@@ -9,20 +9,23 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE_NAME: ghcr.io/basketikun/infinite-canvas-docs
-
 jobs:
   meta:
     runs-on: ubuntu-latest
     outputs:
+      image: ${{ steps.image.outputs.name }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
     steps:
+      # 不写死仓库路径，fork 出去也能推到各自的 ghcr namespace；
+      # ghcr 只接受全小写镜像名，账号带大写字母时必须先转换。
+      - id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}-docs" >> "$GITHUB_OUTPUT"
+
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
             type=ref,event=tag
@@ -59,7 +62,7 @@ jobs:
           file: ./docs/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ needs.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ needs.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=docs-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=docs-${{ matrix.arch }}
 
@@ -100,6 +103,7 @@ jobs:
       - name: Create multi-arch manifest
         shell: bash
         env:
+          IMAGE_NAME: ${{ needs.meta.outputs.image }}
           TAGS: ${{ needs.meta.outputs.tags }}
         run: |
           tag_args=()
