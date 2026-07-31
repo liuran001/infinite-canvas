@@ -1,11 +1,11 @@
 ---
 title: 本地开发
-description: 前端优先的本地开发方式
+description: 前端与后端的本地开发方式
 ---
 
 # 本地开发
 
-当前主应用以 `web/` 前端为主，AI 请求由浏览器前台直连用户自己的 OpenAI 兼容接口。
+主应用由 `web/` 前端和 `server/` 后端组成。默认的本地模式不需要后端，AI 请求由浏览器前台直连用户自己的 OpenAI 兼容接口；只有开发服务器模式相关功能时才需要启动后端。
 
 ## 1. 启动前端
 
@@ -25,7 +25,27 @@ http://localhost:3000
 
 打开右上角配置弹窗，填写自己的 `Base URL`、`API Key` 和模型名。第三方提示词和 WebDAV 都由浏览器前端直连。
 
-## 3. 启动文档站
+## 3. 启动后端（可选）
+
+开发服务器模式相关功能时另开一个终端：
+
+```bash
+cd server
+npm install
+npm run dev
+```
+
+后端默认监听 `8080`，用 SQLite 存数据。可以复制根目录 `.env.example` 成 `server/.env` 调整配置。首次启动会用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 创建管理员。
+
+前端连接时在「配置与用户偏好 - 服务器」里把服务器地址填成 `http://localhost:8080`，开启开关后登录即可。
+
+跑一遍后端主链路的冒烟测试：
+
+```bash
+bash server/smoke-test.sh
+```
+
+## 4. 启动文档站
 
 如果需要单独调整文档站，在 `docs` 目录执行：
 
@@ -37,4 +57,6 @@ bun run dev
 
 - 改画布、页面和交互：主要看 `web/`
 - 改提示词缓存：主要看 `web/src/services/api/prompts.ts`
+- 改服务器模式的前端接入：主要看 `web/src/stores/use-server-store.ts` 和 `web/src/services/api/server.ts`
+- 改后端接口：路由看 `server/src/routes/`，业务逻辑看 `server/src/services/`，数据表看 `server/src/db/entities.ts`
 - 改文档站内容：主要看 `docs/content/docs/`
