@@ -9,6 +9,9 @@ docs/out
 web/.next
 web/node_modules
 web/out
+server/data
+server/dist
+server/node_modules
 *.log
 .env*
 !.env.example

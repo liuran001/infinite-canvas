@@ -6,5 +6,12 @@ services:
     autoDeployTrigger: off
     healthCheckPath: /
     envVars:
+      # nginx 对外监听端口；后端在容器内固定 8080，不受此变量影响。
       - key: PORT
         value: 3000
+    # 免费套餐没有持久化磁盘，SQLite 数据会随每次部署重置；
+    # 需要保留数据请升级套餐并启用下面的磁盘配置。
+    # disk:
+    #   name: data
+    #   mountPath: /app/data
+    #   sizeGB: 1

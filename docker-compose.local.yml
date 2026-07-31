@@ -7,3 +7,11 @@ services:
     ports:
       - "3000:3000"
     restart: unless-stopped
+    volumes:
+      # 数据库文件与本地上传文件都在 /app/data，挂卷持久化。
+      - infinite-canvas-data:/app/data
+    # 变量清单见根目录 .env.example；复制成 .env 后取消注释即可整份加载。
+    # env_file: .env
+
+volumes:
+  infinite-canvas-data:

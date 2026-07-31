@@ -1,11 +1,26 @@
 services:
   app:
-    image: ghcr.io/basketikun/infinite-canvas:latest
+    image: ghcr.io/liuran001/infinite-canvas:latest
     container_name: infinite-canvas
     ports:
       - "3000:3000"
     restart: unless-stopped
-    # 统计分析（可选，默认关闭）。每家一个独立变量，填了谁就启用谁，可同时启用多家：
+    volumes:
+      # 数据库文件与本地上传文件都在 /app/data，挂卷持久化。
+      - infinite-canvas-data:/app/data
+    # 完整变量清单见根目录 .env.example，按需取消注释：
     # environment:
+    #   ADMIN_USERNAME: admin                             # 管理员账号，部署后请修改
+    #   ADMIN_PASSWORD: infinite-canvas                   # 管理员密码，部署后请修改
+    #   JWT_SECRET: 换成一段随机字符串                       # 登录态签名密钥，不填则重启后登录失效
+    #   STORAGE_DRIVER: sqlite                            # 数据库：sqlite | mysql | postgres
+    #   DATABASE_DSN: /app/data/infinite-canvas.db        # sqlite 填文件路径，其余填标准连接 URL
+    #   PUBLIC_BASE_URL: https://example.com              # 对外可访问地址，供上游回源读取参考素材
+    #   FILE_DRIVER: local                                # 文件存储：local 落 /app/data，s3 走对象存储
+    #   JOB_CONCURRENCY: 4                                # 生成任务并发数
+    #   # 统计分析（可选，默认关闭）。每家一个独立变量，填了谁就启用谁，可同时启用多家：
     #   ANALYTICS_GA4_ID: G-XXXXXXXXXX                    # Google Analytics 4 衡量 ID
-    #   ANALYTICS_BAIDU_ID: xxxxxxxxxxxxxxxxxxxxxxxxxxxx   # 百度统计站点 ID
+    #   ANALYTICS_BAIDU_ID: xxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 百度统计站点 ID
+
+volumes:
+  infinite-canvas-data:
