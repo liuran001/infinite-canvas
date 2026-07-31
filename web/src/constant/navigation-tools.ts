@@ -1,6 +1,9 @@
 import { FileText, ImagePlus, Images, Maximize2, Settings2, Video } from "lucide-react";
 
-export const navigationTools = [
+import type { ModelCapability } from "@/stores/use-config-store";
+
+/** capability 为空表示该入口与模型能力无关，始终显示。 */
+export const navigationTools: ReadonlyArray<{ slug: string; label: string; icon: typeof Video; capability?: ModelCapability }> = [
     {
         slug: "canvas",
         label: "我的画布",
@@ -10,11 +13,13 @@ export const navigationTools = [
         slug: "image",
         label: "生图工作台",
         icon: ImagePlus,
+        capability: "image",
     },
     {
         slug: "video",
         label: "视频创作台",
         icon: Video,
+        capability: "video",
     },
     {
         slug: "prompts",
@@ -31,6 +36,6 @@ export const navigationTools = [
         label: "配置",
         icon: Settings2,
     },
-] as const;
+];
 
-export type NavigationToolSlug = (typeof navigationTools)[number]["slug"];
+export type NavigationToolSlug = "canvas" | "image" | "video" | "prompts" | "assets" | "config";

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 
-import { requestEdit, requestGeneration, requestImageQuestion, type AiTextMessage } from "@/services/api/image";
-import { requestVideoGeneration, storeGeneratedVideo } from "@/services/api/video";
+import { requestImageQuestion, type AiTextMessage } from "@/services/api/image";
+import { generateImages, generateVideo, isGenerationReady } from "@/services/api/generation";
 import { decodeChannelModel, selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 import { buildGenerationConfig } from "@/lib/canvas/canvas-generation-helpers";
 import { buildNodeContext } from "@/lib/canvas/plugin-node-context";
@@ -41,7 +41,7 @@ export function usePluginHost(params: PluginHostParams) {
         const toReferences = (refs?: string[]): ReferenceImage[] => (refs || []).filter(Boolean).map((src, index) => ({ id: `plugin-ref-${index}`, name: `ref-${index}.png`, type: "image/png", dataUrl: src }));
         // AI 配置未就绪:弹出配置弹窗并抛错,交由插件 catch 处理
         const ensureReady = (config: AiConfig) => {
-            if (!isAiConfigReady(config, config.model)) {
+            if (!isGenerationReady(config, config.model, isAiConfigReady)) {
                 openConfigDialog(true);
                 throw new Error("AI 配置未就绪,请先在设置里配置模型与密钥");
             }
@@ -50,8 +50,7 @@ export function usePluginHost(params: PluginHostParams) {
             generateImage: async (prompt, options) => {
                 const config = { ...buildGenerationConfig(effectiveConfig, undefined, "image"), count: String(options?.count || 1), ...(options?.model ? { model: options.model } : {}), ...(options?.size ? { size: options.size } : {}) };
                 ensureReady(config);
-                const references = toReferences(options?.references);
-                const items = references.length ? await requestEdit(config, prompt, references, undefined, { signal: options?.signal }) : await requestGeneration(config, prompt, { signal: options?.signal });
+                const items = await generateImages(config, prompt, toReferences(options?.references), { signal: options?.signal });
                 return { images: items.map((item) => item.dataUrl) };
             },
             generateVideo: async (prompt, options) => {
@@ -62,7 +61,7 @@ export function usePluginHost(params: PluginHostParams) {
                     ...(options?.seconds ? { videoSeconds: options.seconds } : {}),
                 };
                 ensureReady(config);
-                const file = await storeGeneratedVideo(await requestVideoGeneration(config, prompt, toReferences(options?.references), [], [], { signal: options?.signal }));
+                const file = await generateVideo(config, prompt, toReferences(options?.references), [], [], { signal: options?.signal });
                 return { url: file.url, mimeType: file.mimeType, width: file.width, height: file.height, durationMs: file.durationMs };
             },
             generateText: async (prompt, options) => {

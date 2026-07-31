@@ -13,10 +13,11 @@ import { imageReferenceLabel } from "@/lib/image-reference-prompt";
 import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
-import { formatBytes, formatDuration, getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
-import { requestEdit, requestGeneration } from "@/services/api/image";
+import { formatBytes, formatDuration } from "@/lib/image-utils";
+import { generateImages, isGenerationReady, resumeImages, storeGeneratedImage, type GeneratedImage as GeneratedImageResult } from "@/services/api/generation";
 import { deleteStoredImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
+import { useJobStore } from "@/stores/use-job-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import type { ReferenceImage } from "@/types/image";
 
@@ -34,6 +35,8 @@ type GeneratedImage = {
 type GenerationResult = {
     id: string;
     status: "pending" | "success" | "failed";
+    /** 服务端生成任务的幂等键，重发同一个键不会重复生成，只有用户主动重试才换新键。 */
+    clientJobId?: string;
     image?: GeneratedImage;
     error?: string;
 };
@@ -109,8 +112,55 @@ export default function ImagePage() {
     }, [running, startedAt]);
 
     useEffect(() => {
-        void refreshLogs();
+        void refreshLogs().then(restorePendingGeneration);
     }, []);
+
+    /** 刷新或断线重连后，把服务端仍在跑的生图任务接回结果区继续轮询，不重新发起生成。 */
+    const restorePendingGeneration = async () => {
+        const pending = (await useJobStore.getState().restorePendingJobs()).filter((job) => job.context.source === "image" && job.kind === "image");
+        if (!pending.length) return;
+        const restoredPrompt = pending[0].context.prompt;
+        setPrompt((value) => value || restoredPrompt);
+        setResults(pending.map((job) => ({ id: nanoid(), status: "pending", clientJobId: job.clientJobId })));
+        setElapsedMs(0);
+        setRunning(true);
+        const restoredAt = performance.now();
+        setStartedAt(restoredAt);
+        message.info(`正在恢复 ${pending.length} 个未完成的生成任务`);
+        await finishBatch(
+            pending.map((job, index) => runGenerationSlot(index, () => resumeImages(job))),
+            { prompt: restoredPrompt, config: effectiveConfig, references: [], count: pending.length, startedAt: restoredAt },
+        );
+    };
+
+    /** 汇总一批生成结果：写生成日志并提示，成功与恢复两条路径共用。 */
+    const finishBatch = async (tasks: Promise<GeneratedImage>[], batch: { prompt: string; config: AiConfig; references: ReferenceImage[]; count: number; startedAt: number }, agentTaskId?: string) => {
+        const result = await Promise.allSettled(tasks);
+        const successImages = result.filter((item): item is PromiseFulfilledResult<GeneratedImage> => item.status === "fulfilled").map((item) => item.value);
+        const successCount = successImages.length;
+        const failCount = batch.count - successCount;
+        const failed = result.find((item): item is PromiseRejectedResult => item.status === "rejected");
+        const error = failed?.reason instanceof Error ? failed.reason.message : failCount ? "生成失败" : undefined;
+        if (agentTaskId) updateAgentTask(agentTaskId, { status: successCount ? "succeeded" : "failed", successCount, failCount, error: successCount ? undefined : error });
+        try {
+            saveLog(
+                buildLog({
+                    prompt: batch.prompt,
+                    model,
+                    config: { ...batch.config, count: String(batch.count) },
+                    references: batch.references,
+                    durationMs: performance.now() - batch.startedAt,
+                    successCount,
+                    failCount,
+                    status: successCount ? "成功" : "失败",
+                    images: successImages,
+                }),
+            );
+            successCount ? message.success("图片已生成") : message.error(error || "生成失败");
+        } finally {
+            setRunning(false);
+        }
+    };
 
     const addReferences = async (files?: FileList | null) => {
         const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
@@ -153,7 +203,7 @@ export default function ImagePage() {
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: "请输入生图提示词" });
             return;
         }
-        if (!isAiConfigReady(effectiveConfig, model)) {
+        if (!isGenerationReady(effectiveConfig, model, isAiConfigReady)) {
             message.warning("请先完成配置");
             openConfigDialog(true);
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: "生图配置不完整" });
@@ -170,44 +220,16 @@ export default function ImagePage() {
         setRunning(true);
         if (agentTaskId) updateAgentTask(agentTaskId, { status: "running", error: undefined });
         setPreviewLog(null);
-        setResults(Array.from({ length: generationCount }, () => ({ id: nanoid(), status: "pending" })));
+        const slots = Array.from({ length: generationCount }, () => ({ id: nanoid(), clientJobId: nanoid() }));
+        setResults(slots.map((slot) => ({ id: slot.id, status: "pending", clientJobId: slot.clientJobId })));
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
 
-        const tasks = Array.from({ length: generationCount }, (_, index) => runGenerationSlot(index, snapshot));
-
-        const result = await Promise.allSettled(tasks);
-        const successImages = result.filter((item): item is PromiseFulfilledResult<GeneratedImage> => item.status === "fulfilled").map((item) => item.value);
-        const successCount = successImages.length;
-        const failCount = generationCount - successCount;
-        const failed = result.find((item): item is PromiseRejectedResult => item.status === "rejected");
-        const error = failed?.reason instanceof Error ? failed.reason.message : failCount ? "生成失败" : undefined;
-        if (agentTaskId) updateAgentTask(agentTaskId, { status: successCount ? "succeeded" : "failed", successCount, failCount, error: successCount ? undefined : error });
-
-        try {
-            const logImages = await Promise.all(
-                successImages.map(async (image) => {
-                    const stored = await uploadImage(image.dataUrl);
-                    return { ...image, dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType };
-                }),
-            );
-            saveLog(
-                buildLog({
-                    prompt: text,
-                    model,
-                    config: { ...snapshot.config, count: String(generationCount) },
-                    references: snapshot.references,
-                    durationMs: performance.now() - batchStartedAt,
-                    successCount,
-                    failCount,
-                    status: successCount ? "成功" : "失败",
-                    images: logImages,
-                }),
-            );
-            successCount ? message.success("图片已生成") : message.error(failed?.reason instanceof Error ? failed.reason.message : "生成失败");
-        } finally {
-            setRunning(false);
-        }
+        await finishBatch(
+            slots.map((slot, index) => runGenerationSlot(index, () => generateImages(snapshot.config, snapshot.text, snapshot.references, { clientJobId: slot.clientJobId, context: { source: "image", prompt: snapshot.text } }))),
+            { prompt: text, config: snapshot.config, references: snapshot.references, count: generationCount, startedAt: batchStartedAt },
+            agentTaskId,
+        );
     };
 
     // 响应 Agent 面板下发的生图命令：填入提示词，并按需自动触发生成。
@@ -236,14 +258,18 @@ export default function ImagePage() {
         saveAs(image.dataUrl, `image-${index + 1}.png`);
     };
 
+    /** 结果图在生成时已经落过存储，直接复用引用，避免服务器模式下重复上传。 */
+    const storedResultImage = async (image: GeneratedImage) =>
+        image.storageKey ? { url: image.dataUrl, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType || "image/png" } : uploadImage(image.dataUrl);
+
     const addResultToReferences = async (image: GeneratedImage, index: number) => {
-        const stored = await uploadImage(image.dataUrl);
+        const stored = await storedResultImage(image);
         setReferences((value) => [...value, { id: nanoid(), name: `result-${index + 1}.png`, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
         message.success("已加入参考图");
     };
 
     const saveResultToAssets = async (image: GeneratedImage, index: number) => {
-        const stored = await uploadImage(image.dataUrl);
+        const stored = await storedResultImage(image);
         addAsset({
             kind: "image",
             title: `生成结果 ${index + 1}`,
@@ -313,7 +339,7 @@ export default function ImagePage() {
             message.error("请输入生图提示词");
             return null;
         }
-        if (!isAiConfigReady(effectiveConfig, model)) {
+        if (!isGenerationReady(effectiveConfig, model, isAiConfigReady)) {
             message.warning("请先完成配置");
             openConfigDialog(true);
             return null;
@@ -321,14 +347,13 @@ export default function ImagePage() {
         return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
     };
 
-    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }) => {
+    const runGenerationSlot = async (index: number, produce: () => Promise<GeneratedImageResult[]>): Promise<GeneratedImage> => {
         const itemStartedAt = performance.now();
         try {
-            const result = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references) : await requestGeneration(snapshot.config, snapshot.text);
-            const image = result[0];
+            const image = (await produce())[0];
             if (!image) throw new Error("接口没有返回图片");
-            const meta = await readImageMeta(image.dataUrl);
-            const nextImage = { id: image.id, dataUrl: image.dataUrl, durationMs: performance.now() - itemStartedAt, width: meta.width, height: meta.height, bytes: getDataUrlByteSize(image.dataUrl) };
+            const stored = await storeGeneratedImage(image);
+            const nextImage = { id: image.id, dataUrl: stored.url, storageKey: stored.storageKey, durationMs: performance.now() - itemStartedAt, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType };
             setResults((value) => updateResultAt(value, index, { status: "success", image: nextImage }));
             return nextImage;
         } catch (error) {
@@ -341,13 +366,12 @@ export default function ImagePage() {
         const snapshot = buildRequestSnapshot();
         if (!snapshot) return;
         setPreviewLog(null);
-        setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined }));
+        // 用户主动重试是一次新的生成，换新的幂等键，避免命中已经失败的旧任务。
+        const clientJobId = nanoid();
+        setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined, clientJobId }));
         const retryStartedAt = performance.now();
         try {
-            const image = await runGenerationSlot(index, snapshot);
-            const stored = await uploadImage(image.dataUrl);
-            const logImage = { ...image, dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType };
-            setResults((value) => updateResultAt(value, index, { image: { ...image, dataUrl: stored.url, storageKey: stored.storageKey } }));
+            const image = await runGenerationSlot(index, () => generateImages(snapshot.config, snapshot.text, snapshot.references, { clientJobId, context: { source: "image", prompt: snapshot.text } }));
             saveLog(
                 buildLog({
                     prompt: snapshot.text,
@@ -358,7 +382,7 @@ export default function ImagePage() {
                     successCount: 1,
                     failCount: 0,
                     status: "成功",
-                    images: [logImage],
+                    images: [image],
                 }),
             );
             message.success("重试成功");

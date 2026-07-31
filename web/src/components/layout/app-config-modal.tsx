@@ -5,16 +5,30 @@ import { useEffect, useRef, useState } from "react";
 import { ModelPicker } from "@/components/model-picker";
 import { ChannelEditorDrawer } from "@/components/layout/channel-editor-drawer";
 import { ConfigPromptSources } from "@/components/layout/config-prompt-sources";
+import { ConfigServer } from "@/components/layout/config-server";
 import { exportAppConfig, importAppConfig } from "@/services/config-file";
 import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent } from "@/services/app-sync";
 import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
-import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import {
+    createModelChannel,
+    modelOptionsFromChannels,
+    normalizeModelOptionValue,
+    selectableModelsByCapability,
+    useConfigStore,
+    useEnabledCapabilities,
+    type AiConfig,
+    type ApiCallFormat,
+    type ConfigTabKey,
+    type ModelCapability,
+    type ModelChannel,
+} from "@/stores/use-config-store";
 
 type ModelGroup = {
     capability: ModelCapability;
     modelKey: "imageModel" | "videoModel" | "textModel" | "audioModel";
     defaultLabel: string;
+    entryLabel: string;
 };
 
 type WebdavDomainProgress = {
@@ -26,10 +40,10 @@ type WebdavDomainProgress = {
 };
 
 const modelGroups: ModelGroup[] = [
-    { capability: "image", modelKey: "imageModel", defaultLabel: "默认生图模型" },
-    { capability: "video", modelKey: "videoModel", defaultLabel: "默认视频模型" },
-    { capability: "text", modelKey: "textModel", defaultLabel: "默认文本模型" },
-    { capability: "audio", modelKey: "audioModel", defaultLabel: "默认音频模型" },
+    { capability: "image", modelKey: "imageModel", defaultLabel: "默认生图模型", entryLabel: "生图" },
+    { capability: "video", modelKey: "videoModel", defaultLabel: "默认视频模型", entryLabel: "视频" },
+    { capability: "text", modelKey: "textModel", defaultLabel: "默认文本模型", entryLabel: "文本" },
+    { capability: "audio", modelKey: "audioModel", defaultLabel: "默认音频模型", entryLabel: "音频" },
 ];
 
 const webdavDomainKeys: AppSyncDomainKey[] = ["canvas", "assets", "image-workbench", "video-workbench"];
@@ -60,6 +74,7 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     const [webdavSyncStatus, setWebdavSyncStatus] = useState("");
     const [webdavDomainProgress, setWebdavDomainProgress] = useState(createWebdavDomainProgress);
     const config = useConfigStore((state) => state.config);
+    const capabilities = useEnabledCapabilities();
     const webdav = useConfigStore((state) => state.webdav);
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const updateWebdavConfig = useConfigStore((state) => state.updateWebdavConfig);
@@ -219,13 +234,32 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                         label: "偏好设置",
                         children: (
                             <Form layout="vertical" requiredMark={false}>
-                                <div className="mb-2 text-sm font-semibold">默认模型</div>
+                                <div className="mb-2 text-sm font-semibold">功能入口</div>
+                                <div className="mb-1 text-xs text-stone-500">默认按当前可用模型自动显示，也可以手动固定。隐藏后只是不再出现入口，已有的节点和素材不受影响。</div>
                                 <div className="mb-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                                     {modelGroups.map((group) => (
-                                        <Form.Item key={group.modelKey} label={group.defaultLabel} className="mb-0">
-                                            <ModelPicker config={config} value={config[group.modelKey]} onChange={(model) => updateConfig(group.modelKey, model)} capability={group.capability} fullWidth />
+                                        <Form.Item key={`visibility-${group.capability}`} label={group.entryLabel} className="mb-0">
+                                            <Select
+                                                value={config.capabilityVisibility[group.capability]}
+                                                onChange={(value) => updateConfig("capabilityVisibility", { ...config.capabilityVisibility, [group.capability]: value })}
+                                                options={[
+                                                    { label: capabilities[group.capability] ? "自动（当前显示）" : "自动（当前隐藏）", value: "auto" },
+                                                    { label: "始终显示", value: "on" },
+                                                    { label: "始终隐藏", value: "off" },
+                                                ]}
+                                            />
                                         </Form.Item>
                                     ))}
+                                </div>
+                                <div className="mb-2 text-sm font-semibold">默认模型</div>
+                                <div className="mb-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                                    {modelGroups
+                                        .filter((group) => capabilities[group.capability])
+                                        .map((group) => (
+                                            <Form.Item key={group.modelKey} label={group.defaultLabel} className="mb-0">
+                                                <ModelPicker config={config} value={config[group.modelKey]} onChange={(model) => updateConfig(group.modelKey, model)} capability={group.capability} fullWidth />
+                                            </Form.Item>
+                                        ))}
                                 </div>
                                 <div className="mb-2 text-sm font-semibold">生成偏好</div>
                                 <div className="grid gap-4 md:grid-cols-4">
@@ -239,27 +273,33 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                             onBlur={(event) => updateConfig("canvasImageCount", normalizeImageCount(event.target.value))}
                                         />
                                     </Form.Item>
-                                    <Form.Item label="默认音频声音" className="mb-4">
-                                        <Select value={config.audioVoice} options={audioVoiceOptions} onChange={(value) => updateConfig("audioVoice", value)} />
-                                    </Form.Item>
-                                    <Form.Item label="默认音频格式" className="mb-4">
-                                        <Select value={config.audioFormat} options={audioFormatOptions} onChange={(value) => updateConfig("audioFormat", value)} />
-                                    </Form.Item>
-                                    <Form.Item label="默认音频语速" className="mb-4">
-                                        <Input
-                                            type="number"
-                                            min={0.25}
-                                            max={4}
-                                            step={0.05}
-                                            value={config.audioSpeed}
-                                            onChange={(event) => updateConfig("audioSpeed", event.target.value)}
-                                            onBlur={(event) => updateConfig("audioSpeed", normalizeAudioSpeedValue(event.target.value))}
-                                        />
-                                    </Form.Item>
+                                    {capabilities.audio ? (
+                                        <>
+                                            <Form.Item label="默认音频声音" className="mb-4">
+                                                <Select value={config.audioVoice} options={audioVoiceOptions} onChange={(value) => updateConfig("audioVoice", value)} />
+                                            </Form.Item>
+                                            <Form.Item label="默认音频格式" className="mb-4">
+                                                <Select value={config.audioFormat} options={audioFormatOptions} onChange={(value) => updateConfig("audioFormat", value)} />
+                                            </Form.Item>
+                                            <Form.Item label="默认音频语速" className="mb-4">
+                                                <Input
+                                                    type="number"
+                                                    min={0.25}
+                                                    max={4}
+                                                    step={0.05}
+                                                    value={config.audioSpeed}
+                                                    onChange={(event) => updateConfig("audioSpeed", event.target.value)}
+                                                    onBlur={(event) => updateConfig("audioSpeed", normalizeAudioSpeedValue(event.target.value))}
+                                                />
+                                            </Form.Item>
+                                        </>
+                                    ) : null}
                                 </div>
-                                <Form.Item label="默认音频指令" className="mb-4">
-                                    <Input.TextArea rows={2} value={config.audioInstructions} placeholder="例如：自然、温暖、适合旁白。" onChange={(event) => updateConfig("audioInstructions", event.target.value)} />
-                                </Form.Item>
+                                {capabilities.audio ? (
+                                    <Form.Item label="默认音频指令" className="mb-4">
+                                        <Input.TextArea rows={2} value={config.audioInstructions} placeholder="例如：自然、温暖、适合旁白。" onChange={(event) => updateConfig("audioInstructions", event.target.value)} />
+                                    </Form.Item>
+                                ) : null}
                                 <Form.Item label="系统提示词" className="mb-0">
                                     <Input.TextArea rows={4} value={config.systemPrompt} placeholder="例如：你是一位擅长电影感写实摄影的视觉导演。" onChange={(event) => updateConfig("systemPrompt", event.target.value)} />
                                 </Form.Item>
@@ -270,6 +310,11 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                         key: "prompt-sources",
                         label: "提示词来源",
                         children: <ConfigPromptSources />,
+                    },
+                    {
+                        key: "server",
+                        label: "服务器",
+                        children: <ConfigServer />,
                     },
                     {
                         key: "webdav",

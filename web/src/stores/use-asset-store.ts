@@ -5,6 +5,7 @@ import { nanoid } from "nanoid";
 import { localForageStorage } from "@/lib/localforage-storage";
 import { cleanupUnusedImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { cleanupUnusedMedia, resolveMediaUrl } from "@/services/file-storage";
+import { isServerMode } from "@/stores/use-server-store";
 
 export type AssetKind = "text" | "image" | "video";
 export type TextAsset = AssetBase<"text"> & { data: { content: string } };
@@ -23,6 +24,8 @@ type AssetBase<T extends AssetKind> = {
     createdAt: string;
     updatedAt: string;
     metadata?: Record<string, unknown>;
+    /** 服务端版本号，本地模式下始终为 undefined。 */
+    revision?: number;
 };
 
 type AssetStore = {
@@ -63,6 +66,17 @@ const assetStorage: PersistStorage<AssetStore> = {
     removeItem: (name) => localForageStorage.removeItem(name),
 };
 
+/** 服务器模式下把改动推到云端，动态导入避免与同步模块循环依赖。 */
+function pushRemote(asset?: Asset) {
+    if (!asset || !isServerMode()) return;
+    void import("@/services/remote-sync").then((module) => module.pushUserAsset(asset));
+}
+
+function removeRemote(id: string) {
+    if (!isServerMode()) return;
+    void import("@/services/remote-sync").then((module) => module.removeRemoteUserAsset(id));
+}
+
 export const useAssetStore = create<AssetStore>()(
     persist(
         (set, get) => ({
@@ -72,18 +86,23 @@ export const useAssetStore = create<AssetStore>()(
                 const now = new Date().toISOString();
                 const id = nanoid();
                 set((state) => ({ assets: [{ ...asset, id, createdAt: now, updatedAt: now } as Asset, ...state.assets] }));
+                pushRemote(get().assets.find((item) => item.id === id));
                 return id;
             },
-            updateAsset: (id, patch) =>
+            updateAsset: (id, patch) => {
                 set((state) => ({
                     assets: state.assets.map((asset) => (asset.id === id ? ({ ...asset, ...patch, updatedAt: new Date().toISOString() } as Asset) : asset)),
-                })),
-            removeAsset: (id) =>
+                }));
+                pushRemote(get().assets.find((asset) => asset.id === id));
+            },
+            removeAsset: (id) => {
                 set((state) => {
                     const assets = state.assets.filter((asset) => asset.id !== id);
                     get().cleanupImages({ assets });
                     return { assets };
-                }),
+                });
+                removeRemote(id);
+            },
             replaceAssets: (assets) => set({ assets }),
             cleanupImages: (extra) => {
                 window.setTimeout(async () => {

@@ -14,8 +14,9 @@ import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, seedanceReferenceLabel, seedanceVideoReferenceError, seedanceVideoReferenceHint, SEEDANCE_REFERENCE_LIMITS, SEEDANCE_VIDEO_MIME_TYPES } from "@/lib/seedance-video";
 import { deleteStoredMedia, resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
 import { resolveImageUrl, uploadImage } from "@/services/image-storage";
-import { createVideoGenerationTask, pollVideoGenerationTask, storeGeneratedVideo, type VideoGenerationTask } from "@/services/api/video";
+import { createVideoTask, isGenerationReady, pollVideoTask, serverVideoTask, storeVideoResult, videoPollInterval, videoPollLimit, type VideoTask } from "@/services/api/generation";
 import { useAssetStore } from "@/stores/use-asset-store";
+import { useJobStore } from "@/stores/use-job-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -56,7 +57,7 @@ type GenerationLog = {
     resolution: string;
     seconds: string;
     status: "生成中" | "成功" | "失败";
-    task?: VideoGenerationTask;
+    task?: VideoTask;
     video?: GeneratedVideo;
     error?: string;
 };
@@ -113,8 +114,33 @@ export default function VideoPage() {
     }, [running, startedAt]);
 
     useEffect(() => {
-        void refreshLogs();
+        void restoreSession();
     }, []);
+
+    /**
+     * 本地有日志的任务由 resumePendingLogs 凭日志里的 task 续查；
+     * 这里只补服务端还在跑、但本地没有日志记录的任务（例如换设备登录），避免重复轮询同一个任务。
+     */
+    const restoreSession = async () => {
+        const nextLogs = await refreshLogs();
+        const pending = (await useJobStore.getState().restorePendingJobs()).filter((job) => job.context.source === "video" && job.kind === "video");
+        const orphans = pending.filter((job) => !nextLogs.some((log) => log.task?.provider === "server" && log.task.clientJobId === job.clientJobId));
+        for (const job of orphans) {
+            const log = buildLog({
+                prompt: job.context.prompt,
+                model: job.model,
+                config: buildVideoConfig(effectiveConfig, job.model),
+                references: [],
+                videoReferences: [],
+                audioReferences: [],
+                durationMs: 0,
+                status: "生成中",
+                task: serverVideoTask(job),
+            });
+            await saveLog(log, false);
+            void pollGenerationLog(log);
+        }
+    };
 
     const addReferences = async (files?: FileList | null) => {
         const selectedFiles = Array.from(files || []);
@@ -208,7 +234,10 @@ export default function VideoPage() {
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
         try {
-            const task = await createVideoGenerationTask(snapshot.config, snapshot.text, snapshot.references, snapshot.videoReferences, snapshot.audioReferences);
+            const task = await createVideoTask(snapshot.config, snapshot.text, snapshot.references, snapshot.videoReferences, snapshot.audioReferences, {
+                clientJobId: nanoid(),
+                context: { source: "video", prompt: snapshot.text },
+            });
             const log = buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, videoReferences: snapshot.videoReferences, audioReferences: snapshot.audioReferences, durationMs: 0, status: "生成中", task });
             await saveLog(log, false);
             void pollGenerationLog(log, snapshot.config, agentTaskId);
@@ -250,7 +279,7 @@ export default function VideoPage() {
             message.error("请输入视频提示词");
             return null;
         }
-        if (!isAiConfigReady(effectiveConfig, model)) {
+        if (!isGenerationReady(effectiveConfig, model, isAiConfigReady)) {
             message.warning("请先完成配置");
             openConfigDialog(true);
             return null;
@@ -347,11 +376,12 @@ export default function VideoPage() {
         setStartedAt((value) => value || performance.now());
         setResults((value) => (value.length ? value : [{ id: log.id, status: "pending" }]));
         const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
+        const pollLimit = videoPollLimit(log.task);
         try {
-            for (let attempt = 0; attempt < 120; attempt += 1) {
-                const state = await pollVideoGenerationTask(configOverride || taskConfig, log.task);
+            for (let attempt = 0; attempt < pollLimit; attempt += 1) {
+                const state = await pollVideoTask(configOverride || taskConfig, log.task);
                 if (state.status === "completed") {
-                    const stored = await storeGeneratedVideo(state.result);
+                    const stored = await storeVideoResult(log.task, state.result);
                     const nextVideo: GeneratedVideo = {
                         id: nanoid(),
                         url: stored.url,
@@ -369,8 +399,8 @@ export default function VideoPage() {
                     return;
                 }
                 if (state.status === "failed") throw new Error(state.error);
-                if (attempt === 119) throw new Error("视频生成超时，请稍后重试");
-                await delay(log.task.provider === "seedance" ? 5000 : 2500);
+                if (attempt === pollLimit - 1) throw new Error("视频生成超时，请稍后重试");
+                await delay(videoPollInterval(log.task));
             }
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : "生成失败";
@@ -872,7 +902,7 @@ function normalizeLogConfig(log: Partial<GenerationLog>): GenerationLogConfig {
     };
 }
 
-function buildLog({ prompt, model, config, references, videoReferences, audioReferences, durationMs, status, task, video, error }: { prompt: string; model: string; config: AiConfig; references: ReferenceImage[]; videoReferences: ReferenceVideo[]; audioReferences: ReferenceAudio[]; durationMs: number; status: GenerationLog["status"]; task?: VideoGenerationTask; video?: GeneratedVideo; error?: string }): GenerationLog {
+function buildLog({ prompt, model, config, references, videoReferences, audioReferences, durationMs, status, task, video, error }: { prompt: string; model: string; config: AiConfig; references: ReferenceImage[]; videoReferences: ReferenceVideo[]; audioReferences: ReferenceAudio[]; durationMs: number; status: GenerationLog["status"]; task?: VideoTask; video?: GeneratedVideo; error?: string }): GenerationLog {
     const logConfig = {
         model: config.model,
         videoModel: config.videoModel,

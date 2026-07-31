@@ -3,16 +3,36 @@ import { useEffect, useRef } from "react";
 import { App } from "antd";
 
 import { createModelChannel, useConfigStore } from "@/stores/use-config-store";
+import { syncAll } from "@/services/remote-sync";
+import { useAssetStore } from "@/stores/use-asset-store";
+import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { useIsServerMode, useServerStore } from "@/stores/use-server-store";
 import { usePromptSourceScheduler } from "@/hooks/use-prompt-source-scheduler";
 
 export function ClientRootInit({ children }: { children: ReactNode }) {
     const { message } = App.useApp();
     const handledConfigParams = useRef(false);
+    const syncedUserId = useRef("");
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const config = useConfigStore((state) => state.config);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
+    const isServerMode = useIsServerMode();
+    const userId = useServerStore((state) => state.user?.id || "");
+    const canvasHydrated = useCanvasStore((state) => state.hydrated);
+    const assetsHydrated = useAssetStore((state) => state.hydrated);
 
     usePromptSourceScheduler();
+
+    // 服务器模式登录后同步一次云端画布与素材，本地数据先加载完再合并。
+    useEffect(() => {
+        if (!isServerMode) {
+            syncedUserId.current = "";
+            return;
+        }
+        if (!canvasHydrated || !assetsHydrated || syncedUserId.current === userId) return;
+        syncedUserId.current = userId;
+        void syncAll();
+    }, [assetsHydrated, canvasHydrated, isServerMode, userId]);
 
     useEffect(() => {
         if (handledConfigParams.current) return;

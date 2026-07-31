@@ -4,6 +4,7 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 import { nanoid } from "nanoid";
 import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
+import { isServerMode } from "@/stores/use-server-store";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
 
 export type CanvasProject = {
@@ -18,6 +19,8 @@ export type CanvasProject = {
     backgroundMode: CanvasBackgroundMode;
     showImageInfo: boolean;
     viewport: ViewportTransform;
+    /** 服务端版本号，本地模式下始终为 undefined。 */
+    revision?: number;
 };
 
 type CanvasStore = {
@@ -59,6 +62,17 @@ const canvasStorage: PersistStorage<CanvasStore> = {
     removeItem: (name) => localForageStorage.removeItem(name),
 };
 
+/** 服务器模式下把改动推到云端，动态导入避免与同步模块循环依赖。 */
+function pushRemote(project?: CanvasProject) {
+    if (!project || !isServerMode()) return;
+    void import("@/services/remote-sync").then((module) => module.pushProject(project));
+}
+
+function removeRemote(ids: string[]) {
+    if (!isServerMode()) return;
+    void import("@/services/remote-sync").then((module) => ids.forEach((id) => module.removeRemoteProject(id)));
+}
+
 export const useCanvasStore = create<CanvasStore>()(
     persist(
         (set, get) => ({
@@ -99,25 +113,33 @@ export const useCanvasStore = create<CanvasStore>()(
                     viewport: source.viewport || initialViewport,
                 };
                 set((state) => ({ projects: [project, ...state.projects] }));
+                pushRemote(project);
                 return project.id;
             },
             openProject: (id) => {
                 return get().projects.find((item) => item.id === id) || null;
             },
-            renameProject: (id, title) =>
+            renameProject: (id, title) => {
                 set((state) => ({
                     projects: state.projects.map((project) => (project.id === id ? { ...project, title: title.trim() || project.title, updatedAt: new Date().toISOString() } : project)),
-                })),
-            deleteProjects: (ids) =>
+                }));
+                pushRemote(get().projects.find((project) => project.id === id));
+            },
+            deleteProjects: (ids) => {
                 set((state) => {
                     const projects = state.projects.filter((project) => !ids.includes(project.id));
                     return { projects };
-                }),
+                });
+                removeRemote(ids);
+            },
             replaceProjects: (projects) => set({ projects }),
-            updateProject: (id, patch) =>
+            updateProject: (id, patch) => {
                 set((state) => ({
                     projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch, updatedAt: new Date().toISOString() } : project)),
-                })),
+                }));
+                // 平移缩放画布只改 viewport，不值得为此上传整份项目 JSON，等有内容改动再推。
+                if (Object.keys(patch).some((key) => key !== "viewport")) pushRemote(get().projects.find((project) => project.id === id));
+            },
         }),
         {
             name: CANVAS_STORE_KEY,

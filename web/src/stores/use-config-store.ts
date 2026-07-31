@@ -3,9 +3,13 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
+import { isServerMode, useServerStore } from "@/stores/use-server-store";
+
 export type ApiCallFormat = "openai" | "gemini" | "ark";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
+/** auto 表示按当前可用模型自动显隐，on / off 为用户手动覆盖。 */
+export type CapabilityVisibility = "auto" | "on" | "off";
 
 export type ChannelModel = {
     name: string;
@@ -49,6 +53,8 @@ export type AiConfig = {
     background: string;
     count: string;
     canvasImageCount: string;
+    /** 生图/文本/视频/音频四类能力的入口显隐，默认按可用模型自动决定。 */
+    capabilityVisibility: Record<ModelCapability, CapabilityVisibility>;
 };
 
 export type WebdavSyncConfig = {
@@ -58,7 +64,7 @@ export type WebdavSyncConfig = {
     directory: string;
     lastSyncedAt: string;
 };
-export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "webdav";
+export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "server" | "webdav";
 
 export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
 const CHANNEL_MODEL_SEPARATOR = "::";
@@ -107,6 +113,7 @@ export const defaultConfig: AiConfig = {
     background: "",
     count: "1",
     canvasImageCount: "3",
+    capabilityVisibility: { image: "auto", text: "auto", video: "auto", audio: "auto" },
 };
 
 export const defaultWebdavSyncConfig: WebdavSyncConfig = {
@@ -162,6 +169,12 @@ export function modelMatchesCapability(config: AiConfig, value: string, capabili
 }
 
 export function resolveModelForCapability(config: AiConfig, currentModel: string | undefined, capability: ModelCapability) {
+    // 服务器模式下模型由服务端下发，本地渠道的 channelId::name 编码在服务端匹配不上。
+    if (isServerMode()) {
+        const channel = useServerStore.getState().settings?.modelChannel;
+        if (currentModel && channel?.models.some((model) => model.name === currentModel && model.capability === capability)) return currentModel;
+        return (capability === "image" ? channel?.defaultImageModel : capability === "video" ? channel?.defaultVideoModel : capability === "audio" ? channel?.defaultAudioModel : channel?.defaultTextModel) || "";
+    }
     const defaultModel = capability === "image" ? config.imageModel : capability === "video" ? config.videoModel : capability === "audio" ? config.audioModel : config.textModel;
     const fallbackModel = capability === "image" ? defaultConfig.imageModel : capability === "video" ? defaultConfig.videoModel : capability === "audio" ? defaultConfig.audioModel : defaultConfig.textModel;
     if (currentModel && modelMatchesCapability(config, currentModel, capability)) return currentModel;
@@ -170,8 +183,37 @@ export function resolveModelForCapability(config: AiConfig, currentModel: string
 }
 
 export function selectableModelsByCapability(config: AiConfig, capability?: ModelCapability) {
+    if (isServerMode()) {
+        const models = useServerStore.getState().settings?.modelChannel.models || [];
+        return (capability ? models.filter((model) => model.capability === capability) : models).map((model) => model.name);
+    }
     if (!capability) return config.models;
     return config.channels.flatMap((channel) => channel.models.filter((model) => model.capability === capability).map((model) => encodeChannelModel(channel.id, model.name)));
+}
+
+export const modelCapabilities: ModelCapability[] = ["image", "text", "video", "audio"];
+
+/**
+ * 能力入口是否显示。默认按当前模式下有没有对应模型自动判断，
+ * 用户可以在偏好设置里手动覆盖成始终显示或始终隐藏。
+ * 一个模型都没配时全部显示，否则新用户会看到一个空界面且不知道去哪配置。
+ */
+export function isCapabilityEnabled(config: AiConfig, capability: ModelCapability) {
+    const override = config.capabilityVisibility?.[capability] || "auto";
+    if (override !== "auto") return override === "on";
+    if (!selectableModelsByCapability(config).length) return true;
+    return selectableModelsByCapability(config, capability).length > 0;
+}
+
+/** 组件里用，会跟随本地渠道与服务端模型列表的变化重新计算。 */
+export function useEnabledCapabilities() {
+    const config = useConfigStore((state) => state.config);
+    const serverModels = useServerStore((state) => state.settings?.modelChannel.models);
+    return useMemo(
+        () => Object.fromEntries(modelCapabilities.map((capability) => [capability, isCapabilityEnabled(config, capability)])) as Record<ModelCapability, boolean>,
+        // serverModels 不直接参与计算，但服务器模式下的判断依赖它，必须进依赖数组。
+        [config, serverModels],
+    );
 }
 
 /** The user script (if any) attached to a model; empty string means use the system default call. */
@@ -245,6 +287,7 @@ export const useConfigStore = create<ConfigStore>()(
                         videoGenerateAudio: config.videoGenerateAudio || "true",
                         videoWatermark: config.videoWatermark || "false",
                         canvasImageCount: config.canvasImageCount || "3",
+                        capabilityVisibility: { ...defaultConfig.capabilityVisibility, ...config.capabilityVisibility },
                     },
                 };
             },
@@ -329,7 +372,11 @@ export function resolveModelChannel(config: AiConfig, value: string) {
     const decoded = decodeChannelModel(value);
     const model = decoded?.model || value;
     const matched = decoded ? config.channels.find((channel) => channel.id === decoded.channelId) : config.channels.find((channel) => channel.models.some((item) => item.name === model));
-    return matched || config.channels[0] || createModelChannel({ id: "default", name: "默认渠道", baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })) });
+    return (
+        matched ||
+        config.channels[0] ||
+        createModelChannel({ id: "default", name: "默认渠道", baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })) })
+    );
 }
 
 export function resolveModelRequestConfig(config: AiConfig, value: string) {
