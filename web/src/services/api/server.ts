@@ -2,7 +2,7 @@ import type { AuthenticationResponseJSON, PublicKeyCredentialCreationOptionsJSON
 
 import { useServerStore, type ServerSettings, type ServerUser } from "@/stores/use-server-store";
 
-export type ServerJobKind = "image" | "video" | "audio";
+export type ServerJobKind = "image" | "video" | "audio" | "text";
 export type ServerJobStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
 
 export type ServerFile = { id: string; kind: string; mimeType: string; bytes: number; width: number; height: number; durationMs: number };
@@ -19,6 +19,8 @@ export type ServerJob = {
     progress: number;
     error: string;
     outputs: ServerFile[];
+    /** 文本任务已经生成出来的内容，中途断开也能凭它拿回已生成的那一半。 */
+    text: string;
     /** 客户端下发的任务归属信息，换设备后靠它把任务定位回界面。 */
     context: Record<string, unknown>;
     createdAt: string;
@@ -42,6 +44,8 @@ export type ServerAgentSession = { id: string; projectId: string; title: string;
 /** seq 是会话内自增游标，断线重连按它拉增量；工具消息会先后推「已调用」和「有结果」两次，seq 相同。 */
 export type ServerAgentMessage = { seq: number; role: ServerAgentMessageRole; content: string; toolName: string; toolArgs: string; toolResult: string; createdAt: string };
 export type ServerAgentEvent = { type: "message"; message: ServerAgentMessage } | { type: "status"; status: ServerAgentSessionStatus; error: string };
+/** 文本任务的增量事件。offset 是这段内容在完整文本里的起点，前端按它覆盖写入，重连或重跑都不会错位。 */
+export type ServerJobTextEvent = { type: "delta"; offset: number; text: string } | { type: "status"; status: ServerJobStatus; error: string };
 
 export type ServerProject = { id: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerUserAsset = { id: string; kind: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
@@ -188,15 +192,19 @@ export async function serverAgentStream(sessionId: string, sinceSeq: number, onE
         throw new Error("登录状态已失效，请重新登录");
     }
     if (!response.ok) throw new Error(`Agent 事件流连接失败（HTTP ${response.status}）`);
+    await readServerSse(response, (data) => onEvent(JSON.parse(data) as ServerAgentEvent), "Agent 事件流没有返回内容");
+}
+
+/** SSE 按空行分块；保活帧是 ": keep-alive" 注释，没有 data 行，这里自然跳过。 */
+async function readServerSse(response: Response, onData: (data: string) => void, empty: string) {
     const reader = response.body?.getReader();
-    if (!reader) throw new Error("Agent 事件流没有返回内容");
+    if (!reader) throw new Error(empty);
     const decoder = new TextDecoder();
     let buffer = "";
     for (;;) {
         const { done, value } = await reader.read();
         if (done) return;
         buffer += decoder.decode(value, { stream: true });
-        // SSE 按空行分块；保活帧是 ": keep-alive" 注释，没有 data 行，这里自然跳过。
         for (let index = buffer.indexOf("\n\n"); index >= 0; index = buffer.indexOf("\n\n")) {
             const data = buffer
                 .slice(0, index)
@@ -205,9 +213,34 @@ export async function serverAgentStream(sessionId: string, sinceSeq: number, onE
                 .map((line) => line.slice(5).trim())
                 .join("");
             buffer = buffer.slice(index + 2);
-            if (data) onEvent(JSON.parse(data) as ServerAgentEvent);
+            if (data) onData(data);
         }
     }
+}
+
+/**
+ * 文本任务事件流。断开只是取消订阅，服务端任务照常跑完并落库，
+ * 重连时带上已经收到的字符数就能补齐断线期间的内容；返回值是任务的终态。
+ * 连接本身出问题时抛错，调用方据此决定是否重连续传。
+ */
+export async function serverJobTextStream(jobId: string, since: number, onDelta: (offset: number, text: string) => void, signal?: AbortSignal) {
+    const response = await fetch(serverApiUrl(`/v1/jobs/${jobId}/text?since=${since}`), { headers: authHeaders({ Accept: "text/event-stream" }), signal }).catch(() => {
+        throw new Error("文本任务事件流连接失败：无法连接服务端，请检查网络");
+    });
+    if (response.status === 401) {
+        useServerStore.getState().clearSession();
+        useServerStore.getState().setLoginOpen(true);
+        throw new Error("登录状态已失效，请重新登录");
+    }
+    if (!response.ok) throw new Error(`文本任务事件流连接失败（HTTP ${response.status}）`);
+    let final: { status: ServerJobStatus; error: string } | null = null;
+    await readServerSse(response, (data) => {
+        const event = JSON.parse(data) as ServerJobTextEvent;
+        if (event.type === "delta") onDelta(event.offset, event.text);
+        else final = { status: event.status, error: event.error };
+    }, "文本任务事件流没有返回内容");
+    if (!final) throw new Error("文本任务事件流意外中断");
+    return final as { status: ServerJobStatus; error: string };
 }
 
 /** 文本类调用需要流式读取，单独走 fetch 拿原始 Response。 */

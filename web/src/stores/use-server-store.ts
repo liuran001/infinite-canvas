@@ -14,6 +14,8 @@ export type ServerUser = {
     credits: number;
     createdAt: string;
     updatedAt: string;
+    /** 是否已绑定 Linux.do，账号设置据此决定给「绑定」还是「解绑」。 */
+    linuxDoBound: boolean;
 };
 
 /** label 是管理员配置的展示名，服务端保证有值（留空时回落成 name），请求仍然用 name。 */
@@ -63,6 +65,8 @@ type ServerStore = {
     syncedAt: string;
     /** 登录弹窗开关。全站数据都在服务端，未登录时由它引导登录。 */
     loginOpen: boolean;
+    /** 登录失败原因，显示在登录弹窗里。第三方登录被拒时用它把原因留给用户看。 */
+    loginError: string;
     syncState: SyncState;
     syncError: string;
     setMode: (mode: ServerModeSetting) => void;
@@ -74,6 +78,7 @@ type ServerStore = {
     setStatus: (status: ServerStatus, error?: string) => void;
     setSyncedAt: (syncedAt: string) => void;
     setLoginOpen: (loginOpen: boolean) => void;
+    setLoginError: (loginError: string) => void;
     setSyncState: (syncState: SyncState, syncError?: string) => void;
     clearSession: () => void;
 };
@@ -93,17 +98,19 @@ export const useServerStore = create<ServerStore>()(
             error: "",
             syncedAt: "",
             loginOpen: false,
+            loginError: "",
             syncState: "idle",
             syncError: "",
             setMode: (mode) => set(mode === "off" ? { mode, status: "idle", error: "" } : { mode }),
             setDetected: (detected) => set({ detected }),
             setBaseUrl: (baseUrl) => set({ baseUrl: baseUrl.trim().replace(/\/+$/, ""), status: "idle", error: "" }),
-            setSession: (token, user) => set({ token, user, status: "ready", error: "", loginOpen: false }),
+            setSession: (token, user) => set({ token, user, status: "ready", error: "", loginOpen: false, loginError: "" }),
             setUser: (user) => set({ user }),
             setSettings: (settings) => set({ settings }),
             setStatus: (status, error = "") => set({ status, error }),
             setSyncedAt: (syncedAt) => set({ syncedAt }),
-            setLoginOpen: (loginOpen) => set({ loginOpen }),
+            setLoginOpen: (loginOpen) => set(loginOpen ? { loginOpen } : { loginOpen, loginError: "" }),
+            setLoginError: (loginError) => set({ loginError }),
             setSyncState: (syncState, syncError = "") => set({ syncState, syncError }),
             clearSession: () => set({ token: "", user: null, status: "idle", error: "", syncedAt: "" }),
         }),

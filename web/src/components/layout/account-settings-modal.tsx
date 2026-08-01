@@ -16,6 +16,7 @@ export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose
     const [linking, setLinking] = useState(false);
     const user = useServerStore((state) => state.user);
     const linuxDoEnabled = useServerStore((state) => state.settings?.auth.linuxDo.enabled);
+    const linuxDoBound = useServerStore((state) => state.user?.linuxDoBound);
     const [storage, setStorage] = useState<ServerStorage | null>(null);
 
     useEffect(() => {
@@ -106,14 +107,17 @@ export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose
             {linuxDoEnabled ? (
                 <>
                     <div className="mt-6 text-sm font-semibold">Linux.do 账号</div>
-                    <div className="mt-1 text-xs text-stone-500">绑定后可以直接用 Linux.do 登录；没有设置过密码的账号不能解绑，否则将无法登录。</div>
+                    <div className="mt-1 text-xs text-stone-500">{linuxDoBound ? "已绑定，可以直接用 Linux.do 登录；没有设置过密码的账号不能解绑，否则将无法登录。" : "绑定后可以直接用 Linux.do 登录。"}</div>
                     <div className="mt-3 flex gap-2">
-                        <Button loading={linking} onClick={() => void bindLinuxDo()}>
-                            绑定 Linux.do
-                        </Button>
-                        <Button danger loading={linking} onClick={() => void unbindLinuxDo()}>
-                            解绑
-                        </Button>
+                        {linuxDoBound ? (
+                            <Button danger loading={linking} onClick={() => void unbindLinuxDo()}>
+                                解绑 Linux.do
+                            </Button>
+                        ) : (
+                            <Button loading={linking} onClick={() => void bindLinuxDo()}>
+                                绑定 Linux.do
+                            </Button>
+                        )}
                     </div>
                 </>
             ) : null}

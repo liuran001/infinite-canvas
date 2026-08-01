@@ -1,7 +1,8 @@
 import { browserSupportsWebAuthn, startAuthentication } from "@simplewebauthn/browser";
-import { App, Button, Divider, Form, Input, Modal } from "antd";
+import { Alert, App, Button, Divider, Form, Input, Modal } from "antd";
 import { Fingerprint, KeyRound, Loader2, User } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 
 import { serverApi } from "@/services/api/server";
 import { useServerStore } from "@/stores/use-server-store";
@@ -22,6 +23,7 @@ export function LoginModal() {
     const settings = useServerStore((state) => state.settings);
     const setLoginOpen = useServerStore((state) => state.setLoginOpen);
     const setSession = useServerStore((state) => state.setSession);
+    const loginError = useServerStore((state) => state.loginError);
     const canRegister = settings?.auth.allowRegister !== false;
     const isRegister = mode === "register";
 
@@ -83,6 +85,8 @@ export function LoginModal() {
                 <p className="mt-1 text-xs text-stone-500">画布、素材与生成记录都保存在服务器，可在多设备之间同步</p>
             </div>
 
+            {loginError ? <Alert type="error" showIcon className="!mb-4" message={loginError} /> : null}
+
             <Form form={form} layout="vertical" requiredMark={false} onFinish={submit} disabled={submitting}>
                 <Form.Item name="username" rules={[{ required: true, message: "请输入用户名" }]} className="mb-3">
                     <Input size="large" autoComplete="username" placeholder="用户名" prefix={<User className="size-4 text-stone-400" />} />
@@ -125,11 +129,17 @@ export function LoginModal() {
 /** OAuth 回调落地：把查询参数里的令牌换成本地会话，然后回到原页面。 */
 export function OauthCallbackHandler() {
     const { message } = App.useApp();
+    const navigate = useNavigate();
     const setSession = useServerStore((state) => state.setSession);
     const [pending, setPending] = useState(true);
+    // 回调参数只在首次渲染时读一次：处理过程本身会改写地址，
+    // 再去读实时地址会拿到已经被清空的参数，把结果误判成「没有令牌」。
+    const [params] = useState(() => new URLSearchParams(window.location.search));
+    const handledRef = useRef(false);
 
     useEffect(() => {
-        const params = new URLSearchParams(window.location.search);
+        if (handledRef.current) return;
+        handledRef.current = true;
         const token = params.get("token");
         const error = params.get("error");
         const redirect = params.get("redirect") || "/";
@@ -142,8 +152,12 @@ export function OauthCallbackHandler() {
             return;
         }
         if (error) {
-            message.error(error);
-            window.location.replace(redirect);
+            // 用 SPA 跳转而不是整页替换：整页替换会立刻卸载页面，提示来不及显示，
+            // 用户只看到地址栏一闪。改成把原因留在登录弹窗里，直到用户主动关掉。
+            useServerStore.getState().setLoginError(error);
+            useServerStore.getState().setLoginOpen(true);
+            navigate(redirect, { replace: true });
+            setPending(false);
             return;
         }
         if (!token) {
@@ -163,7 +177,7 @@ export function OauthCallbackHandler() {
                 message.error(failure.message);
                 window.location.replace("/");
             });
-    }, []);
+    }, [navigate, params]);
 
     if (!pending) return null;
     return (

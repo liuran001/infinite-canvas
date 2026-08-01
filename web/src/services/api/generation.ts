@@ -9,7 +9,7 @@ import { modelOptionName, type AiConfig } from "@/stores/use-config-store";
 import { useJobStore, type JobContext, type TrackedJob } from "@/stores/use-job-store";
 import { serverModelFormat, useServerStore, type ServerCapability } from "@/stores/use-server-store";
 import { normalizeBackground, normalizeQuality, resolveRequestSize } from "./image";
-import { serverApi, serverFileUrl, type ServerFile } from "./server";
+import { serverApi, serverFileUrl, serverJobTextStream, type ServerFile, type ServerJobKind } from "./server";
 import { normalizeVideoResolution, normalizeVideoSeconds, normalizeVideoSize } from "./video";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -26,6 +26,9 @@ export type VideoTaskState = { status: "pending" } | { status: "completed"; file
 
 const IMAGE_POLL_MS = 2000;
 const AUDIO_POLL_MS = 2000;
+/** 文本事件流断了就带着已收到的字符数重连；重试几次仍连不上才算失败，服务端任务本身不受影响。 */
+const TEXT_STREAM_RETRIES = 3;
+const TEXT_STREAM_RETRY_MS = 1500;
 /** 视频任务偏慢，轮询间隔更长；服务端自己保活，客户端也多等一会儿避免提前判超时丢结果。 */
 export const VIDEO_POLL_MS = 5000;
 export const VIDEO_POLL_LIMIT = 300;
@@ -82,7 +85,7 @@ function delay(ms: number, signal?: AbortSignal) {
 }
 
 /** 提交任务：clientJobId 交给服务端做幂等去重，同一个键只会生成一次。 */
-async function submitJob(kind: "image" | "video" | "audio", model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], clientJobId: string, context?: JobContext) {
+async function submitJob(kind: ServerJobKind, model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], clientJobId: string, context?: JobContext) {
     const job = await serverApi.createJob({ clientJobId, kind, model, prompt, params, inputFileIds, context });
     useJobStore.getState().trackJob(clientJobId, job, context);
     return job;
@@ -114,7 +117,7 @@ function withUserSystemPrompt(config: AiConfig, prompt: string) {
     return systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
 }
 
-async function runJob(kind: "image" | "video" | "audio", model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], intervalMs: number, options?: GenerationOptions) {
+async function runJob(kind: ServerJobKind, model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], intervalMs: number, options?: GenerationOptions) {
     const clientJobId = options?.clientJobId || nanoid();
     const job = await submitJob(kind, model, prompt, params, inputFileIds, clientJobId, options?.context);
     return waitJob(job.id, clientJobId, intervalMs, options);
@@ -175,6 +178,11 @@ function audioParams(config: AiConfig) {
     };
 }
 
+/** 推理档位由服务端按渠道协议决定要不要带，前端只负责透传用户选的那档。 */
+function textParams(config: AiConfig) {
+    return { reasoningEffort: config.reasoningEffort };
+}
+
 /** 生成图片：提交服务端任务并轮询结果。 */
 export async function generateImages(config: AiConfig, prompt: string, references: ReferenceImage[] = [], options?: ImageGenerationOptions): Promise<GeneratedImage[]> {
     if (options?.mask) throw new Error("服务端生成暂不支持蒙版编辑");
@@ -230,4 +238,56 @@ export async function generateAudio(config: AiConfig, prompt: string, options?: 
     const outputs = await runJob("audio", model, prompt, audioParams(config), [], AUDIO_POLL_MS, options);
     if (!outputs[0]) throw new Error("任务成功但没有返回音频");
     return adoptServerMedia(outputs[0]);
+}
+
+/**
+ * 订阅文本任务并把增量喂给调用方，返回完整文本。
+ * 连接断了只是订阅断了，服务端照常跑完并落库，这里带上已收到的字符数重连即可续上；
+ * 主动取消才顺带把服务端任务也取消掉，页面刷新不会走到这里，任务因此能继续跑完。
+ */
+async function streamJobText(jobId: string, clientJobId: string, onDelta: (text: string) => void, options?: GenerationOptions): Promise<string> {
+    let text = "";
+    try {
+        for (let attempt = 0; ; attempt += 1) {
+            const final = await serverJobTextStream(
+                jobId,
+                text.length,
+                (offset, delta) => {
+                    // 按 offset 覆盖写入：重连补发、任务重跑导致的整段重发都能落到正确位置。
+                    text = text.slice(0, offset) + delta;
+                    onDelta(text);
+                },
+                options?.signal,
+            ).catch((error: unknown) => {
+                if (options?.signal?.aborted || attempt >= TEXT_STREAM_RETRIES) throw error;
+                return null;
+            });
+            if (!final) {
+                await delay(TEXT_STREAM_RETRY_MS, options?.signal);
+                continue;
+            }
+            if (final.status === "succeeded") return text;
+            if (final.status === "canceled") throw new DOMException("Aborted", "AbortError");
+            throw new Error(final.error || "生成失败");
+        }
+    } catch (error) {
+        if (options?.signal?.aborted) void serverApi.cancelJob(jobId).catch(() => undefined);
+        throw error;
+    } finally {
+        useJobStore.getState().untrackJob(clientJobId);
+    }
+}
+
+/** 生成文本：提交服务端任务并订阅增量，刷新或断网后可凭任务恢复已经生成出来的内容。 */
+export async function generateText(config: AiConfig, prompt: string, references: ReferenceImage[] = [], onDelta: (text: string) => void, options?: GenerationOptions): Promise<string> {
+    const model = serverModel(config, "text");
+    const inputFileIds = await Promise.all(references.map(imageFileId));
+    const clientJobId = options?.clientJobId || nanoid();
+    const job = await submitJob("text", model, withUserSystemPrompt(config, prompt), textParams(config), inputFileIds, clientJobId, options?.context);
+    return streamJobText(job.id, clientJobId, onDelta, options);
+}
+
+/** 续订一个已存在的文本任务，不会重新提交；任务已经结束时会一次性拿回完整内容。 */
+export function resumeText(job: TrackedJob, onDelta: (text: string) => void, options?: GenerationOptions): Promise<string> {
+    return streamJobText(job.jobId, job.clientJobId, onDelta, options);
 }

@@ -1,4 +1,3 @@
-import type { AiTextMessage } from "@/services/api/image";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
 import { seedanceReferenceLabel } from "@/lib/seedance-video";
 import type { ReferenceImage } from "@/types/image";
@@ -125,19 +124,6 @@ export function buildNodeGenerationInputs(nodeId: string, nodes: CanvasNodeData[
         if (text) return [{ nodeId: node.id, type: "text" as const, title: node.title, text }];
         return [];
     });
-}
-
-export function buildNodeResponseMessages(context: NodeGenerationContext): AiTextMessage[] {
-    if (!context.referenceImages.length) {
-        return [{ role: "user", content: context.prompt }];
-    }
-
-    return [
-        {
-            role: "user",
-            content: [{ type: "text" as const, text: context.prompt }, ...context.referenceImages.map((image) => ({ type: "image_url" as const, image_url: { url: image.dataUrl } }))],
-        },
-    ];
 }
 
 export async function hydrateNodeGenerationContext(context: NodeGenerationContext) {

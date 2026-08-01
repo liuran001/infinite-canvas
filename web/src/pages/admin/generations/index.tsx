@@ -20,6 +20,7 @@ const kindOptions = [
     { label: "图片", value: "image" },
     { label: "视频", value: "video" },
     { label: "音频", value: "audio" },
+    { label: "文本", value: "text" },
 ];
 
 const label = (options: Array<{ label: string; value: string }>, value: string) => options.find((item) => item.value === value)?.label || value;

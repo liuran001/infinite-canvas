@@ -4,8 +4,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Group, Video } from "lucide-react";
 import { saveAs } from "file-saver";
 
-import { requestImageQuestion } from "@/services/api/image";
-import { generateAudio, generateImages, generateVideo, isGenerationReady, resumeImages, resumeMedia, storeGeneratedImage } from "@/services/api/generation";
+import { generateAudio, generateImages, generateText, generateVideo, isGenerationReady, resumeImages, resumeMedia, resumeText, storeGeneratedImage } from "@/services/api/generation";
 import { useJobStore, type JobContext, type TrackedJob } from "@/stores/use-job-store";
 import { defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { uploadImage } from "@/services/image-storage";
@@ -28,7 +27,7 @@ import { CanvasNodeCropDialog, type CanvasImageCropRect } from "@/components/can
 import { CanvasNodeMaskEditDialog, type CanvasImageMaskEditPayload } from "@/components/canvas/canvas-node-mask-edit-dialog";
 import { CanvasNodeSplitDialog, type CanvasImageSplitParams } from "@/components/canvas/canvas-node-split-dialog";
 import { CanvasNodeUpscaleDialog, type CanvasImageUpscaleParams } from "@/components/canvas/canvas-node-upscale-dialog";
-import { buildNodeGenerationContext, buildNodeGenerationInputs, buildNodeResponseMessages, hydrateNodeGenerationContext, type NodeGenerationInput } from "@/components/canvas/canvas-node-generation";
+import { buildNodeGenerationContext, buildNodeGenerationInputs, hydrateNodeGenerationContext, type NodeGenerationInput } from "@/components/canvas/canvas-node-generation";
 import { CanvasNodeHoverToolbar, CanvasNodeInfoModal } from "@/components/canvas/canvas-node-hover-toolbar";
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { Minimap } from "@/components/canvas/canvas-mini-map";
@@ -203,6 +202,7 @@ function InfiniteCanvasPage() {
     const bindCloudAgentProject = useCloudAgentStore((state) => state.bindProject);
     const cloudAgentCanvasReload = useCloudAgentStore((state) => state.canvasReload);
     const isServerModeReady = useIsServerMode();
+    const serverToken = useServerStore((state) => state.token);
     const cloudAgentEnabled = useServerStore((state) => Boolean(state.settings?.agent.enabled));
     const appliedCanvasReloadRef = useRef(0);
     const canvasReloadRetryRef = useRef(0);
@@ -309,6 +309,14 @@ function InfiniteCanvasPage() {
     const resumeCanvasJob = useCallback(async (job: TrackedJob) => {
         const nodeId = job.context.nodeId || "";
         try {
+            if (job.kind === "text") {
+                // 文本任务已经生成出来的部分在服务端，续订事件流即可先拿回这一半，再接着收后面的内容。
+                const answer = await resumeText(job, (text) =>
+                    setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: text } } : item))),
+                );
+                setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: answer, status: NODE_STATUS_SUCCESS, errorDetails: undefined } } : item)));
+                return;
+            }
             if (job.kind === "image") {
                 const image = await storeGeneratedImage((await resumeImages(job))[0]);
                 const spec = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
@@ -344,7 +352,10 @@ function InfiniteCanvasPage() {
     );
 
     useEffect(() => {
-        if (!hydrated) return;
+        // 登录态是异步就绪的（要等 /auth/me 回来）。本地已经缓存过这张画布时，画布恢复会比登录态先跑完，
+        // 那一刻查服务端任务会被判成「未登录」直接返回空，仍在跑的节点就被误报成「生成已中断」。
+        // 有令牌就先等它确认完再恢复；令牌失效会被清空，这里也会跟着重新跑，不会卡死。
+        if (!hydrated || (serverToken && !isServerModeReady)) return;
         setProjectLoaded(false);
         let cancelled = false;
 
@@ -398,7 +409,7 @@ function InfiniteCanvasPage() {
         return () => {
             cancelled = true;
         };
-    }, [hydrated, navigate, openProject, projectId]);
+    }, [hydrated, isServerModeReady, navigate, openProject, projectId, serverToken]);
 
     useEffect(() => {
         if (!projectLoaded) return;
@@ -2470,16 +2481,17 @@ function InfiniteCanvasPage() {
                 const answers = await Promise.all(
                     textTargetIds.map((targetNodeId) => {
                         let localStreamed = "";
-                        return requestImageQuestion(
+                        return generateText(
                             generationConfig,
-                            buildNodeResponseMessages({ ...generationContext, prompt: effectivePrompt }),
+                            effectivePrompt,
+                            generationContext.referenceImages,
                             (text) => {
                                 localStreamed = text;
                                 streamed = text;
                                 if (isConfigNode) return;
                                 setNodes((prev) => prev.map((node) => (node.id === targetNodeId ? { ...node, type: CanvasNodeType.Text, metadata: { ...node.metadata, content: text, status: NODE_STATUS_LOADING } } : node)));
                             },
-                            { signal: controller.signal },
+                            { signal: controller.signal, context: jobContext(targetNodeId, effectivePrompt) },
                         )
                             .then((answer) => ({ nodeId: targetNodeId, content: answer || localStreamed }))
                             .finally(() => finishGenerationRequest(targetNodeId, controller));
@@ -2568,14 +2580,15 @@ function InfiniteCanvasPage() {
                 if (node.type === CanvasNodeType.Text) {
                     if (!context) return;
                     let streamed = "";
-                    const answer = await requestImageQuestion(
+                    const answer = await generateText(
                         generationConfig,
-                        buildNodeResponseMessages({ ...context, prompt }),
+                        prompt,
+                        context.referenceImages,
                         (text) => {
                             streamed = text;
                             setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: text, status: NODE_STATUS_LOADING } } : item)));
                         },
-                        { signal: controller.signal },
+                        { signal: controller.signal, context: jobContext(node.id, prompt) },
                     );
                     setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: answer || streamed, prompt, status: NODE_STATUS_SUCCESS } } : item)));
                     return;

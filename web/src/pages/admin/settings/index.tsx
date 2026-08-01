@@ -1,12 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
-import { App, AutoComplete, Button, Input, InputNumber, Select, Switch } from "antd";
+import { App, AutoComplete, Button, Input, InputNumber, Select, Switch, Typography } from "antd";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { useAdminAction } from "@/pages/admin/use-admin-action";
 import { adminApi, type AdminChannel, type AdminChannelModel, type AdminSearchProvider, type AdminSettings, type ModelCost } from "@/services/api/admin";
 import { imageQualityOptions } from "@/components/image-settings-panel";
-import type { ServerCapability, ServerSettings } from "@/stores/use-server-store";
+import { useServerStore, type ServerCapability, type ServerSettings } from "@/stores/use-server-store";
 import { ChannelEditorModal } from "./components/channel-editor-modal";
 
 const newChannel = (): AdminChannel => ({ apiFormat: "openai", name: "", baseUrl: "", apiKey: "", models: [], weight: 1, enabled: true, remark: "" });
@@ -41,6 +41,9 @@ export default function AdminSettingsPage() {
     const runAction = useAdminAction();
     const { data, isFetching, refetch } = useQuery({ queryKey: ["admin-settings"], queryFn: adminApi.settings });
     const [draft, setDraft] = useState<AdminSettings | null>(null);
+    // 回调地址给管理员照抄到 Linux.do 的 OAuth 应用。baseUrl 留空表示与前端同源。
+    const serverBaseUrl = useServerStore((state) => state.baseUrl);
+    const oauthCallbackUrl = `${serverBaseUrl || window.location.origin}/api/auth/linux-do/callback`;
     const [editingChannel, setEditingChannel] = useState<AdminChannel | null>(null);
     const [editingIndex, setEditingIndex] = useState<number | undefined>(undefined);
     const [saving, setSaving] = useState(false);
@@ -326,6 +329,15 @@ export default function AdminSettingsPage() {
                         <span className="mb-1 block text-sm font-medium">Linux.do Client Secret</span>
                         <Input.Password value={draft.private.auth.linuxDo.clientSecret} onChange={(event) => patchPrivate({ auth: { linuxDo: { ...draft.private.auth.linuxDo, clientSecret: event.target.value } } })} placeholder="留空表示不修改" />
                     </label>
+                </div>
+                <div className="mt-4 rounded-lg bg-stone-100 px-3 py-2.5 dark:bg-white/5">
+                    <span className="block text-sm font-medium">回调地址</span>
+                    <Typography.Paragraph className="!mb-1 !mt-1 !text-sm" copyable={{ text: oauthCallbackUrl }}>
+                        <code className="break-all">{oauthCallbackUrl}</code>
+                    </Typography.Paragraph>
+                    <span className="block text-xs text-stone-500">
+                        在 Linux.do 的 OAuth 应用里把回调地址填成这个。地址取自当前访问的域名，如果站点通过反向代理对外提供服务，请确认这里显示的就是用户实际访问的地址，并与服务端 <code>PUBLIC_BASE_URL</code> 保持一致。
+                    </span>
                 </div>
             </section>
 
