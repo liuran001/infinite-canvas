@@ -1,37 +1,17 @@
 import { useMemo } from "react";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { nanoid } from "nanoid";
 
-import { isServerMode, useServerStore } from "@/stores/use-server-store";
+import { useServerStore } from "@/stores/use-server-store";
 
-export type ApiCallFormat = "openai" | "gemini" | "ark";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
-/** auto 表示按当前可用模型自动显隐，on / off 为用户手动覆盖。 */
-export type CapabilityVisibility = "auto" | "on" | "off";
 
-export type ChannelModel = {
-    name: string;
-    capability: ModelCapability;
-    script?: string;
-};
-
-export type ModelChannel = {
-    id: string;
-    name: string;
-    baseUrl: string;
-    apiKey: string;
-    apiFormat: ApiCallFormat;
-    models: ChannelModel[];
-};
-
+/**
+ * 用户偏好。模型渠道与密钥都由管理员在服务端配置，这里只保留个人偏好，
+ * 模型字段存的是服务端下发的模型名。
+ */
 export type AiConfig = {
-    channelMode: "remote" | "local";
-    baseUrl: string;
-    apiKey: string;
-    apiFormat: ApiCallFormat;
-    channels: ModelChannel[];
     model: string;
     imageModel: string;
     videoModel: string;
@@ -47,56 +27,23 @@ export type AiConfig = {
     videoWatermark: string;
     systemPrompt: string;
     reasoningEffort: ReasoningEffort;
-    models: string[];
     quality: string;
     size: string;
     background: string;
     count: string;
     canvasImageCount: string;
-    /** 生图/文本/视频/音频四类能力的入口显隐，默认按可用模型自动决定。 */
-    capabilityVisibility: Record<ModelCapability, CapabilityVisibility>;
 };
 
-export type WebdavSyncConfig = {
-    url: string;
-    username: string;
-    password: string;
-    directory: string;
-    lastSyncedAt: string;
-};
-export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "server" | "webdav";
+export type ConfigTabKey = "preferences";
 
 export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
-const CHANNEL_MODEL_SEPARATOR = "::";
-const OPENAI_BASE_URL = "https://api.openai.com";
-const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
-const ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
 
 export const defaultConfig: AiConfig = {
-    channelMode: "local",
-    baseUrl: OPENAI_BASE_URL,
-    apiKey: "",
-    apiFormat: "openai",
-    channels: [
-        {
-            id: "default",
-            name: "默认渠道",
-            baseUrl: OPENAI_BASE_URL,
-            apiKey: "",
-            apiFormat: "openai",
-            models: [
-                { name: "gpt-image-2", capability: "image" },
-                { name: "grok-imagine-video", capability: "video" },
-                { name: "gpt-5.5", capability: "text" },
-                { name: "gpt-4o-mini-tts", capability: "audio" },
-            ],
-        },
-    ],
-    model: "default::gpt-image-2",
-    imageModel: "default::gpt-image-2",
-    videoModel: "default::grok-imagine-video",
-    textModel: "default::gpt-5.5",
-    audioModel: "default::gpt-4o-mini-tts",
+    model: "",
+    imageModel: "",
+    videoModel: "",
+    textModel: "",
+    audioModel: "",
     audioVoice: "alloy",
     audioFormat: "mp3",
     audioSpeed: "1",
@@ -107,60 +54,80 @@ export const defaultConfig: AiConfig = {
     videoWatermark: "false",
     systemPrompt: "",
     reasoningEffort: "auto",
-    models: ["default::gpt-image-2", "default::grok-imagine-video", "default::gpt-5.5", "default::gpt-4o-mini-tts"],
     quality: "auto",
     size: "1:1",
     background: "",
     count: "1",
     canvasImageCount: "3",
-    capabilityVisibility: { image: "auto", text: "auto", video: "auto", audio: "auto" },
-};
-
-export const defaultWebdavSyncConfig: WebdavSyncConfig = {
-    url: "",
-    username: "",
-    password: "",
-    directory: "infinite-canvas",
-    lastSyncedAt: "",
 };
 
 type ConfigStore = {
     config: AiConfig;
-    webdav: WebdavSyncConfig;
     isConfigOpen: boolean;
     configTab: ConfigTabKey;
     shouldPromptContinue: boolean;
     updateConfig: <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
-    updateWebdavConfig: <K extends keyof WebdavSyncConfig>(key: K, value: WebdavSyncConfig[K]) => void;
     isAiConfigReady: (config: AiConfig, model: string) => boolean;
     openConfigDialog: (shouldPromptContinue?: boolean, tab?: ConfigTabKey) => void;
     setConfigDialogOpen: (isOpen: boolean) => void;
     clearPromptContinue: () => void;
 };
 
-const VIDEO_KEYWORDS = ["seedance", "video", "sora", "veo", "kling", "wan", "hailuo"];
-const AUDIO_KEYWORDS = ["audio", "tts", "speech", "voice", "music", "sound"];
-const IMAGE_KEYWORDS = ["seedream", "gpt-image", "image", "dall-e", "dalle", "imagen", "flux", "sdxl", "stable-diffusion", "midjourney"];
-
-/** Best-effort default capability for a freshly fetched model name; user can override in the channel editor. */
-export function guessCapability(name: string): ModelCapability {
-    const value = name.toLowerCase();
-    if (VIDEO_KEYWORDS.some((keyword) => value.includes(keyword))) return "video";
-    if (AUDIO_KEYWORDS.some((keyword) => value.includes(keyword))) return "audio";
-    if (IMAGE_KEYWORDS.some((keyword) => value.includes(keyword))) return "image";
-    return "text";
+/** 服务端配好模型就算就绪，密钥不再由前端持有。 */
+function isAiConfigReady(_config: AiConfig, model: string) {
+    const models = useServerStore.getState().settings?.modelChannel.models || [];
+    return Boolean(model.trim()) && models.some((item) => item.name === model.trim());
 }
 
-function findChannelModel(config: AiConfig, value: string): { channel: ModelChannel; model: ChannelModel } | null {
-    const decoded = decodeChannelModel(value);
-    const name = decoded?.model || value;
-    const channel = decoded ? config.channels.find((item) => item.id === decoded.channelId) : config.channels.find((item) => item.models.some((model) => model.name === name));
-    const model = channel?.models.find((item) => item.name === name);
-    return channel && model ? { channel, model } : null;
+/** 动态引入避免与同步服务循环依赖，写法与画布、素材、插件保持一致。 */
+function pushPreferences() {
+    void import("@/services/remote-sync").then((module) => module.pushPreferences());
 }
 
-export function modelCapabilityOf(config: AiConfig, value: string): ModelCapability | undefined {
-    return findChannelModel(config, value)?.model.capability;
+export const useConfigStore = create<ConfigStore>()(
+    persist(
+        (set) => ({
+            config: defaultConfig,
+            isConfigOpen: false,
+            configTab: "preferences",
+            shouldPromptContinue: false,
+            updateConfig: (key, value) => {
+                set((state) => ({ config: { ...state.config, [key]: value } }));
+                pushPreferences();
+            },
+            isAiConfigReady,
+            openConfigDialog: (shouldPromptContinue = false, configTab = "preferences") => set({ isConfigOpen: true, shouldPromptContinue, configTab }),
+            setConfigDialogOpen: (isConfigOpen) => set({ isConfigOpen }),
+            clearPromptContinue: () => set({ shouldPromptContinue: false }),
+        }),
+        {
+            name: CONFIG_STORE_KEY,
+            partialize: (state) => ({ config: state.config }),
+            merge: (persisted, current) => ({ ...current, config: { ...defaultConfig, ...((persisted as { config?: Partial<AiConfig> })?.config || {}) } }),
+        },
+    ),
+);
+
+export function useEffectiveConfig() {
+    return useConfigStore((state) => state.config);
+}
+
+/** 取值一律用服务端下发的原始模型名，展示走管理员配置的展示名。 */
+export function modelOptionName(value: string) {
+    return (value || "").trim();
+}
+
+export function modelOptionLabel(_config: AiConfig, value: string) {
+    const name = modelOptionName(value);
+    return serverModels().find((model) => model.name === name)?.label || name;
+}
+
+export function serverModels() {
+    return useServerStore.getState().settings?.modelChannel.models || [];
+}
+
+export function modelCapabilityOf(_config: AiConfig, value: string): ModelCapability | undefined {
+    return serverModels().find((model) => model.name === modelOptionName(value))?.capability;
 }
 
 export function modelMatchesCapability(config: AiConfig, value: string, capability?: ModelCapability) {
@@ -168,289 +135,32 @@ export function modelMatchesCapability(config: AiConfig, value: string, capabili
     return modelCapabilityOf(config, value) === capability;
 }
 
-export function resolveModelForCapability(config: AiConfig, currentModel: string | undefined, capability: ModelCapability) {
-    // 服务器模式下模型由服务端下发，本地渠道的 channelId::name 编码在服务端匹配不上。
-    if (isServerMode()) {
-        const channel = useServerStore.getState().settings?.modelChannel;
-        if (currentModel && channel?.models.some((model) => model.name === currentModel && model.capability === capability)) return currentModel;
-        return (capability === "image" ? channel?.defaultImageModel : capability === "video" ? channel?.defaultVideoModel : capability === "audio" ? channel?.defaultAudioModel : channel?.defaultTextModel) || "";
-    }
-    const defaultModel = capability === "image" ? config.imageModel : capability === "video" ? config.videoModel : capability === "audio" ? config.audioModel : config.textModel;
-    const fallbackModel = capability === "image" ? defaultConfig.imageModel : capability === "video" ? defaultConfig.videoModel : capability === "audio" ? defaultConfig.audioModel : defaultConfig.textModel;
-    if (currentModel && modelMatchesCapability(config, currentModel, capability)) return currentModel;
-    if (defaultModel && modelMatchesCapability(config, defaultModel, capability)) return defaultModel;
-    return fallbackModel;
+export function selectableModelsByCapability(_config: AiConfig, capability?: ModelCapability) {
+    const models = serverModels();
+    return (capability ? models.filter((model) => model.capability === capability) : models).map((model) => model.name);
 }
 
-export function selectableModelsByCapability(config: AiConfig, capability?: ModelCapability) {
-    if (isServerMode()) {
-        const models = useServerStore.getState().settings?.modelChannel.models || [];
-        return (capability ? models.filter((model) => model.capability === capability) : models).map((model) => model.name);
-    }
-    if (!capability) return config.models;
-    return config.channels.flatMap((channel) => channel.models.filter((model) => model.capability === capability).map((model) => encodeChannelModel(channel.id, model.name)));
+/** 当前选择仍然有效就保留，否则回落到服务端为该能力配置的默认模型。 */
+export function resolveModelForCapability(config: AiConfig, currentModel: string | undefined, capability: ModelCapability) {
+    const channel = useServerStore.getState().settings?.modelChannel;
+    const name = modelOptionName(currentModel || "");
+    if (name && channel?.models.some((model) => model.name === name && model.capability === capability)) return name;
+    const preferred = capability === "image" ? config.imageModel : capability === "video" ? config.videoModel : capability === "audio" ? config.audioModel : config.textModel;
+    if (preferred && channel?.models.some((model) => model.name === preferred && model.capability === capability)) return preferred;
+    return (capability === "image" ? channel?.defaultImageModel : capability === "video" ? channel?.defaultVideoModel : capability === "audio" ? channel?.defaultAudioModel : channel?.defaultTextModel) || "";
 }
 
 export const modelCapabilities: ModelCapability[] = ["image", "text", "video", "audio"];
 
-/**
- * 能力入口是否显示。默认按当前模式下有没有对应模型自动判断，
- * 用户可以在偏好设置里手动覆盖成始终显示或始终隐藏。
- * 一个模型都没配时全部显示，否则新用户会看到一个空界面且不知道去哪配置。
- */
-export function isCapabilityEnabled(config: AiConfig, capability: ModelCapability) {
-    const override = config.capabilityVisibility?.[capability] || "auto";
-    if (override !== "auto") return override === "on";
-    if (!selectableModelsByCapability(config).length) return true;
-    return selectableModelsByCapability(config, capability).length > 0;
+/** 功能入口是否显示，由管理员在后台统一控制；没配对应模型时也自动隐藏。 */
+export function isCapabilityEnabled(capability: ModelCapability) {
+    const settings = useServerStore.getState().settings;
+    if (!settings) return true;
+    if (settings.capabilities?.[capability] === false) return false;
+    return settings.modelChannel.models.some((model) => model.capability === capability);
 }
 
-/** 组件里用，会跟随本地渠道与服务端模型列表的变化重新计算。 */
 export function useEnabledCapabilities() {
-    const config = useConfigStore((state) => state.config);
-    const serverModels = useServerStore((state) => state.settings?.modelChannel.models);
-    return useMemo(
-        () => Object.fromEntries(modelCapabilities.map((capability) => [capability, isCapabilityEnabled(config, capability)])) as Record<ModelCapability, boolean>,
-        // serverModels 不直接参与计算，但服务器模式下的判断依赖它，必须进依赖数组。
-        [config, serverModels],
-    );
-}
-
-/** The user script (if any) attached to a model; empty string means use the system default call. */
-export function resolveModelScript(config: AiConfig, value: string) {
-    return findChannelModel(config, value)?.model.script?.trim() || "";
-}
-
-function isAiConfigReady(config: AiConfig, model: string) {
-    const channel = resolveModelChannel(config, model);
-    return Boolean(model.trim() && channel.baseUrl.trim() && channel.apiKey.trim());
-}
-
-export const useConfigStore = create<ConfigStore>()(
-    persist(
-        (set, get) => ({
-            config: defaultConfig,
-            webdav: defaultWebdavSyncConfig,
-            isConfigOpen: false,
-            configTab: "channels",
-            shouldPromptContinue: false,
-            updateConfig: (key, value) =>
-                set((state) => ({
-                    config: {
-                        ...state.config,
-                        [key]: value,
-                    },
-                })),
-            updateWebdavConfig: (key, value) =>
-                set((state) => ({
-                    webdav: {
-                        ...state.webdav,
-                        [key]: value,
-                    },
-                })),
-            isAiConfigReady: (config, model) => isAiConfigReady(config, model),
-            openConfigDialog: (shouldPromptContinue = false, configTab = "channels") => set({ isConfigOpen: true, shouldPromptContinue, configTab }),
-            setConfigDialogOpen: (isConfigOpen) => set({ isConfigOpen }),
-            clearPromptContinue: () => set({ shouldPromptContinue: false }),
-        }),
-        {
-            name: CONFIG_STORE_KEY,
-            partialize: (state) => ({ config: state.config, webdav: state.webdav }),
-            merge: (persisted, current) => {
-                const persistedState = (persisted || {}) as Partial<ConfigStore>;
-                const persistedConfig = (persistedState.config || {}) as Partial<AiConfig>;
-                const persistedWebdav = (persistedState.webdav || {}) as Partial<WebdavSyncConfig>;
-                const config = { ...defaultConfig, ...persistedConfig };
-                if (!Array.isArray(persistedConfig.channels)) config.channels = [];
-                const channels = normalizeChannels(config);
-                const models = modelOptionsFromChannels(channels);
-                return {
-                    ...current,
-                    webdav: { ...defaultWebdavSyncConfig, ...persistedWebdav },
-                    config: {
-                        ...config,
-                        channelMode: "local",
-                        apiFormat: normalizeApiFormat(config.apiFormat),
-                        channels,
-                        models,
-                        imageModel: normalizeModelOptionValue(config.imageModel || config.model, channels),
-                        videoModel: normalizeModelOptionValue(config.videoModel, channels),
-                        textModel: normalizeModelOptionValue(config.textModel || config.model, channels),
-                        audioModel: normalizeModelOptionValue(config.audioModel || defaultConfig.audioModel, channels),
-                        audioVoice: config.audioVoice || defaultConfig.audioVoice,
-                        audioFormat: config.audioFormat || defaultConfig.audioFormat,
-                        audioSpeed: config.audioSpeed || defaultConfig.audioSpeed,
-                        audioInstructions: config.audioInstructions || "",
-                        reasoningEffort: config.reasoningEffort || "auto",
-                        videoSeconds: config.videoSeconds || "6",
-                        vquality: config.vquality || "720",
-                        videoGenerateAudio: config.videoGenerateAudio || "true",
-                        videoWatermark: config.videoWatermark || "false",
-                        canvasImageCount: config.canvasImageCount || "3",
-                        capabilityVisibility: { ...defaultConfig.capabilityVisibility, ...config.capabilityVisibility },
-                    },
-                };
-            },
-        },
-    ),
-);
-
-export function useEffectiveConfig() {
-    const config = useConfigStore((state) => state.config);
-    return useMemo(() => ({ ...config, channelMode: "local" as const }), [config]);
-}
-
-/** Normalize a mixed list of raw model names or model objects into deduped ChannelModel entries. */
-export function normalizeChannelModels(models: Array<string | ChannelModel> | undefined): ChannelModel[] {
-    const seen = new Set<string>();
-    const result: ChannelModel[] = [];
-    for (const item of models || []) {
-        const name = (typeof item === "string" ? item : item?.name || "").trim();
-        if (!name || seen.has(name)) continue;
-        seen.add(name);
-        const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
-        const script = typeof item === "string" ? undefined : item.script?.trim() || undefined;
-        result.push({ name, capability, script });
-    }
-    return result;
-}
-
-export function createModelChannel(channel?: Partial<ModelChannel>): ModelChannel {
-    const apiFormat = normalizeApiFormat(channel?.apiFormat);
-    return {
-        id: channel?.id?.trim() || nanoid(),
-        name: channel?.name?.trim() || "新渠道",
-        baseUrl: channel?.baseUrl?.trim() || defaultBaseUrlForApiFormat(apiFormat),
-        apiKey: channel?.apiKey || "",
-        apiFormat,
-        models: normalizeChannelModels(channel?.models),
-    };
-}
-
-export function encodeChannelModel(channelId: string, model: string) {
-    return `${channelId}${CHANNEL_MODEL_SEPARATOR}${model.trim()}`;
-}
-
-export function isChannelModelValue(value: string) {
-    return value.includes(CHANNEL_MODEL_SEPARATOR);
-}
-
-export function decodeChannelModel(value: string) {
-    const index = value.indexOf(CHANNEL_MODEL_SEPARATOR);
-    if (index < 0) return null;
-    return { channelId: value.slice(0, index), model: value.slice(index + CHANNEL_MODEL_SEPARATOR.length) };
-}
-
-export function modelOptionName(value: string) {
-    return decodeChannelModel(value)?.model || value;
-}
-
-export function modelOptionLabel(config: AiConfig, value: string) {
-    const decoded = decodeChannelModel(value);
-    if (!decoded) return value;
-    const channel = config.channels.find((item) => item.id === decoded.channelId);
-    return channel ? `${decoded.model}（${channel.name}）` : decoded.model;
-}
-
-export function modelOptionsFromChannels(channels: ModelChannel[]) {
-    return uniqueModelOptions(channels.flatMap((channel) => channel.models.map((model) => encodeChannelModel(channel.id, model.name))));
-}
-
-export function normalizeModelOptionValue(value: string | undefined, channels: ModelChannel[]) {
-    const model = (value || "").trim();
-    if (!model) return "";
-    const decoded = decodeChannelModel(model);
-    if (decoded) {
-        const channel = channels.find((item) => item.id === decoded.channelId);
-        return channel && channel.models.some((item) => item.name === decoded.model) ? model : "";
-    }
-    const channel = channels.find((item) => item.models.some((entry) => entry.name === model)) || channels[0];
-    return channel && channel.models.some((item) => item.name === model) ? encodeChannelModel(channel.id, model) : model;
-}
-
-export function resolveModelChannel(config: AiConfig, value: string) {
-    const decoded = decodeChannelModel(value);
-    const model = decoded?.model || value;
-    const matched = decoded ? config.channels.find((channel) => channel.id === decoded.channelId) : config.channels.find((channel) => channel.models.some((item) => item.name === model));
-    return (
-        matched ||
-        config.channels[0] ||
-        createModelChannel({ id: "default", name: "默认渠道", baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })) })
-    );
-}
-
-export function resolveModelRequestConfig(config: AiConfig, value: string) {
-    const channel = resolveModelChannel(config, value);
-    return {
-        ...config,
-        model: modelOptionName(value || config.model),
-        baseUrl: channel.baseUrl,
-        apiKey: channel.apiKey,
-        apiFormat: channel.apiFormat,
-    };
-}
-
-function normalizeChannels(config: AiConfig) {
-    const persistedChannels = Array.isArray(config.channels) ? config.channels : [];
-    const channels = persistedChannels.map((channel, index) =>
-        createModelChannel({
-            ...channel,
-            id: channel.id || (index === 0 ? "default" : `channel-${index + 1}`),
-            name: channel.name || (index === 0 ? "默认渠道" : `渠道 ${index + 1}`),
-            models: normalizeChannelModels(channel.models),
-        }),
-    );
-    if (!channels.length) {
-        channels.push(
-            createModelChannel({
-                id: "default",
-                name: "默认渠道",
-                baseUrl: config.baseUrl || defaultConfig.baseUrl,
-                apiKey: config.apiKey || "",
-                apiFormat: config.apiFormat || defaultConfig.apiFormat,
-                models: normalizeChannelModels([config.model, config.imageModel, config.videoModel, config.textModel, config.audioModel].map(modelOptionName)),
-            }),
-        );
-    }
-    return channels;
-}
-
-export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
-    if (apiFormat === "gemini") return GEMINI_BASE_URL;
-    if (apiFormat === "ark") return ARK_BASE_URL;
-    return OPENAI_BASE_URL;
-}
-
-function normalizeApiFormat(apiFormat: unknown): ApiCallFormat {
-    return apiFormat === "gemini" || apiFormat === "ark" ? apiFormat : "openai";
-}
-
-function uniqueModelOptions(models: string[]) {
-    return Array.from(new Set((models || []).map((model) => model.trim()).filter(Boolean)));
-}
-
-export function buildApiUrl(baseUrl: string, path: string) {
-    let normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
-    normalizedBaseUrl = normalizeArkPlanBaseUrl(normalizedBaseUrl);
-    const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
-    const apiBaseUrl = lowerBaseUrl.endsWith("/v1") || lowerBaseUrl.endsWith("/api/v3") || lowerBaseUrl.endsWith("/api/plan/v3") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
-    return `${apiBaseUrl}${path}`;
-}
-
-function normalizeArkPlanBaseUrl(baseUrl: string) {
-    try {
-        const url = new URL(baseUrl);
-        const path = url.pathname.replace(/\/+$/, "");
-        const lowerPath = path.toLowerCase();
-        const arkPlanIndex = lowerPath.indexOf("/api/plan/v3");
-        if (arkPlanIndex < 0) return baseUrl;
-        const end = arkPlanIndex + "/api/plan/v3".length;
-        if (lowerPath.length !== end && lowerPath[end] !== "/") return baseUrl;
-        url.pathname = path.slice(0, end);
-        url.search = "";
-        url.hash = "";
-        return url.toString().replace(/\/+$/, "");
-    } catch {
-        return baseUrl;
-    }
+    const settings = useServerStore((state) => state.settings);
+    return useMemo(() => Object.fromEntries(modelCapabilities.map((capability) => [capability, isCapabilityEnabled(capability)])) as Record<ModelCapability, boolean>, [settings]);
 }

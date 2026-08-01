@@ -15,3 +15,5 @@ web/public/plugins
 plugins/canvas/*/dist
 plugins/canvas/*/node_modules
 web/public/plugins
+# UI 验证脚本的截图产物
+web/ui-check-*.png

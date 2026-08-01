@@ -4,8 +4,12 @@ import { Search } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { useAssetStore, type Asset } from "@/stores/use-asset-store";
+import { useEnabledCapabilities } from "@/stores/use-config-store";
 
-export type InsertAssetPayload = { kind: "text"; content: string; title: string } | { kind: "image"; dataUrl: string; title: string; storageKey?: string } | { kind: "video"; url: string; title: string; storageKey?: string; width?: number; height?: number };
+export type InsertAssetPayload =
+    | { kind: "text"; content: string; title: string }
+    | { kind: "image"; dataUrl: string; title: string; storageKey?: string }
+    | { kind: "video"; url: string; title: string; storageKey?: string; width?: number; height?: number };
 
 type Props = {
     open: boolean;
@@ -24,11 +28,12 @@ export function AssetPickerModal({ open, onInsert, onClose }: Props) {
 
 const PAGE_SIZE = 8;
 
+// 视频素材只可能来自视频生成，能力关闭后不再展示这个筛选项。
 const kindOptions = [
     { label: "全部", value: "all" },
     { label: "文本", value: "text" },
     { label: "图片", value: "image" },
-    { label: "视频", value: "video" },
+    { label: "视频", value: "video", capability: "video" as const },
 ];
 
 function PickerCard({ title, kind, cover, onClick }: { title: string; kind: string; cover: string; onClick: () => void }) {
@@ -55,6 +60,7 @@ function PickerCard({ title, kind, cover, onClick }: { title: string; kind: stri
 }
 
 function MyAssetsTab({ onInsert }: { onInsert: (payload: InsertAssetPayload) => void }) {
+    const capabilities = useEnabledCapabilities();
     const assets = useAssetStore((state) => state.assets);
     const [keyword, setKeyword] = useState("");
     const [kindFilter, setKindFilter] = useState("all");
@@ -79,7 +85,11 @@ function MyAssetsTab({ onInsert }: { onInsert: (payload: InsertAssetPayload) => 
         if (asset.kind === "text") {
             onInsert({ kind: "text", content: asset.data.content, title: asset.title });
         } else {
-            onInsert(asset.kind === "video" ? { kind: "video", url: asset.data.url, storageKey: asset.data.storageKey, title: asset.title, width: asset.data.width, height: asset.data.height } : { kind: "image", dataUrl: asset.data.dataUrl, storageKey: asset.data.storageKey, title: asset.title });
+            onInsert(
+                asset.kind === "video"
+                    ? { kind: "video", url: asset.data.url, storageKey: asset.data.storageKey, title: asset.title, width: asset.data.width, height: asset.data.height }
+                    : { kind: "image", dataUrl: asset.data.dataUrl, storageKey: asset.data.storageKey, title: asset.title },
+            );
         }
     };
 
@@ -99,19 +109,21 @@ function MyAssetsTab({ onInsert }: { onInsert: (payload: InsertAssetPayload) => 
                     }}
                 />
                 <div className="flex gap-1.5">
-                    {kindOptions.map((opt) => (
-                        <Tag.CheckableTag
-                            key={opt.value}
-                            checked={kindFilter === opt.value}
-                            className={cn("prompt-filter-tag", kindFilter === opt.value && "is-active")}
-                            onChange={() => {
-                                setPage(1);
-                                setKindFilter(opt.value);
-                            }}
-                        >
-                            {opt.label}
-                        </Tag.CheckableTag>
-                    ))}
+                    {kindOptions
+                        .filter((opt) => !opt.capability || capabilities[opt.capability])
+                        .map((opt) => (
+                            <Tag.CheckableTag
+                                key={opt.value}
+                                checked={kindFilter === opt.value}
+                                className={cn("prompt-filter-tag", kindFilter === opt.value && "is-active")}
+                                onChange={() => {
+                                    setPage(1);
+                                    setKindFilter(opt.value);
+                                }}
+                            >
+                                {opt.label}
+                            </Tag.CheckableTag>
+                        ))}
                 </div>
             </div>
 

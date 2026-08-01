@@ -4,7 +4,7 @@ import { Cpu } from "lucide-react";
 import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { modelOptionLabel, modelOptionName, selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
-import { useIsServerMode, useServerStore } from "@/stores/use-server-store";
+import { useServerStore } from "@/stores/use-server-store";
 
 type ModelPickerProps = {
     config: AiConfig;
@@ -20,12 +20,11 @@ type ModelPickerProps = {
 export function ModelPicker({ config, value, onChange, capability, className, fullWidth = false, placeholder = "选择模型", onMissingConfig }: ModelPickerProps) {
     const pickerId = useId();
     const [open, setOpen] = useState(false);
-    const isServerMode = useIsServerMode();
     // 服务器模式下模型来自服务端，订阅它才能在配置拉回来后重新计算选项。
     const serverModels = useServerStore((state) => state.settings?.modelChannel.models);
     const options = useMemo(
-        () => Array.from(new Set([...(!isServerMode && !capability ? [value] : []), ...selectableModelsByCapability(config, capability)].filter((model): model is string => Boolean(model)))),
-        [capability, config, isServerMode, serverModels, value],
+        () => Array.from(new Set(selectableModelsByCapability(config, capability).filter((model): model is string => Boolean(model)))),
+        [capability, config, serverModels],
     );
     const current = value || "";
 
@@ -43,7 +42,7 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
             value={current}
             onOpenChange={(nextOpen) => {
                 // 服务器模式的模型由管理员在后台配置，这里不该把用户引到本地渠道设置。
-                if (nextOpen && !options.length && !isServerMode) onMissingConfig?.();
+                if (nextOpen && !options.length) onMissingConfig?.();
                 if (nextOpen) window.dispatchEvent(new CustomEvent("model-picker-open", { detail: pickerId }));
                 setOpen(nextOpen);
             }}
@@ -81,7 +80,7 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
                     ))
                 ) : (
                     <SelectItem value="__empty__" disabled>
-                        {emptyModelLabel(config, capability, isServerMode)}
+                        {emptyModelLabel(capability)}
                     </SelectItem>
                 )}
             </SelectContent>
@@ -89,11 +88,9 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
     );
 }
 
-function emptyModelLabel(config: AiConfig, capability?: ModelCapability, isServerMode = false) {
+function emptyModelLabel(capability?: ModelCapability) {
     const label = capability === "image" ? "生图" : capability === "video" ? "视频" : capability === "text" ? "文本" : capability === "audio" ? "音频" : "";
-    if (isServerMode) return `服务端未配置${label}模型，请联系管理员`;
-    if (capability && config.models.length) return `请先在渠道里为${label}指定模型`;
-    return config.models.length ? `暂无匹配的${label}模型` : "请先到配置里添加渠道和模型";
+    return `服务端未配置${label}模型，请联系管理员`;
 }
 
 function ModelLabel({ config, model }: { config: AiConfig; model: string }) {

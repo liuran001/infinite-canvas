@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, type Dispatch, type MutableRefObject, 
 
 import { requestImageQuestion, type AiTextMessage } from "@/services/api/image";
 import { generateImages, generateVideo, isGenerationReady } from "@/services/api/generation";
-import { decodeChannelModel, selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
+import { selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 import { buildGenerationConfig } from "@/lib/canvas/canvas-generation-helpers";
 import { buildNodeContext } from "@/lib/canvas/plugin-node-context";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
@@ -17,7 +17,6 @@ type CanvasTheme = (typeof canvasThemes)[keyof typeof canvasThemes];
 
 type PluginHostParams = {
     effectiveConfig: AiConfig;
-    isAiConfigReady: (config: AiConfig, model: string) => boolean;
     openConfigDialog: (open: boolean) => void;
     theme: CanvasTheme;
     nodesRef: MutableRefObject<CanvasNodeData[]>;
@@ -33,23 +32,23 @@ type PluginHostParams = {
  * 并在挂载时加载已安装的远程插件。返回给画布用于渲染插件面板与工具条。
  */
 export function usePluginHost(params: PluginHostParams) {
-    const { effectiveConfig, isAiConfigReady, openConfigDialog, theme, nodesRef, connectionsRef, viewportRef, setNodes, setDialogNodeId, applyAgentOps } = params;
+    const { effectiveConfig, openConfigDialog, theme, nodesRef, connectionsRef, viewportRef, setNodes, setDialogNodeId, applyAgentOps } = params;
 
     // 提供给插件节点的宿主能力(节点无关,方法接收 nodeId)
     const pluginAi = useMemo<CanvasPluginAi>(() => {
         // 把插件传入的参考图(dataURL 或 URL)整理成宿主生成 API 需要的 ReferenceImage[]
         const toReferences = (refs?: string[]): ReferenceImage[] => (refs || []).filter(Boolean).map((src, index) => ({ id: `plugin-ref-${index}`, name: `ref-${index}.png`, type: "image/png", dataUrl: src }));
-        // AI 配置未就绪:弹出配置弹窗并抛错,交由插件 catch 处理
-        const ensureReady = (config: AiConfig) => {
-            if (!isGenerationReady(config, config.model, isAiConfigReady)) {
+        // 服务端还没配好可用模型:弹出配置弹窗并抛错,交由插件 catch 处理
+        const ensureReady = () => {
+            if (!isGenerationReady()) {
                 openConfigDialog(true);
-                throw new Error("AI 配置未就绪,请先在设置里配置模型与密钥");
+                throw new Error("服务端还没有可用模型,请稍后重试或联系管理员");
             }
         };
         return {
             generateImage: async (prompt, options) => {
                 const config = { ...buildGenerationConfig(effectiveConfig, undefined, "image"), count: String(options?.count || 1), ...(options?.model ? { model: options.model } : {}), ...(options?.size ? { size: options.size } : {}) };
-                ensureReady(config);
+                ensureReady();
                 const items = await generateImages(config, prompt, toReferences(options?.references), { signal: options?.signal });
                 return { images: items.map((item) => item.dataUrl) };
             },
@@ -60,22 +59,22 @@ export function usePluginHost(params: PluginHostParams) {
                     ...(options?.size ? { size: options.size } : {}),
                     ...(options?.seconds ? { videoSeconds: options.seconds } : {}),
                 };
-                ensureReady(config);
+                ensureReady();
                 const file = await generateVideo(config, prompt, toReferences(options?.references), [], [], { signal: options?.signal });
                 return { url: file.url, mimeType: file.mimeType, width: file.width, height: file.height, durationMs: file.durationMs };
             },
             generateText: async (prompt, options) => {
                 const config = { ...buildGenerationConfig(effectiveConfig, undefined, "text"), ...(options?.model ? { model: options.model } : {}) };
-                ensureReady(config);
+                ensureReady();
                 const messages: AiTextMessage[] = [...(options?.system ? [{ role: "system" as const, content: options.system }] : []), { role: "user" as const, content: prompt }];
                 const text = await requestImageQuestion(config, messages, (delta) => options?.onDelta?.(delta), { signal: options?.signal });
                 return { text };
             },
-            // 列出某能力下用户已配置的模型;label 取编码值中的模型名(去掉 channel 前缀)
-            listModels: (capability) => selectableModelsByCapability(effectiveConfig, capability as ModelCapability | undefined).map((value) => ({ value, label: decodeChannelModel(value)?.model || value })),
+            // 列出服务端为该能力下发的模型
+            listModels: (capability) => selectableModelsByCapability(effectiveConfig, capability as ModelCapability | undefined).map((value) => ({ value, label: value })),
             defaultModel: (capability) => buildGenerationConfig(effectiveConfig, undefined, capability).model,
         };
-    }, [effectiveConfig, isAiConfigReady, openConfigDialog]);
+    }, [effectiveConfig, openConfigDialog]);
 
     const pluginHost = useMemo<CanvasPluginHost>(
         () => ({

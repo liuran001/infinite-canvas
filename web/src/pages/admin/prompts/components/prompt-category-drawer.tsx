@@ -66,7 +66,7 @@ export function PromptCategoryDrawer({ open, onClose, onChanged }: { open: boole
     return (
         <Drawer
             open={open}
-            width={640}
+            size={640}
             title="提示词分类"
             onClose={onClose}
             extra={

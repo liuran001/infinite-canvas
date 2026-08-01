@@ -1,11 +1,14 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { App, Button, Form, Input, InputNumber, Modal, Select, Table, Tag } from "antd";
 import dayjs from "dayjs";
-import { Coins, Pencil, Plus, Trash2 } from "lucide-react";
+import { Coins, HardDrive, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { formatBytes } from "@/lib/image-utils";
 import { useAdminAction } from "@/pages/admin/use-admin-action";
 import { adminApi, type AdminQuery, type AdminUser } from "@/services/api/admin";
+
+const MB = 1 << 20;
 
 const roleOptions = [
     { label: "普通用户", value: "user" },
@@ -22,12 +25,15 @@ type UserForm = Partial<AdminUser> & { password?: string };
 export default function AdminUsersPage() {
     const { modal } = App.useApp();
     const runAction = useAdminAction();
+    const queryClient = useQueryClient();
     const [form] = Form.useForm<UserForm>();
     const [keyword, setKeyword] = useState("");
     const [query, setQuery] = useState<AdminQuery>({ page: 1, pageSize: 20 });
     const [editing, setEditing] = useState<UserForm | null>(null);
     const [creditTarget, setCreditTarget] = useState<AdminUser | null>(null);
     const [credits, setCredits] = useState(0);
+    const [quotaTarget, setQuotaTarget] = useState<AdminUser | null>(null);
+    const [quotaMb, setQuotaMb] = useState(0);
     const { data, isFetching, refetch } = useQuery({ queryKey: ["admin-users", query], queryFn: () => adminApi.users(query) });
 
     useEffect(() => {
@@ -53,6 +59,21 @@ export default function AdminUsersPage() {
         if (!creditTarget) return;
         if (await runAction(() => adminApi.setUserCredits(creditTarget.id, credits), "算力点已更新")) {
             setCreditTarget(null);
+            // 服务端会补一条后台调整流水，让流水页的缓存失效，切过去就能看到。
+            void queryClient.invalidateQueries({ queryKey: ["admin-credit-logs"] });
+            await refetch();
+        }
+    };
+
+    const openQuota = (user: AdminUser) => {
+        setQuotaMb(Math.round(user.storageQuota / MB));
+        setQuotaTarget(user);
+    };
+
+    const submitQuota = async () => {
+        if (!quotaTarget) return;
+        if (await runAction(() => adminApi.setUserQuota(quotaTarget.id, quotaMb * MB), "云空间配额已更新")) {
+            setQuotaTarget(null);
             await refetch();
         }
     };
@@ -85,6 +106,9 @@ export default function AdminUsersPage() {
                         onChange={(event) => setKeyword(event.target.value)}
                         onSearch={(value) => setQuery((current) => ({ ...current, keyword: value, page: 1 }))}
                     />
+                    <Button icon={<RefreshCw className={`size-4 ${isFetching ? "animate-spin" : ""}`} />} onClick={() => void refetch()} title="刷新">
+                        刷新
+                    </Button>
                     <Button type="primary" icon={<Plus className="size-4" />} onClick={() => setEditing({})}>
                         新建用户
                     </Button>
@@ -140,6 +164,16 @@ export default function AdminUsersPage() {
                         render: (value: number) => <span className="tabular-nums">{value}</span>,
                     },
                     {
+                        title: "云空间",
+                        dataIndex: "storageUsed",
+                        width: 130,
+                        render: (used: number, item) => (
+                            <span className="text-xs tabular-nums text-stone-500">
+                                {formatBytes(used) || "0 B"} / {formatBytes(item.storageQuota) || "0 B"}
+                            </span>
+                        ),
+                    },
+                    {
                         title: "邀请码 / 邀请数",
                         dataIndex: "affCode",
                         width: 140,
@@ -157,11 +191,12 @@ export default function AdminUsersPage() {
                     },
                     {
                         title: "操作",
-                        width: 140,
+                        width: 170,
                         align: "right",
                         render: (_, item) => (
                             <div className="flex justify-end gap-1">
                                 <Button size="small" type="text" title="调整算力点" icon={<Coins className="size-3.5" />} onClick={() => openCredits(item)} />
+                                <Button size="small" type="text" title="调整云空间配额" icon={<HardDrive className="size-3.5" />} onClick={() => openQuota(item)} />
                                 <Button size="small" type="text" title="编辑" icon={<Pencil className="size-3.5" />} onClick={() => setEditing(item)} />
                                 <Button size="small" type="text" danger title="删除" icon={<Trash2 className="size-3.5" />} onClick={() => confirmDelete(item)} />
                             </div>
@@ -198,6 +233,13 @@ export default function AdminUsersPage() {
             <Modal open={Boolean(creditTarget)} title={`调整算力点 · ${creditTarget?.username || ""}`} okText="保存" cancelText="取消" onOk={submitCredits} onCancel={() => setCreditTarget(null)}>
                 <div className="mt-4 text-sm text-stone-500">直接设置余额的绝对值，服务端会自动记录一条后台调整流水。</div>
                 <InputNumber className="mt-3 w-full" min={0} precision={0} value={credits} onChange={(value) => setCredits(value || 0)} />
+            </Modal>
+
+            <Modal open={Boolean(quotaTarget)} title={`调整云空间配额 · ${quotaTarget?.username || ""}`} okText="保存" cancelText="取消" onOk={submitQuota} onCancel={() => setQuotaTarget(null)}>
+                <div className="mt-4 text-sm text-stone-500">
+                    单位 MB，用户上传的图片与生成结果都计入用量。当前已用 {formatBytes(quotaTarget?.storageUsed || 0) || "0 B"}。
+                </div>
+                <InputNumber className="mt-3 w-full" min={0} precision={0} addonAfter="MB" value={quotaMb} onChange={(value) => setQuotaMb(value || 0)} />
             </Modal>
         </div>
     );

@@ -1,4 +1,5 @@
-import { resolveModelRequestConfig, type AiConfig } from "@/stores/use-config-store";
+import { modelOptionName, type AiConfig } from "@/stores/use-config-store";
+import { serverModelFormat } from "@/stores/use-server-store";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
@@ -57,9 +58,10 @@ const seedancePixels = {
     },
 } as const;
 
-export function isSeedanceVideoConfig(config: AiConfig | Pick<AiConfig, "model" | "videoModel" | "apiFormat">) {
-    const requestConfig = "channels" in config ? resolveModelRequestConfig(config, config.model || config.videoModel) : config;
-    return requestConfig.apiFormat === "ark";
+/** 模型的上游协议由服务端下发，ark 协议即 Seedance 系列。 */
+export function isSeedanceVideoConfig(config: Pick<AiConfig, "model" | "videoModel">) {
+    const model = modelOptionName(config.model || config.videoModel);
+    return serverModelFormat(model) === "ark" || model.toLowerCase().includes("seedance");
 }
 
 export function normalizeSeedanceResolution(value: string) {

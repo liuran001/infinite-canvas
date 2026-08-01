@@ -4,8 +4,8 @@ import { App, Button } from "antd";
 import { Download, FileUp, Plus } from "lucide-react";
 
 import { readZip } from "@/lib/zip";
-import { setMediaBlob } from "@/services/file-storage";
-import { setImageBlob } from "@/services/image-storage";
+import { uploadMediaFile } from "@/services/file-storage";
+import { uploadImage } from "@/services/image-storage";
 import { CanvasDeleteProjectsDialog } from "@/components/canvas/canvas-delete-projects-dialog";
 import { CanvasProjectCard } from "@/components/canvas/canvas-project-card";
 import type { CanvasExportFile } from "@/types/canvas-export";
@@ -40,17 +40,20 @@ export default function CanvasPage() {
             const projectFile = zip.get("projects.json");
             if (!projectFile) throw new Error("missing projects.json");
             const data = JSON.parse(await projectFile.text()) as CanvasExportFile;
+            // 旧的 storageKey 在服务端无法复用，导入时重新上传文件，再把画布里的引用换成新键。
+            const remap = new Map<string, string>();
             await Promise.all(
                 data.projects.flatMap((project) =>
                     project.files.map(async (item) => {
                         const blob = zip.get(item.path);
                         if (!blob) return;
                         const typedBlob = blob.type ? blob : blob.slice(0, blob.size, item.mimeType);
-                        await (item.storageKey.startsWith("image:") ? setImageBlob(item.storageKey, typedBlob) : setMediaBlob(item.storageKey, typedBlob));
+                        const stored = item.mimeType.startsWith("image/") ? await uploadImage(typedBlob) : await uploadMediaFile(typedBlob, item.mimeType.split("/")[0] || "file");
+                        remap.set(item.storageKey, stored.storageKey);
                     }),
                 ),
             );
-            data.projects.forEach((item) => importProject(item.project));
+            data.projects.forEach((item) => importProject(remapStorageKeys(item.project, remap)));
             message.success(`已导入 ${data.projects.length} 个画布`);
         } catch {
             message.error("导入失败，请选择有效的画布压缩包");
@@ -123,4 +126,9 @@ export default function CanvasPage() {
             <CanvasDeleteProjectsDialog />
         </main>
     );
+}
+
+function remapStorageKeys<T>(project: T, remap: Map<string, string>): T {
+    if (!remap.size) return project;
+    return JSON.parse(Array.from(remap).reduce((text, [from, to]) => text.split(from).join(to), JSON.stringify(project))) as T;
 }

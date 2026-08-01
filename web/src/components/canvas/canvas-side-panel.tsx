@@ -9,12 +9,13 @@ import { exportCanvasNodes } from "@/lib/canvas/canvas-export";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
 import { cn } from "@/lib/utils";
 import { PromptDetailDialog } from "@/pages/prompts/components/prompt-detail-dialog";
-import { fetchSourcePrompts, type Prompt } from "@/services/api/prompts";
+import { usePromptList } from "@/components/prompts/use-prompt-list";
+import { fetchPrompts, type Prompt } from "@/services/api/prompts";
 import { uploadMediaFile } from "@/services/file-storage";
 import { uploadImage } from "@/services/image-storage";
 import { useAssetStore, type Asset, type AssetKind } from "@/stores/use-asset-store";
-import { usePromptSourceStore } from "@/stores/use-prompt-source-store";
 import { CANVAS_SIDE_PANEL_MAX_WIDTH, CANVAS_SIDE_PANEL_MIN_WIDTH, CANVAS_SIDE_PANEL_MOTION_MS, useCanvasSidePanelStore } from "@/stores/use-canvas-side-panel-store";
+import { useEnabledCapabilities } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
 
@@ -130,12 +131,14 @@ function TabButton({ label, active, theme, onClick }: { label: string; active: b
 // 画布 Tab —— 列出节点,点击居中放大并选中
 // ---------------------------------------------------------------------------
 
+// 视频和音频节点只可能由对应生成产生，能力关闭后这两个筛选项就是噪音；
+// 图片和文本节点用户也会直接上传或手写，始终保留。
 const NODE_FILTER_OPTIONS = [
     { label: "全部", value: "all" },
     { label: "图片", value: CanvasNodeType.Image },
-    { label: "视频", value: CanvasNodeType.Video },
+    { label: "视频", value: CanvasNodeType.Video, capability: "video" as const },
     { label: "文本", value: CanvasNodeType.Text },
-    { label: "音频", value: CanvasNodeType.Audio },
+    { label: "音频", value: CanvasNodeType.Audio, capability: "audio" as const },
     { label: "配置", value: CanvasNodeType.Config },
     { label: "分组", value: CanvasNodeType.Group },
 ];
@@ -146,6 +149,7 @@ function nodePreviewText(node: CanvasNodeData) {
 }
 
 function CanvasNodesTab({ nodes, selectedNodeIds, onFocusNode, onPreviewNode, theme }: { nodes: CanvasNodeData[]; selectedNodeIds: Set<string>; onFocusNode: (nodeId: string) => void; onPreviewNode: (nodeId: string) => void; theme: CanvasTheme }) {
+    const capabilities = useEnabledCapabilities();
     const { message } = App.useApp();
     const [keyword, setKeyword] = useState("");
     const [typeFilter, setTypeFilter] = useState<string>("all");
@@ -203,7 +207,7 @@ function CanvasNodesTab({ nodes, selectedNodeIds, onFocusNode, onPreviewNode, th
                     <ListChecks className="size-3.5" />
                     {selectMode ? "取消" : "选择"}
                 </button>
-                {selectMode ? null : <Select size="small" variant="borderless" className="w-20" value={typeFilter} onChange={setTypeFilter} options={NODE_FILTER_OPTIONS} />}
+                {selectMode ? null : <Select size="small" variant="borderless" className="w-20" value={typeFilter} onChange={setTypeFilter} options={NODE_FILTER_OPTIONS.filter((option) => !option.capability || capabilities[option.capability])} />}
             </div>
             <div className="px-3 pb-2.5">
                 <Input size="small" allowClear prefix={<Search className="size-3.5 text-stone-400" />} placeholder="搜索节点" value={keyword} onChange={(e) => setKeyword(e.target.value)} />
@@ -231,7 +235,13 @@ function CanvasNodesTab({ nodes, selectedNodeIds, onFocusNode, onPreviewNode, th
                                     </button>
                                     {selectMode || !isImage ? null : (
                                         <div className="flex shrink-0 flex-col items-center gap-0.5 pr-1.5">
-                                            <button type="button" onClick={() => onPreviewNode(node.id)} className="grid size-7 place-items-center rounded-md opacity-55 transition hover:bg-black/10 hover:opacity-100 dark:hover:bg-white/10" aria-label="放大预览" title="放大预览">
+                                            <button
+                                                type="button"
+                                                onClick={() => onPreviewNode(node.id)}
+                                                className="grid size-7 place-items-center rounded-md opacity-55 transition hover:bg-black/10 hover:opacity-100 dark:hover:bg-white/10"
+                                                aria-label="放大预览"
+                                                title="放大预览"
+                                            >
                                                 <Eye className="size-3.5" />
                                             </button>
                                         </div>
@@ -278,9 +288,9 @@ function CheckMark({ checked, theme }: { checked: boolean; theme: CanvasTheme })
 // 资产 Tab —— 按类型折叠分组 + 标签筛选,点击插入画布
 // ---------------------------------------------------------------------------
 
-const ASSET_GROUPS: { kind: AssetKind; label: string; icon: typeof Square }[] = [
+const ASSET_GROUPS: { kind: AssetKind; label: string; icon: typeof Square; capability?: "video" }[] = [
     { kind: "image", label: "图片", icon: ImageIcon },
-    { kind: "video", label: "视频", icon: Video },
+    { kind: "video", label: "视频", icon: Video, capability: "video" },
     { kind: "text", label: "文本", icon: FileText },
 ];
 
@@ -291,6 +301,7 @@ function buildInsertPayload(asset: Asset): InsertAssetPayload {
 }
 
 const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onInsert: (payload: InsertAssetPayload) => void; theme: CanvasTheme }) {
+    const capabilities = useEnabledCapabilities();
     const { message } = App.useApp();
     const assets = useAssetStore((state) => state.assets);
     const addAsset = useAssetStore((state) => state.addAsset);
@@ -308,7 +319,13 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
         return assets.filter((asset) => (tagFilter === "all" || (asset.tags || []).includes(tagFilter)) && (!query || [asset.title, ...(asset.tags || [])].join(" ").toLowerCase().includes(query)));
     }, [assets, keyword, tagFilter]);
 
-    const groups = useMemo(() => ASSET_GROUPS.map((group) => ({ ...group, items: filtered.filter((asset) => asset.kind === group.kind) })).filter((group) => group.items.length > 0), [filtered]);
+    const groups = useMemo(
+        () =>
+            ASSET_GROUPS.filter((group) => !group.capability || capabilities[group.capability])
+                .map((group) => ({ ...group, items: filtered.filter((asset) => asset.kind === group.kind) }))
+                .filter((group) => group.items.length > 0),
+        [capabilities, filtered],
+    );
 
     const handleFiles = async (fileList: FileList | null) => {
         const files = Array.from(fileList || []);
@@ -332,7 +349,8 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
             else message.warning("仅支持图片或视频文件");
         } catch (error) {
             console.error(error);
-            message.error("添加失败，请重试");
+            // 云空间不足、文件过大等都是服务端给的中文文案，原样提示给用户。
+            message.error(error instanceof Error ? error.message : "添加失败，请重试");
         } finally {
             hide();
             setUploading(false);
@@ -441,16 +459,17 @@ function AssetCover({ asset }: { asset: Asset }) {
 }
 
 // ---------------------------------------------------------------------------
-// 提示词库 Tab —— 按来源折叠分组,展开时按需加载,点击复制 / 插入文本节点
+// 提示词库 Tab —— 读服务端提示词,按分类折叠分组,展开时按需加载,点击复制 / 插入文本节点
 // ---------------------------------------------------------------------------
 
 const CanvasPromptsTab = memo(function CanvasPromptsTab({ onInsert, theme }: { onInsert: (payload: InsertAssetPayload) => void; theme: CanvasTheme }) {
     const { message } = App.useApp();
-    const sources = usePromptSourceStore((state) => state.sources);
-    const enabledSources = useMemo(() => sources.filter((source) => source.enabled), [sources]);
     const [keyword, setKeyword] = useState("");
     const [expanded, setExpanded] = useState<Record<string, boolean>>({});
     const [detail, setDetail] = useState<Prompt | null>(null);
+    // 只为拿分类列表,取一条即可。
+    const categoriesQuery = useQuery({ queryKey: ["side-panel-prompt-categories"], queryFn: () => fetchPrompts({ pageSize: 1 }), staleTime: 1000 * 60 * 60 });
+    const categories = categoriesQuery.data?.categories || [];
 
     const copyPrompt = async (prompt: string) => {
         try {
@@ -467,30 +486,40 @@ const CanvasPromptsTab = memo(function CanvasPromptsTab({ onInsert, theme }: { o
                 <Input size="small" allowClear prefix={<Search className="size-3.5 text-stone-400" />} placeholder="搜索提示词" value={keyword} onChange={(e) => setKeyword(e.target.value)} />
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
-                <div className="space-y-1">
-                    {enabledSources.length ? enabledSources.map((source) => (
-                        <PromptSourceGroup
-                            key={source.id}
-                            sourceId={source.id}
-                            sourceName={source.name}
-                            keyword={keyword}
-                            open={!!expanded[source.id]}
-                            theme={theme}
-                            onToggle={() => setExpanded((prev) => ({ ...prev, [source.id]: !prev[source.id] }))}
-                            onInsert={onInsert}
-                            onView={setDetail}
-                        />
-                    )) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无提示词" className="pt-12" />}
-                </div>
+                {categoriesQuery.isLoading ? (
+                    <div className="flex justify-center py-8">
+                        <Spin size="small" />
+                    </div>
+                ) : categoriesQuery.isError ? (
+                    <button type="button" onClick={() => void categoriesQuery.refetch()} className="block w-full py-8 text-center text-xs text-red-500 opacity-80 transition hover:opacity-100">
+                        加载失败,点击重试
+                    </button>
+                ) : categories.length ? (
+                    <div className="space-y-1">
+                        {categories.map((category) => (
+                            <PromptCategoryGroup
+                                key={category}
+                                category={category}
+                                keyword={keyword}
+                                open={!!expanded[category]}
+                                theme={theme}
+                                onToggle={() => setExpanded((prev) => ({ ...prev, [category]: !prev[category] }))}
+                                onInsert={onInsert}
+                                onView={setDetail}
+                            />
+                        ))}
+                    </div>
+                ) : (
+                    <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无提示词" className="pt-12" />
+                )}
             </div>
             <PromptDetailDialog prompt={detail} onClose={() => setDetail(null)} onCopy={(prompt) => void copyPrompt(prompt)} />
         </div>
     );
 });
 
-function PromptSourceGroup({
-    sourceId,
-    sourceName,
+function PromptCategoryGroup({
+    category,
     keyword,
     open,
     theme,
@@ -498,8 +527,7 @@ function PromptSourceGroup({
     onInsert,
     onView,
 }: {
-    sourceId: string;
-    sourceName: string;
+    category: string;
     keyword: string;
     open: boolean;
     theme: CanvasTheme;
@@ -507,16 +535,9 @@ function PromptSourceGroup({
     onInsert: (payload: InsertAssetPayload) => void;
     onView: (prompt: Prompt) => void;
 }) {
-    // 展开过一次即缓存,避免收起后重复请求;搜索命中时也需要拿到数据来计数。
+    // 展开或搜索时才请求,收起后靠 react-query 缓存避免重复拉取。
     const showResults = open || !!keyword.trim();
-    const query = useQuery({ queryKey: ["side-panel-prompts", sourceId], queryFn: () => fetchSourcePrompts(sourceId), enabled: showResults, staleTime: 1000 * 60 * 60 });
-
-    const filtered = useMemo(() => {
-        const items = query.data || [];
-        const q = keyword.trim().toLowerCase();
-        if (!q) return items;
-        return items.filter((item) => [item.title, item.prompt, ...item.tags].join(" ").toLowerCase().includes(q));
-    }, [query.data, keyword]);
+    const { query, items, total } = usePromptList({ keyword, tags: [], category, enabled: showResults });
 
     const insertPrompt = (item: Prompt) => onInsert({ kind: "text", content: item.prompt, title: item.title });
 
@@ -525,8 +546,8 @@ function PromptSourceGroup({
             <button type="button" onClick={onToggle} className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1.5 text-left text-xs font-semibold opacity-75 transition hover:opacity-100">
                 <ChevronRight className={cn("size-3.5 transition-transform", showResults && "rotate-90")} />
                 <BookOpen className="size-3.5" />
-                <span className="min-w-0 flex-1 truncate">{sourceName}</span>
-                {showResults && query.isSuccess ? <span className="opacity-50">{filtered.length}</span> : null}
+                <span className="min-w-0 flex-1 truncate">{category}</span>
+                {showResults && query.isSuccess ? <span className="opacity-50">{total}</span> : null}
             </button>
             {showResults ? (
                 <div className="px-1 pb-2 pt-1">
@@ -538,14 +559,24 @@ function PromptSourceGroup({
                         <button type="button" onClick={() => void query.refetch()} className="block w-full py-4 text-center text-xs text-red-500 opacity-80 transition hover:opacity-100">
                             加载失败,点击重试
                         </button>
-                    ) : filtered.length ? (
+                    ) : items.length ? (
                         <div className="space-y-1.5">
-                            {filtered.map((item) => (
+                            {items.map((item) => (
                                 <PromptRow key={item.id} item={item} theme={theme} onInsert={() => insertPrompt(item)} onView={() => onView(item)} />
                             ))}
+                            {query.hasNextPage ? (
+                                <button
+                                    type="button"
+                                    disabled={query.isFetchingNextPage}
+                                    onClick={() => void query.fetchNextPage()}
+                                    className="block w-full rounded-md py-2 text-center text-xs opacity-55 transition hover:bg-black/5 hover:opacity-100 disabled:cursor-not-allowed dark:hover:bg-white/10"
+                                >
+                                    {query.isFetchingNextPage ? "加载中…" : "加载更多"}
+                                </button>
+                            ) : null}
                         </div>
                     ) : (
-                        <div className="py-4 text-center text-xs opacity-40">{keyword.trim() ? "无匹配提示词" : "该来源暂无提示词"}</div>
+                        <div className="py-4 text-center text-xs opacity-40">{keyword.trim() ? "无匹配提示词" : "该分类暂无提示词"}</div>
                     )}
                 </div>
             ) : null}

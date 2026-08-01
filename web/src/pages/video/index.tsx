@@ -12,9 +12,9 @@ import { VideoSettingsPanel, normalizeVideoResolutionValue, normalizeVideoSizeVa
 import { canvasThemes } from "@/lib/canvas-theme";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, seedanceReferenceLabel, seedanceVideoReferenceError, seedanceVideoReferenceHint, SEEDANCE_REFERENCE_LIMITS, SEEDANCE_VIDEO_MIME_TYPES } from "@/lib/seedance-video";
-import { deleteStoredMedia, resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
+import { adoptServerMedia, deleteStoredMedia, resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
 import { resolveImageUrl, uploadImage } from "@/services/image-storage";
-import { createVideoTask, isGenerationReady, pollVideoTask, serverVideoTask, storeVideoResult, videoPollInterval, videoPollLimit, type VideoTask } from "@/services/api/generation";
+import { createVideoTask, isGenerationReady, pollVideoTask, serverVideoTask, VIDEO_POLL_LIMIT, VIDEO_POLL_MS, type VideoTask } from "@/services/api/generation";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useJobStore } from "@/stores/use-job-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
@@ -77,7 +77,6 @@ export default function VideoPage() {
     const config = useConfigStore((state) => state.config);
     const effectiveConfig = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
-    const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
     const [prompt, setPrompt] = useState("");
@@ -124,7 +123,7 @@ export default function VideoPage() {
     const restoreSession = async () => {
         const nextLogs = await refreshLogs();
         const pending = (await useJobStore.getState().restorePendingJobs()).filter((job) => job.context.source === "video" && job.kind === "video");
-        const orphans = pending.filter((job) => !nextLogs.some((log) => log.task?.provider === "server" && log.task.clientJobId === job.clientJobId));
+        const orphans = pending.filter((job) => !nextLogs.some((log) => log.task?.clientJobId === job.clientJobId));
         for (const job of orphans) {
             const log = buildLog({
                 prompt: job.context.prompt,
@@ -240,7 +239,7 @@ export default function VideoPage() {
             });
             const log = buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, videoReferences: snapshot.videoReferences, audioReferences: snapshot.audioReferences, durationMs: 0, status: "生成中", task });
             await saveLog(log, false);
-            void pollGenerationLog(log, snapshot.config, agentTaskId);
+            void pollGenerationLog(log, agentTaskId);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : "生成失败";
             setResults([{ id: nanoid(), status: "failed", error: errorMessage }]);
@@ -279,7 +278,7 @@ export default function VideoPage() {
             message.error("请输入视频提示词");
             return null;
         }
-        if (!isGenerationReady(effectiveConfig, model, isAiConfigReady)) {
+        if (!isGenerationReady()) {
             message.warning("请先完成配置");
             openConfigDialog(true);
             return null;
@@ -369,19 +368,17 @@ export default function VideoPage() {
         }
     };
 
-    const pollGenerationLog = async (log: GenerationLog, configOverride?: AiConfig, agentTaskId?: string) => {
+    const pollGenerationLog = async (log: GenerationLog, agentTaskId?: string) => {
         if (!log.task || activeLogIdsRef.current.has(log.id)) return;
         activeLogIdsRef.current.add(log.id);
         setRunning(true);
         setStartedAt((value) => value || performance.now());
         setResults((value) => (value.length ? value : [{ id: log.id, status: "pending" }]));
-        const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
-        const pollLimit = videoPollLimit(log.task);
         try {
-            for (let attempt = 0; attempt < pollLimit; attempt += 1) {
-                const state = await pollVideoTask(configOverride || taskConfig, log.task);
+            for (let attempt = 0; attempt < VIDEO_POLL_LIMIT; attempt += 1) {
+                const state = await pollVideoTask(log.task);
                 if (state.status === "completed") {
-                    const stored = await storeVideoResult(log.task, state.result);
+                    const stored = adoptServerMedia(state.file);
                     const nextVideo: GeneratedVideo = {
                         id: nanoid(),
                         url: stored.url,
@@ -399,8 +396,8 @@ export default function VideoPage() {
                     return;
                 }
                 if (state.status === "failed") throw new Error(state.error);
-                if (attempt === pollLimit - 1) throw new Error("视频生成超时，请稍后重试");
-                await delay(videoPollInterval(log.task));
+                if (attempt === VIDEO_POLL_LIMIT - 1) throw new Error("视频生成超时，请稍后重试");
+                await delay(VIDEO_POLL_MS);
             }
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : "生成失败";

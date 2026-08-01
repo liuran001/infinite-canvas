@@ -16,12 +16,14 @@ export type ServerUser = {
     updatedAt: string;
 };
 
-export type ServerModel = { name: string; apiFormat: ServerApiFormat; capability: ServerCapability };
+/** label 是管理员配置的展示名，服务端保证有值（留空时回落成 name），请求仍然用 name。 */
+export type ServerModel = { name: string; label: string; apiFormat: ServerApiFormat; capability: ServerCapability };
 
 export type ServerSettings = {
     modelChannel: {
         models: ServerModel[];
-        modelCosts: Array<{ model: string; credits: number }>;
+        /** qualityCredits 按画质档位在基础价上叠加。 */
+        modelCosts: Array<{ model: string; credits: number; qualityCredits?: Record<string, number> }>;
         defaultModel: string;
         defaultImageModel: string;
         defaultVideoModel: string;
@@ -32,13 +34,19 @@ export type ServerSettings = {
     };
     auth: { allowRegister: boolean; linuxDo: { enabled: boolean } };
     storage: { remoteEnabled: boolean };
+    /** 管理员统一控制的功能入口开关，关掉后所有用户都看不到对应入口。 */
+    capabilities: Record<ServerCapability, boolean>;
 };
 
 export type ServerStatus = "idle" | "connecting" | "ready" | "error";
+/** auto 表示自动探测同源后端，探测到就用；on / off 为用户手动固定。 */
+export type ServerModeSetting = "auto" | "on" | "off";
 
 type ServerStore = {
-    /** 服务器模式总开关，关闭时整个应用退回纯本地模式。 */
-    enabled: boolean;
+    /** 服务器模式开关，默认 auto：部署了后端就直接可用，纯前端部署自动退回本地模式。 */
+    mode: ServerModeSetting;
+    /** auto 模式下是否探测到了可用后端，每次启动重新探测，不持久化。 */
+    detected: boolean;
     /** 服务端地址，留空表示与前端同源，走 nginx 反代的 /api。 */
     baseUrl: string;
     token: string;
@@ -48,7 +56,8 @@ type ServerStore = {
     error: string;
     /** 本地已同步到的服务端时间戳，用于增量拉取项目与素材。 */
     syncedAt: string;
-    setEnabled: (enabled: boolean) => void;
+    setMode: (mode: ServerModeSetting) => void;
+    setDetected: (detected: boolean) => void;
     setBaseUrl: (baseUrl: string) => void;
     setSession: (token: string, user: ServerUser) => void;
     setUser: (user: ServerUser | null) => void;
@@ -63,7 +72,8 @@ export const SERVER_STORE_KEY = "infinite-canvas:server_store";
 export const useServerStore = create<ServerStore>()(
     persist(
         (set) => ({
-            enabled: false,
+            mode: "auto",
+            detected: false,
             baseUrl: "",
             token: "",
             user: null,
@@ -71,7 +81,8 @@ export const useServerStore = create<ServerStore>()(
             status: "idle",
             error: "",
             syncedAt: "",
-            setEnabled: (enabled) => set(enabled ? { enabled } : { enabled, status: "idle", error: "" }),
+            setMode: (mode) => set(mode === "off" ? { mode, status: "idle", error: "" } : { mode }),
+            setDetected: (detected) => set({ detected }),
             setBaseUrl: (baseUrl) => set({ baseUrl: baseUrl.trim().replace(/\/+$/, ""), status: "idle", error: "" }),
             setSession: (token, user) => set({ token, user, status: "ready", error: "" }),
             setUser: (user) => set({ user }),
@@ -82,19 +93,32 @@ export const useServerStore = create<ServerStore>()(
         }),
         {
             name: SERVER_STORE_KEY,
-            partialize: (state) => ({ enabled: state.enabled, baseUrl: state.baseUrl, token: state.token, syncedAt: state.syncedAt }),
+            partialize: (state) => ({ mode: state.mode, baseUrl: state.baseUrl, token: state.token, syncedAt: state.syncedAt }),
         },
     ),
 );
 
+/** 服务器模式是否启用（未必已登录）：on 直接启用，auto 看有没有探测到后端。 */
+function serverEnabled(state: Pick<ServerStore, "mode" | "detected">) {
+    return state.mode === "on" || (state.mode === "auto" && state.detected);
+}
+
+export function isServerEnabled() {
+    return serverEnabled(useServerStore.getState());
+}
+
+export function useIsServerEnabled() {
+    return useServerStore(serverEnabled);
+}
+
 /** 是否处于「已登录的服务器模式」，数据读写与生成都应走服务端。 */
 export function isServerMode() {
     const state = useServerStore.getState();
-    return state.enabled && Boolean(state.token) && Boolean(state.user);
+    return serverEnabled(state) && Boolean(state.token) && Boolean(state.user);
 }
 
 export function useIsServerMode() {
-    return useServerStore((state) => state.enabled && Boolean(state.token) && Boolean(state.user));
+    return useServerStore((state) => serverEnabled(state) && Boolean(state.token) && Boolean(state.user));
 }
 
 export function isServerAdmin() {

@@ -7,11 +7,11 @@ import { videoResolutionOptions, videoSecondOptions, videoSizeOptions } from "@/
 import type { CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAssetStore } from "@/stores/use-asset-store";
-import { modelOptionLabel, modelOptionName, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore } from "@/stores/use-config-store";
+import { modelOptionLabel, modelOptionName, selectableModelsByCapability, useConfigStore } from "@/stores/use-config-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 
 // 在网页端执行 Agent 的「站点级」工具（画布列表、工作台生成、提示词搜索、资产增删查等）。
-// 这些工具的数据都在浏览器本地（localforage / zustand），因此由本模块直接读写对应 store 后返回结果。
+// 这些工具读写前端 store，画布与素材的改动会由 store 自动同步到服务端。
 
 export const SITE_TOOL_NAMES = [
     "canvas_list_projects",
@@ -156,7 +156,7 @@ function runImageWorkbench(input: SiteToolInput, navigate: NavigateFunction) {
     const configStore = useConfigStore.getState();
     const applied: Record<string, unknown> = {};
     if (typeof input.model === "string" && input.model.trim()) {
-        const value = normalizeModelOptionValue(input.model, configStore.config.channels) || input.model;
+        const value = input.model.trim();
         configStore.updateConfig("imageModel", value);
         applied.model = value;
     }
@@ -204,7 +204,7 @@ function runVideoWorkbench(input: SiteToolInput, navigate: NavigateFunction) {
     const configStore = useConfigStore.getState();
     const applied: Record<string, unknown> = {};
     if (typeof input.model === "string" && input.model.trim()) {
-        const value = normalizeModelOptionValue(input.model, configStore.config.channels) || input.model;
+        const value = input.model.trim();
         configStore.updateConfig("videoModel", value);
         applied.model = value;
     }
@@ -246,7 +246,7 @@ async function searchPrompts(input: SiteToolInput) {
         pageSize,
         categories: result.categories,
         tags: result.tags.slice(0, 60),
-        items: result.items.map((prompt) => ({ id: prompt.id, title: prompt.title, prompt: prompt.prompt, category: prompt.category, tags: prompt.tags, coverUrl: prompt.coverUrl, githubUrl: prompt.githubUrl })),
+        items: result.items.map((prompt) => ({ id: prompt.id, title: prompt.title, prompt: prompt.prompt, category: prompt.category, tags: prompt.tags, coverUrl: prompt.coverUrl, githubUrl: prompt.sourceUrl })),
     };
 }
 

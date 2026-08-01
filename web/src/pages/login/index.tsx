@@ -1,3 +1,4 @@
+import { browserSupportsWebAuthn, startAuthentication } from "@simplewebauthn/browser";
 import { App, Button, Form, Input, Segmented, Tag } from "antd";
 import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -13,11 +14,11 @@ export default function LoginPage() {
     const [searchParams] = useSearchParams();
     const [mode, setMode] = useState<Mode>("login");
     const [submitting, setSubmitting] = useState(false);
+    const [passkeyLoading, setPasskeyLoading] = useState(false);
     const baseUrl = useServerStore((state) => state.baseUrl);
     const settings = useServerStore((state) => state.settings);
     const user = useServerStore((state) => state.user);
     const setSession = useServerStore((state) => state.setSession);
-    const setEnabled = useServerStore((state) => state.setEnabled);
 
     const redirect = searchParams.get("redirect") || "/";
     const oauthToken = searchParams.get("token");
@@ -35,7 +36,6 @@ export default function LoginPage() {
             return;
         }
         if (!oauthToken) return;
-        setEnabled(true);
         useServerStore.setState({ token: oauthToken });
         serverApi
             .me()
@@ -59,7 +59,6 @@ export default function LoginPage() {
         setSubmitting(true);
         try {
             const session = mode === "login" ? await serverApi.login(values.username, values.password) : await serverApi.register(values.username, values.password);
-            setEnabled(true);
             setSession(session.token, session.user);
             message.success(mode === "login" ? "登录成功" : "注册成功");
             navigate(redirect, { replace: true });
@@ -70,11 +69,29 @@ export default function LoginPage() {
         }
     };
 
+    /** 不传用户名，由浏览器列出本机可用的 Passkey 让用户挑。 */
+    const loginWithPasskey = async () => {
+        setPasskeyLoading(true);
+        try {
+            const { flowId, options } = await serverApi.passkeyLoginOptions();
+            const session = await serverApi.passkeyLoginVerify(flowId, await startAuthentication({ optionsJSON: options }));
+            setSession(session.token, session.user);
+            message.success("登录成功");
+            navigate(redirect, { replace: true });
+        } catch (error) {
+            // 用户主动取消系统弹窗也会抛错，这里不当成失败提示。
+            const text = error instanceof Error ? error.message : "Passkey 登录失败";
+            if (!/NotAllowed|abort|cancel/i.test(text)) message.error(text);
+        } finally {
+            setPasskeyLoading(false);
+        }
+    };
+
     return (
         <main className="flex h-full items-center justify-center overflow-y-auto bg-background px-6 py-10">
             <div className="w-full max-w-sm">
-                <h1 className="text-xl font-semibold text-stone-950 dark:text-stone-100">连接服务器</h1>
-                <p className="mt-1 text-sm text-stone-500">登录后画布、素材与生成记录会保存在服务器，可在多设备之间同步</p>
+                <h1 className="text-xl font-semibold text-stone-950 dark:text-stone-100">登录</h1>
+                <p className="mt-1 text-sm text-stone-500">画布、素材与生成记录都保存在服务器，登录后可在多设备之间同步</p>
                 <div className="mt-2 text-xs text-stone-400">服务器地址：{baseUrl || "与当前站点同源"}</div>
 
                 <Segmented
@@ -101,15 +118,17 @@ export default function LoginPage() {
                     </Button>
                 </Form>
 
+                {browserSupportsWebAuthn() ? (
+                    <Button className="mt-3" block loading={passkeyLoading} onClick={loginWithPasskey}>
+                        使用 Passkey 登录
+                    </Button>
+                ) : null}
+
                 {settings?.auth.linuxDo.enabled ? (
                     <Button className="mt-3" block onClick={() => (window.location.href = serverApi.linuxDoAuthorizeUrl(redirect))}>
                         使用 Linux.do 登录
                     </Button>
                 ) : null}
-
-                <Button className="mt-3" type="link" block onClick={() => navigate("/")}>
-                    先不登录，继续使用本地模式
-                </Button>
             </div>
         </main>
     );

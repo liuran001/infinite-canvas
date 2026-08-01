@@ -76,7 +76,6 @@ export default function ImagePage() {
     const config = useConfigStore((state) => state.config);
     const effectiveConfig = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
-    const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
     const [prompt, setPrompt] = useState("");
@@ -164,13 +163,18 @@ export default function ImagePage() {
 
     const addReferences = async (files?: FileList | null) => {
         const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
-        const nextReferences = await Promise.all(
-            imageFiles.map(async (file) => {
-                const image = await uploadImage(file);
-                return { id: nanoid(), name: file.name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
-            }),
-        );
-        setReferences((value) => [...value, ...nextReferences]);
+        try {
+            const nextReferences = await Promise.all(
+                imageFiles.map(async (file) => {
+                    const image = await uploadImage(file);
+                    return { id: nanoid(), name: file.name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
+                }),
+            );
+            setReferences((value) => [...value, ...nextReferences]);
+        } catch (error) {
+            // 云空间不足、文件过大等都是服务端给的中文文案，原样提示给用户。
+            message.error(error instanceof Error ? error.message : "上传参考图失败");
+        }
     };
 
     const addReferencesFromClipboard = async () => {
@@ -203,7 +207,7 @@ export default function ImagePage() {
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: "请输入生图提示词" });
             return;
         }
-        if (!isGenerationReady(effectiveConfig, model, isAiConfigReady)) {
+        if (!isGenerationReady()) {
             message.warning("请先完成配置");
             openConfigDialog(true);
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: "生图配置不完整" });
@@ -339,7 +343,7 @@ export default function ImagePage() {
             message.error("请输入生图提示词");
             return null;
         }
-        if (!isGenerationReady(effectiveConfig, model, isAiConfigReady)) {
+        if (!isGenerationReady()) {
             message.warning("请先完成配置");
             openConfigDialog(true);
             return null;

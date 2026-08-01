@@ -36,6 +36,7 @@ import { CanvasNode } from "@/components/canvas/canvas-node";
 import { CanvasNodePromptPanel, type CanvasNodeGenerationMode } from "@/components/canvas/canvas-node-prompt-panel";
 import { CanvasToolbar } from "@/components/canvas/canvas-toolbar";
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
+import { CanvasMobileHintDialog } from "@/components/canvas/canvas-mobile-hint-dialog";
 import { CanvasSidePanel } from "@/components/canvas/canvas-side-panel";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useAgentStore } from "@/stores/use-agent-store";
@@ -187,10 +188,8 @@ function InfiniteCanvasPage() {
 
     const config = useConfigStore((state) => state.config);
     const effectiveConfig = useEffectiveConfig();
-    const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
-    const cleanupAssetImages = useAssetStore((state) => state.cleanupImages);
     const hydrated = useCanvasStore((state) => state.hydrated);
     const createProject = useCanvasStore((state) => state.createProject);
     const openProject = useCanvasStore((state) => state.openProject);
@@ -266,13 +265,6 @@ function InfiniteCanvasPage() {
             showImageInfo,
         }),
         [activeChatId, backgroundMode, chatSessions, showImageInfo],
-    );
-
-    const cleanupCanvasFiles = useCallback(
-        (extra?: unknown) => {
-            cleanupAssetImages({ extra, history: historyRef.current, lastHistory: lastHistoryRef.current });
-        },
-        [cleanupAssetImages],
     );
 
     const startGenerationRequest = useCallback((targetNodeId: string, originNodeId: string, runningId = originNodeId, controller = new AbortController()) => {
@@ -708,7 +700,6 @@ function InfiniteCanvasPage() {
 
     const { pluginHost, renderPluginPanel, buildNodeToolbarItems } = usePluginHost({
         effectiveConfig,
-        isAiConfigReady,
         openConfigDialog,
         theme,
         nodesRef,
@@ -793,9 +784,8 @@ function InfiniteCanvasPage() {
             setPreviewNodeId((current) => (current && allIds.has(current) ? null : current));
             setRunningNodeId((current) => (current && allIds.has(current) ? null : current));
             setContextMenu((current) => (current?.type === "node" && allIds.has(current.nodeId) ? null : current));
-            cleanupCanvasFiles({ projectId, nodes: nodesRef.current.filter((node) => !allIds.has(node.id)), chatSessions });
         },
-        [chatSessions, cleanupCanvasFiles, projectId],
+        [],
     );
 
     const deleteConnection = useCallback((connectionId: string) => {
@@ -827,8 +817,7 @@ function InfiniteCanvasPage() {
         setRunningNodeId(null);
         deselectCanvas();
         setClearConfirmOpen(false);
-        cleanupCanvasFiles({ projectId, nodes: [], chatSessions: [] });
-    }, [cleanupCanvasFiles, deselectCanvas, projectId]);
+    }, [deselectCanvas]);
 
     const duplicateNode = useCallback((nodeId: string) => {
         const source = nodesRef.current.find((node) => node.id === nodeId);
@@ -1023,9 +1012,8 @@ function InfiniteCanvasPage() {
 
     const deleteCurrentProject = useCallback(() => {
         deleteProjects([projectId]);
-        cleanupAssetImages();
         navigate("/canvas");
-    }, [cleanupAssetImages, deleteProjects, navigate, projectId]);
+    }, [deleteProjects, navigate, projectId]);
 
     const exportCurrentProject = useCallback(async () => {
         const project = useCanvasStore.getState().projects.find((item) => item.id === projectId);
@@ -1749,7 +1737,7 @@ function InfiniteCanvasPage() {
         async (node: CanvasNodeData, payload: CanvasImageMaskEditPayload) => {
             if (!node.metadata?.content) return;
             const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image"), count: "1", size: node.metadata?.size || "auto" };
-            if (!isGenerationReady(generationConfig, generationConfig.model, isAiConfigReady)) {
+            if (!isGenerationReady()) {
                 openConfigDialog(true);
                 return;
             }
@@ -1792,7 +1780,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, jobContext, isAiConfigReady, message, openConfigDialog, startGenerationRequest],
+        [effectiveConfig, finishGenerationRequest, jobContext, message, openConfigDialog, startGenerationRequest],
     );
 
     const upscaleImageNode = useCallback(async (node: CanvasNodeData, params: CanvasImageUpscaleParams) => {
@@ -1824,7 +1812,7 @@ function InfiniteCanvasPage() {
         async (node: CanvasNodeData, params: CanvasImageAngleParams) => {
             if (!node.metadata?.content) return;
             const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image"), count: "1" };
-            if (!isGenerationReady(generationConfig, generationConfig.model, isAiConfigReady)) {
+            if (!isGenerationReady()) {
                 openConfigDialog(true);
                 return;
             }
@@ -2066,7 +2054,7 @@ function InfiniteCanvasPage() {
         async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => {
             const sourceNode = nodesRef.current.find((node) => node.id === nodeId);
             const generationConfig = buildGenerationConfig(effectiveConfig, sourceNode, mode);
-            if (!isGenerationReady(generationConfig, generationConfig.model, isAiConfigReady)) {
+            if (!isGenerationReady()) {
                 openConfigDialog(true);
                 return;
             }
@@ -2473,7 +2461,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, jobContext, isAiConfigReady, message, openConfigDialog, startGenerationRequest],
+        [effectiveConfig, finishGenerationRequest, jobContext, message, openConfigDialog, startGenerationRequest],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;
@@ -2496,7 +2484,7 @@ function InfiniteCanvasPage() {
                           count: "1",
                       }
                     : { ...buildGenerationConfig(effectiveConfig, sourceNode, node.type === CanvasNodeType.Text ? "text" : node.type === CanvasNodeType.Video ? "video" : node.type === CanvasNodeType.Audio ? "audio" : "image"), count: "1" };
-            if (!isGenerationReady(generationConfig, generationConfig.model, isAiConfigReady)) {
+            if (!isGenerationReady()) {
                 openConfigDialog(true);
                 return;
             }
@@ -2610,7 +2598,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, jobContext, isAiConfigReady, message, openConfigDialog, startGenerationRequest],
+        [effectiveConfig, finishGenerationRequest, jobContext, message, openConfigDialog, startGenerationRequest],
     );
 
     const generateImageFromTextNode = useCallback(
@@ -3066,6 +3054,7 @@ function InfiniteCanvasPage() {
                 </Modal>
 
                 <AssetPickerModal open={assetPickerOpen} onInsert={handleAssetInsert} onClose={() => setAssetPickerOpen(false)} />
+                <CanvasMobileHintDialog />
             </section>
         </main>
     );

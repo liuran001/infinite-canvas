@@ -1,5 +1,5 @@
 import { Button, Menu, Result } from "antd";
-import { ArrowLeft, Coins, Images, Settings, Sparkles, Users } from "lucide-react";
+import { ArrowLeft, Coins, FolderOpen, Images, Settings, Sparkles, Users, Wand2 } from "lucide-react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 
 import { useServerStore } from "@/stores/use-server-store";
@@ -7,6 +7,8 @@ import { useServerStore } from "@/stores/use-server-store";
 const navItems = [
     { key: "/admin/users", icon: <Users className="size-4" />, label: <Link to="/admin/users">用户管理</Link> },
     { key: "/admin/credit-logs", icon: <Coins className="size-4" />, label: <Link to="/admin/credit-logs">算力点流水</Link> },
+    { key: "/admin/generations", icon: <Wand2 className="size-4" />, label: <Link to="/admin/generations">生成记录</Link> },
+    { key: "/admin/contents", icon: <FolderOpen className="size-4" />, label: <Link to="/admin/contents">用户内容</Link> },
     { key: "/admin/prompts", icon: <Sparkles className="size-4" />, label: <Link to="/admin/prompts">提示词</Link> },
     { key: "/admin/assets", icon: <Images className="size-4" />, label: <Link to="/admin/assets">素材</Link> },
     { key: "/admin/settings", icon: <Settings className="size-4" />, label: <Link to="/admin/settings">系统设置</Link> },

@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { App, Button, Form, Input, InputNumber, Modal, Select, Table, Tag } from "antd";
 import dayjs from "dayjs";
-import { Plus, Trash2 } from "lucide-react";
+import { Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { useAdminAction } from "@/pages/admin/use-admin-action";
@@ -66,6 +66,9 @@ export default function AdminCreditLogsPage() {
                         onChange={(event) => setKeyword(event.target.value)}
                         onSearch={(value) => setQuery((current) => ({ ...current, keyword: value, page: 1 }))}
                     />
+                    <Button icon={<RefreshCw className={`size-4 ${isFetching ? "animate-spin" : ""}`} />} onClick={() => void refetch()} title="刷新">
+                        刷新
+                    </Button>
                     <Button type="primary" icon={<Plus className="size-4" />} onClick={() => setCreating(true)}>
                         新增流水
                     </Button>

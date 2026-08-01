@@ -4,7 +4,9 @@ import { AnalyticsTracker } from "@/components/layout/analytics-tracker";
 import AdminLayout from "@/layouts/admin-layout";
 import UserLayout from "@/layouts/user-layout";
 import AdminAssetsPage from "@/pages/admin/assets";
+import AdminContentsPage from "@/pages/admin/contents";
 import AdminCreditLogsPage from "@/pages/admin/credit-logs";
+import AdminGenerationsPage from "@/pages/admin/generations";
 import AdminPromptsPage from "@/pages/admin/prompts";
 import AdminSettingsPage from "@/pages/admin/settings";
 import AdminUsersPage from "@/pages/admin/users";
@@ -46,6 +48,8 @@ export const router = createBrowserRouter([
             { index: true, element: <AdminUsersPage /> },
             { path: "users", element: <AdminUsersPage /> },
             { path: "credit-logs", element: <AdminCreditLogsPage /> },
+            { path: "generations", element: <AdminGenerationsPage /> },
+            { path: "contents", element: <AdminContentsPage /> },
             { path: "settings", element: <AdminSettingsPage /> },
             { path: "prompts", element: <AdminPromptsPage /> },
             { path: "assets", element: <AdminAssetsPage /> },

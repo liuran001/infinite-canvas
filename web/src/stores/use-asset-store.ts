@@ -3,8 +3,8 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 
 import { nanoid } from "nanoid";
 import { localForageStorage } from "@/lib/localforage-storage";
-import { cleanupUnusedImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
-import { cleanupUnusedMedia, resolveMediaUrl } from "@/services/file-storage";
+import { resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { resolveMediaUrl } from "@/services/file-storage";
 import { isServerMode } from "@/stores/use-server-store";
 
 export type AssetKind = "text" | "image" | "video";
@@ -35,7 +35,6 @@ type AssetStore = {
     updateAsset: (id: string, patch: Partial<Omit<Asset, "id" | "createdAt">>) => void;
     removeAsset: (id: string) => void;
     replaceAssets: (assets: Asset[]) => void;
-    cleanupImages: (extra?: unknown) => void;
 };
 
 const ASSET_STORE_KEY = "infinite-canvas:asset_store";
@@ -96,21 +95,10 @@ export const useAssetStore = create<AssetStore>()(
                 pushRemote(get().assets.find((asset) => asset.id === id));
             },
             removeAsset: (id) => {
-                set((state) => {
-                    const assets = state.assets.filter((asset) => asset.id !== id);
-                    get().cleanupImages({ assets });
-                    return { assets };
-                });
+                set((state) => ({ assets: state.assets.filter((asset) => asset.id !== id) }));
                 removeRemote(id);
             },
             replaceAssets: (assets) => set({ assets }),
-            cleanupImages: (extra) => {
-                window.setTimeout(async () => {
-                    const { useCanvasStore } = await import("@/stores/canvas/use-canvas-store");
-                    await cleanupUnusedImages({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
-                    await cleanupUnusedMedia({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
-                }, 0);
-            },
         }),
         {
             name: ASSET_STORE_KEY,

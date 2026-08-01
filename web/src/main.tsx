@@ -13,9 +13,9 @@ import { useServerStore } from "@/stores/use-server-store";
 
 initAnalytics();
 
-// 只有令牌持久化到本地，用户信息与服务端配置需要在启动时重新拉一次，
-// 否则刷新页面后会被判定成未登录而静默退回本地模式。
-if (useServerStore.getState().enabled) void connectServer();
+// 默认自动探测同源后端：部署了服务端就直接可用，纯前端部署探测不到会静默留在本地模式。
+// 用户信息也没有持久化，刷新后同样要靠这次连接恢复，否则会被判定成未登录。
+if (useServerStore.getState().mode !== "off") void connectServer();
 
 document.body.style.fontFamily = '"SF Pro Display","SF Pro Text","PingFang SC","Microsoft YaHei","Helvetica Neue",sans-serif';
 

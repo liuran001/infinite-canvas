@@ -2,9 +2,26 @@ import { App, Button, Input, InputNumber, Modal, Segmented, Select, Switch } fro
 import { Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { adminApi, type AdminChannel } from "@/services/api/admin";
-import { defaultBaseUrlForApiFormat, guessCapability } from "@/stores/use-config-store";
+import { adminApi, type AdminChannel, type AdminChannelModel } from "@/services/api/admin";
 import type { ServerApiFormat, ServerCapability } from "@/stores/use-server-store";
+
+const defaultBaseUrls: Record<ServerApiFormat, string> = {
+    openai: "https://api.openai.com",
+    gemini: "https://generativelanguage.googleapis.com",
+    ark: "https://ark.cn-beijing.volces.com/api/v3",
+};
+
+const capabilityKeywords: Array<{ capability: ServerCapability; keywords: string[] }> = [
+    { capability: "video", keywords: ["seedance", "video", "sora", "veo", "kling", "wan", "hailuo"] },
+    { capability: "audio", keywords: ["audio", "tts", "speech", "voice", "music", "sound"] },
+    { capability: "image", keywords: ["seedream", "gpt-image", "image", "dall-e", "dalle", "imagen", "flux", "sdxl", "stable-diffusion", "midjourney"] },
+];
+
+/** 按模型名猜一个默认能力，猜错了在下面的分段控件里改即可。 */
+function guessCapability(name: string): ServerCapability {
+    const value = name.toLowerCase();
+    return capabilityKeywords.find((item) => item.keywords.some((keyword) => value.includes(keyword)))?.capability || "text";
+}
 
 const apiFormatOptions: Array<{ label: string; value: ServerApiFormat }> = [
     { label: "OpenAI", value: "openai" },
@@ -41,8 +58,8 @@ export function ChannelEditorModal({ channel, index, onSave, onClose }: { channe
     const patch = (value: Partial<AdminChannel>) => setDraft((current) => (current ? { ...current, ...value } : current));
 
     const changeApiFormat = (apiFormat: ServerApiFormat) => {
-        const isDefault = !draft.baseUrl.trim() || draft.baseUrl.trim() === defaultBaseUrlForApiFormat(draft.apiFormat);
-        patch({ apiFormat, baseUrl: isDefault ? defaultBaseUrlForApiFormat(apiFormat) : draft.baseUrl });
+        const isDefault = !draft.baseUrl.trim() || draft.baseUrl.trim() === defaultBaseUrls[draft.apiFormat];
+        patch({ apiFormat, baseUrl: isDefault ? defaultBaseUrls[apiFormat] : draft.baseUrl });
     };
 
     // 已选模型保留原有能力设置，新增的按名称猜一个默认能力。
@@ -51,7 +68,7 @@ export function ChannelEditorModal({ channel, index, onSave, onClose }: { channe
         patch({ models: names.map((name) => saved.get(name) || { name, capability: guessCapability(name) }) });
     };
 
-    const setCapability = (name: string, capability: ServerCapability) => patch({ models: draft.models.map((model) => (model.name === name ? { ...model, capability } : model)) });
+    const patchModel = (name: string, value: Partial<AdminChannelModel>) => patch({ models: draft.models.map((model) => (model.name === name ? { ...model, ...value } : model)) });
 
     const loadModels = async () => {
         setLoading(true);
@@ -135,7 +152,8 @@ export function ChannelEditorModal({ channel, index, onSave, onClose }: { channe
                             <span className="min-w-0 flex-1 truncate text-sm" title={model.name}>
                                 {model.name}
                             </span>
-                            <Segmented size="small" value={model.capability} options={capabilityOptions} onChange={(value) => setCapability(model.name, value as ServerCapability)} />
+                            <Input size="small" className="w-44" value={model.label || ""} placeholder="留空则显示模型名" onChange={(event) => patchModel(model.name, { label: event.target.value })} />
+                            <Segmented size="small" value={model.capability} options={capabilityOptions} onChange={(value) => patchModel(model.name, { capability: value as ServerCapability })} />
                             <Button size="small" danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => applyNames(modelNames.filter((name) => name !== model.name))} />
                         </div>
                     ))

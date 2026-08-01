@@ -1,5 +1,6 @@
 import { serverRequest } from "@/services/api/server";
 import type { ServerApiFormat, ServerCapability, ServerRole, ServerSettings, ServerUser } from "@/stores/use-server-store";
+import type { CanvasNodeData } from "@/types/canvas";
 
 export type AdminUserStatus = "active" | "ban";
 
@@ -11,6 +12,8 @@ export type AdminUser = {
     avatarUrl: string;
     role: ServerRole;
     credits: number;
+    storageQuota: number;
+    storageUsed: number;
     affCode: string;
     affCount: number;
     linuxDoId: string;
@@ -34,7 +37,7 @@ export type AdminCreditLog = {
     createdAt: string;
 };
 
-export type AdminChannelModel = { name: string; capability: ServerCapability };
+export type AdminChannelModel = { name: string; label?: string; capability: ServerCapability };
 
 export type AdminChannel = {
     apiFormat: ServerApiFormat;
@@ -46,6 +49,9 @@ export type AdminChannel = {
     enabled: boolean;
     remark: string;
 };
+
+/** 模型算力点成本，qualityCredits 按画质档位在基础价上叠加。 */
+export type ModelCost = ServerSettings["modelChannel"]["modelCosts"][number];
 
 /** public 与前端公开配置同构；private 只有管理后台可见，密钥字段读取时被服务端抹成空串。 */
 export type AdminSettings = {
@@ -105,6 +111,33 @@ export type AdminAsset = {
 
 export type AdminQuery = { keyword?: string; category?: string; type?: string; tag?: string[]; page?: number; pageSize?: number };
 
+/** 内容审查列表的额外筛选项，`search()` 会一并拼进查询串。 */
+export type AdminReviewQuery = AdminQuery & { userId?: string; status?: string; kind?: string };
+
+export type AdminOwner = { userId: string; username: string; displayName: string };
+
+export type AdminFile = { id: string; kind: string; mimeType: string; bytes: number; width: number; height: number; durationMs: number; createdAt: string };
+
+export type AdminJob = AdminOwner & {
+    id: string;
+    kind: "image" | "video" | "audio";
+    status: "pending" | "running" | "succeeded" | "failed" | "canceled";
+    model: string;
+    prompt: string;
+    credits: number;
+    progress: number;
+    error: string;
+    outputs: AdminFile[];
+    createdAt: string;
+    finishedAt: string;
+};
+
+export type AdminJobDetail = AdminJob & { clientJobId: string; params: Record<string, unknown>; context: Record<string, unknown>; inputs: AdminFile[]; updatedAt: string };
+
+export type AdminProject = AdminOwner & { projectId: string; title: string; nodeCount: number; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
+
+export type AdminProjectDetail = AdminProject & { data: { nodes?: CanvasNodeData[] } };
+
 function search(query: AdminQuery) {
     const params = new URLSearchParams();
     for (const [key, value] of Object.entries(query)) {
@@ -127,6 +160,7 @@ export const adminApi = {
     users: (query: AdminQuery) => serverRequest<{ items: AdminUser[]; total: number }>(`/admin/users${search(query)}`, {}, "读取用户列表失败"),
     saveUser: (user: Partial<AdminUser> & { password?: string }) => serverRequest<AdminUser>("/admin/users", post(user), "保存用户失败"),
     setUserCredits: (id: string, credits: number) => serverRequest<AdminUser>(`/admin/users/${id}/credits`, post({ credits }), "调整算力点失败"),
+    setUserQuota: (id: string, quota: number) => serverRequest<AdminUser>(`/admin/users/${id}/quota`, post({ quota }), "调整云空间配额失败"),
     deleteUser: (id: string) => serverRequest<boolean>(`/admin/users/${id}`, remove, "删除用户失败"),
 
     creditLogs: (query: AdminQuery) => serverRequest<{ items: AdminCreditLog[]; total: number }>(`/admin/credit-logs${search(query)}`, {}, "读取算力点流水失败"),
@@ -151,4 +185,10 @@ export const adminApi = {
     assets: (query: AdminQuery) => serverRequest<{ items: AdminAsset[]; tags: string[]; total: number }>(`/admin/assets${search(query)}`, {}, "读取素材失败"),
     saveAsset: (asset: Partial<AdminAsset>) => serverRequest<AdminAsset>("/admin/assets", post(asset), "保存素材失败"),
     deleteAsset: (id: string) => serverRequest<boolean>(`/admin/assets/${id}`, remove, "删除素材失败"),
+
+    jobs: (query: AdminReviewQuery) => serverRequest<{ items: AdminJob[]; total: number }>(`/admin/jobs${search(query)}`, {}, "读取生成记录失败"),
+    job: (id: string) => serverRequest<AdminJobDetail>(`/admin/jobs/${id}`, {}, "读取生成详情失败"),
+    projects: (query: AdminReviewQuery) => serverRequest<{ items: AdminProject[]; total: number }>(`/admin/projects${search(query)}`, {}, "读取画布列表失败"),
+    project: (userId: string, projectId: string) => serverRequest<AdminProjectDetail>(`/admin/projects/${encodeURIComponent(userId)}/${encodeURIComponent(projectId)}`, {}, "读取画布详情失败"),
+    files: (query: AdminReviewQuery) => serverRequest<{ items: Array<AdminFile & AdminOwner>; total: number }>(`/admin/files${search(query)}`, {}, "读取用户文件失败"),
 };
