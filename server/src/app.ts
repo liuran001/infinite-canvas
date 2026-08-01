@@ -10,6 +10,7 @@ import { agentRouter } from "./routes/agent";
 import { aiRouter } from "./routes/ai";
 import { adminUserRouter, authRouter } from "./routes/auth";
 import { fileRouter } from "./routes/files";
+import { inviteRouter } from "./routes/invites";
 import { jobRouter } from "./routes/jobs";
 import { passkeyRouter } from "./routes/passkey";
 import { preferenceRouter } from "./routes/preferences";
@@ -26,7 +27,7 @@ export function createApp() {
     app.use((req, res, next) => {
         res.setHeader("Access-Control-Allow-Origin", config.corsOrigin);
         res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept");
-        res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS");
         if (req.method === "OPTIONS") return res.sendStatus(204);
         return next();
     });
@@ -34,6 +35,7 @@ export function createApp() {
     const api = express.Router();
     api.get("/health", (_req, res) => ok(res, "ok"));
     api.use(authRouter);
+    api.use(inviteRouter);
     api.use(passkeyRouter);
     api.use(preferenceRouter);
     api.use(publicRouter);

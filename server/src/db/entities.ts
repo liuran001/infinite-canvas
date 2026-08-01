@@ -9,7 +9,7 @@ const short = { type: "varchar", length: 255, default: "" } as const;
 
 export type UserRole = "guest" | "user" | "admin";
 export type UserStatus = "active" | "ban";
-export type CreditLogType = "admin_adjust" | "ai_consume" | "ai_refund";
+export type CreditLogType = "admin_adjust" | "ai_consume" | "ai_refund" | "invite_gift";
 export type JobKind = "image" | "video" | "audio" | "text";
 export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
 export type FileStorage = "local" | "s3";
@@ -68,6 +68,34 @@ export class Setting {
     @PrimaryColumn({ type: "varchar", length: 32 }) key!: string;
     @Column({ type: LONG_TEXT, nullable: true }) value!: string;
     @Column(short) updatedAt!: string;
+}
+
+/**
+ * 注册邀请码。码值本身就是主键：它是随机生成、不可枚举的，再多一个自增 ID 只会让每次校验都多一次查询。
+ * 码值统一按大写存，校验时也先转大写，用户手输不用纠结大小写。
+ * usedCount 靠「usedCount < maxUses」的原子条件更新推进，两个人抢最后一个名额时不会一起成功。
+ */
+@Entity("invite_codes")
+export class InviteCode {
+    @PrimaryColumn({ type: "varchar", length: 64 }) code!: string;
+    @Column({ type: "int", default: 1 }) maxUses!: number;
+    @Column({ type: "int", default: 0 }) usedCount!: number;
+    /** 用这个码注册时赠送的算力点，0 表示不送。赠送时照常走算力点流水，不直接改余额。 */
+    @Column({ type: "int", default: 0 }) credits!: number;
+    @Column({ type: "boolean", default: true }) enabled!: boolean;
+    @Column(short) note!: string;
+    @Index() @Column(short) createdAt!: string;
+}
+
+/** 邀请码使用记录，注册成功一次落一条，后台据此查「这个码被谁、在什么时候用了」。 */
+@Entity("invite_uses")
+export class InviteUse {
+    @PrimaryColumn(id) id!: string;
+    @Index() @Column({ type: "varchar", length: 64 }) code!: string;
+    @Index() @Column(short) userId!: string;
+    /** 当时实际赠送的算力点。码上的 credits 后来可能被改，留档才知道这个人到底拿了多少。 */
+    @Column({ type: "int", default: 0 }) credits!: number;
+    @Index() @Column(short) createdAt!: string;
 }
 
 @Entity("prompts")
@@ -298,4 +326,4 @@ export class AgentMessage {
     @Column(short) createdAt!: string;
 }
 
-export const entities = [User, CreditLog, Setting, Prompt, PromptCategory, Asset, StoredFile, Project, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage];
+export const entities = [User, CreditLog, Setting, InviteCode, InviteUse, Prompt, PromptCategory, Asset, StoredFile, Project, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage];

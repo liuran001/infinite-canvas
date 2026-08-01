@@ -69,7 +69,8 @@ export type PublicSetting = {
         systemPrompt: string;
         allowCustomChannel: boolean;
     };
-    auth: { allowRegister: boolean; linuxDo: { enabled: boolean } };
+    /** requireInvite 打开后，密码注册与第三方登录建号都必须带有效邀请码；前端据此决定要不要显示邀请码输入框。 */
+    auth: { allowRegister: boolean; requireInvite: boolean; linuxDo: { enabled: boolean } };
     /** defaultQuota 是新账号的云空间上限（字节），已有账号不受影响。 */
     storage: { remoteEnabled: boolean; defaultQuota: number };
     /** 各类功能入口的总开关。配了模型也可以先不对外开放，关掉后所有用户都看不到对应入口。 */
@@ -204,6 +205,8 @@ function normalizePublic(setting: Partial<PublicSetting> | undefined, privateSet
         },
         auth: {
             allowRegister: setting?.auth?.allowRegister !== false,
+            // 默认关闭：这是给「先攒一批码再放开」准备的开关，默认打开会让全新部署直接注册不进来。
+            requireInvite: setting?.auth?.requireInvite === true,
             linuxDo: { enabled: Boolean(setting?.auth?.linuxDo?.enabled) },
         },
         storage: {
@@ -292,11 +295,29 @@ function keepSecrets(next: Settings, saved: Settings): Settings {
     };
 }
 
+/**
+ * 深合并：只有传进来的字段才覆盖已存配置。
+ * 数组整体替换而不是逐项合并 —— 渠道、搜索服务这类列表要能删条目，合并的话删不掉。
+ */
+function mergeDeep<T>(base: T, patch: unknown): T {
+    if (patch === undefined) return base;
+    if (patch === null || Array.isArray(patch) || typeof patch !== "object") return patch as T;
+    if (base === null || Array.isArray(base) || typeof base !== "object") return patch as T;
+    const result: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+    for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+        result[key] = mergeDeep((base as Record<string, unknown>)[key], value);
+    }
+    return result as T;
+}
+
 export async function saveSettings(input: Partial<Settings>) {
     const saved = await readSettings();
+    // 先合到已存配置上再归一化：直接归一化 input 会把没传的字段填成默认值，
+    // 于是「只改一个开关」的请求会把渠道、密钥等其余配置一起清空。
+    const patched = mergeDeep(saved, input) as Partial<Settings>;
     // 补回「留空表示不变」的密钥后要再归一化一次：
     // agent.searchEnabled 是从搜索 key 推导出来的，先补 key 再算才不会被误判成未配置。
-    const merged = normalizeSettings(keepSecrets(normalizeSettings(input), saved));
+    const merged = normalizeSettings(keepSecrets(normalizeSettings(patched), saved));
     const table = repo(Setting);
     await table.save([
         { key: "public", value: JSON.stringify(merged.public), updatedAt: now() },

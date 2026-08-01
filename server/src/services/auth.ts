@@ -8,6 +8,7 @@ import { repo } from "../db/data-source";
 import { CreditLog, DEFAULT_STORAGE_QUOTA, User, type CreditLogType, type UserRole, type UserStatus } from "../db/entities";
 import { fail, firstNonEmpty, newAffCode, newId, now } from "../lib/errors";
 import type { Query } from "../lib/response";
+import { claimInviteCode, recordInviteUse, releaseInviteCode } from "./invites";
 import { usedBytesOf } from "./quota";
 import { getSettings } from "./settings";
 
@@ -84,7 +85,44 @@ export async function ensureDefaultAdmin() {
     await users.save(newUser({ username: config.adminUsername, password: await bcrypt.hash(config.adminPassword, 10), role: "admin" }));
 }
 
-export async function register(username: string, password: string) {
+type ClaimedInvite = { code: string; credits: number };
+
+/**
+ * 邀请码赠送算力点：先落使用记录，再按「原子加余额 + 写流水」走一遍正常的算力点通道。
+ * 不直接把余额写死，是为了让后台在流水里能看到这笔点数是哪个邀请码送的，而不是凭空多出来的余额。
+ */
+async function grantInviteReward(user: User, invite: ClaimedInvite) {
+    await recordInviteUse(invite.code, user.id, invite.credits);
+    if (invite.credits <= 0) return user;
+    const users = repo(User);
+    await users
+        .createQueryBuilder()
+        .update(User)
+        .set({ credits: () => "credits + :credits", updatedAt: now() })
+        .where("id = :userId", { userId: user.id })
+        .setParameter("credits", invite.credits)
+        .execute();
+    const fresh = (await users.findOneBy({ id: user.id })) || user;
+    await writeCreditLog(user.id, "invite_gift", invite.credits, fresh.credits, `邀请码 ${invite.code} 注册赠送`, { code: invite.code });
+    return fresh;
+}
+
+/**
+ * 建号并结算邀请码。名额是在这之前就原子占掉的，
+ * 所以建号失败必须把名额还回去，否则一次用户名冲突就白白吃掉一个名额。
+ */
+async function createInvitedUser(patch: Partial<User>, invite: ClaimedInvite | null) {
+    let user: User;
+    try {
+        user = await repo(User).save(newUser(patch));
+    } catch (error) {
+        if (invite) await releaseInviteCode(invite.code);
+        throw error;
+    }
+    return invite ? grantInviteReward(user, invite) : user;
+}
+
+export async function register(username: string, password: string, inviteCode = "") {
     const settings = await getSettings();
     if (!settings.public.auth.allowRegister) throw fail("当前未开放注册");
     const name = (username || "").trim();
@@ -92,7 +130,9 @@ export async function register(username: string, password: string) {
     if (!name || !password) throw fail("用户名和密码不能为空");
     const users = repo(User);
     if (await users.findOneBy({ username: name })) throw fail("用户名已存在");
-    const user = await users.save(newUser({ username: name, password: await bcrypt.hash(password, 10), storageQuota: settings.public.storage.defaultQuota }));
+    // 先占名额再建号：反过来的话，名额没抢到时用户已经建出来了，再删又要处理一堆半成品数据。
+    const invite = settings.public.auth.requireInvite ? await claimInviteCode(inviteCode) : null;
+    const user = await createInvitedUser({ username: name, password: await bcrypt.hash(password, 10), storageQuota: settings.public.storage.defaultQuota }, invite);
     return newSession(user);
 }
 
@@ -296,6 +336,23 @@ export async function linuxDoAuthorizeUrl(req: Request, redirect: string, bindUs
 
 type LinuxDoProfile = { id?: number; username?: string; name?: string; avatar_template?: string };
 
+/**
+ * 待注册凭据。第三方身份这时已经在服务端验过了，但还不能建号（缺邀请码），
+ * 所以把已验证的身份签成一张短期 JWT 发给前端，补完邀请码再原样带回来。
+ * 关键点是「签名」：如果让前端自己传 linuxDoId，任何人都能声称自己是任意 Linux.do 用户直接开户。
+ * kind 用来和 OAuth 的 state 令牌区分，避免两种短期令牌被互相顶用。
+ */
+type PendingRegister = { kind: "linux-do-register"; linuxDoId: string; profile: LinuxDoProfile };
+
+const PENDING_REGISTER_KIND = "linux-do-register";
+/** 10 分钟：够用户去翻一下邀请码，又不至于让一张能开户的凭据长期在外面飘着。 */
+const PENDING_REGISTER_EXPIRES = "10m";
+
+function signPendingRegister(linuxDoId: string, profile: LinuxDoProfile) {
+    const payload: PendingRegister = { kind: PENDING_REGISTER_KIND, linuxDoId, profile };
+    return jwt.sign(payload, config.jwtSecret, { expiresIn: PENDING_REGISTER_EXPIRES });
+}
+
 function linuxDoAvatar(template: string) {
     if (!template.trim()) return "";
     const url = template.startsWith("//") ? `https:${template}` : template.startsWith("/") ? `https://linux.do${template}` : template;
@@ -308,6 +365,12 @@ async function linuxDoJson<T>(url: string, init: RequestInit): Promise<T> {
     });
     if (!response.ok) throw fail("Linux.do 登录失败");
     return (await response.json()) as T;
+}
+
+/** Linux.do 用户名可能和站内已有账号撞名，撞了就拼上第三方 ID 保证唯一。 */
+async function linuxDoUsername(linuxDoId: string, profile: LinuxDoProfile) {
+    const base = (profile.username || "").trim() || `linuxdo-${linuxDoId}`;
+    return (await repo(User).findOneBy({ username: base })) ? `${base}-${linuxDoId}` : base;
 }
 
 export async function loginWithLinuxDo(req: Request, code: string, state: string) {
@@ -348,14 +411,16 @@ export async function loginWithLinuxDo(req: Request, code: string, state: string
         user.updatedAt = now();
         user.extra = JSON.stringify({ linuxDo: profile });
         await users.save(user);
-        return { session: null, redirect, bound: true };
+        return { session: null, redirect, bound: true, pendingToken: "" };
     }
 
     let user = bound;
     if (!user) {
         if (!settings.public.auth.allowRegister) throw Object.assign(fail("当前未开放注册"), { redirect });
-        const base = (profile.username || "").trim() || `linuxdo-${linuxDoId}`;
-        const username = (await users.findOneBy({ username: base })) ? `${base}-${linuxDoId}` : base;
+        // 需要邀请码时这一步绝不能建号：只签一张待注册凭据交给前端，
+        // 用户补完邀请码走 /auth/linux-do/complete 才真正开户，在那之前始终是未登录状态。
+        if (settings.public.auth.requireInvite) return { session: null, redirect, bound: false, pendingToken: signPendingRegister(linuxDoId, profile) };
+        const username = await linuxDoUsername(linuxDoId, profile);
         user = newUser({ username, displayName: (profile.name || "").trim(), avatarUrl: linuxDoAvatar(profile.avatar_template || ""), linuxDoId, storageQuota: settings.public.storage.defaultQuota });
     } else if (user.status === "ban") {
         throw Object.assign(fail("账号已被禁用"), { redirect });
@@ -365,5 +430,47 @@ export async function loginWithLinuxDo(req: Request, code: string, state: string
     user.lastLoginAt = now();
     user.updatedAt = now();
     user.extra = JSON.stringify({ linuxDo: profile });
-    return { session: await newSession(await users.save(user)), redirect, bound: false };
+    return { session: await newSession(await users.save(user)), redirect, bound: false, pendingToken: "" };
+}
+
+/**
+ * 用待注册凭据 + 邀请码完成第三方注册。
+ * 身份只认凭据里的签名内容，请求体里除了邀请码不接受任何身份字段。
+ */
+export async function completeLinuxDoRegister(pendingToken: string, inviteCode: string) {
+    let payload: PendingRegister;
+    try {
+        payload = jwt.verify(pendingToken, config.jwtSecret) as PendingRegister;
+    } catch {
+        throw fail("注册凭据已过期，请重新发起 Linux.do 登录");
+    }
+    if (payload?.kind !== PENDING_REGISTER_KIND || !payload.linuxDoId) throw fail("注册凭据无效，请重新发起 Linux.do 登录");
+
+    const settings = await getSettings();
+    if (!settings.public.auth.allowRegister) throw fail("当前未开放注册");
+    const users = repo(User);
+    // 凭据有效期内对方可能已经从别的入口把号建出来了，这时直接换成登录，不要重复建号也不要再吃一个名额。
+    const bound = await users.findOneBy({ linuxDoId: payload.linuxDoId });
+    if (bound) {
+        if (bound.status === "ban") throw fail("账号已被禁用");
+        bound.lastLoginAt = now();
+        bound.updatedAt = now();
+        return newSession(await users.save(bound));
+    }
+
+    const profile = payload.profile || {};
+    const invite = settings.public.auth.requireInvite ? await claimInviteCode(inviteCode) : null;
+    const user = await createInvitedUser(
+        {
+            username: await linuxDoUsername(payload.linuxDoId, profile),
+            displayName: (profile.name || "").trim(),
+            avatarUrl: linuxDoAvatar(profile.avatar_template || ""),
+            linuxDoId: payload.linuxDoId,
+            storageQuota: settings.public.storage.defaultQuota,
+            lastLoginAt: now(),
+            extra: JSON.stringify({ linuxDo: profile }),
+        },
+        invite,
+    );
+    return newSession(user);
 }

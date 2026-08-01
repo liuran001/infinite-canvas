@@ -82,6 +82,15 @@ curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -
   "public": { "modelChannel": { "modelCosts": [{ "model": "gpt-image-2", "credits": 2 }] } }
 }' >/dev/null
 check "留空保存不会清掉已有密钥" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.models | length')" "1"
+
+# 只改一个开关不该把其余配置一起清空：直接归一化入参会把没传的字段填成默认值，
+# 于是「改个注册开关」会顺手把渠道和密钥洗掉。这条守着 saveSettings 的深合并。
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"allowRegister":false}}}' >/dev/null
+check "部分更新不会清掉渠道" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.models | length')" "1"
+check "部分更新确实改到了目标字段" "$(curl -s "$BASE/settings" | jq -r .data.auth.allowRegister)" "false"
+check "部分更新不会清掉渠道密钥" "$(curl -s "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.private.channels | length')" "1"
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"allowRegister":true}}}' >/dev/null
+check "开关能改回去" "$(curl -s "$BASE/settings" | jq -r .data.auth.allowRegister)" "true"
 check "模型算力点成本已保存" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.modelCosts[0].credits')" "2"
 
 echo "文件存储"
@@ -280,8 +289,16 @@ require("http").createServer((req, res) => {
             return push();
         }
         // 假的 Linux.do：换 token 与拉用户资料，用来验证关闭注册时第三方登录会被挡住。
-        if (req.url.startsWith("/oauth2/token")) return res.end(JSON.stringify({ access_token: "linuxdo-access-token" }));
-        if (req.url.startsWith("/api/user")) return res.end(JSON.stringify({ id: 424242, username: "smoke-linuxdo", name: "冒烟测试" }));
+        // 授权码 invite-code-flow 换出另一个身份：邀请码用例需要一个「站内还不存在」的第三方账号，
+        // 否则会直接命中上面那个已经建过号的用户，压根走不到「新用户要邀请码」这条路径。
+        if (req.url.startsWith("/oauth2/token")) {
+            const invited = new URLSearchParams(Buffer.concat(chunks).toString("utf8")).get("code") === "invite-code-flow";
+            return res.end(JSON.stringify({ access_token: invited ? "linuxdo-invited-token" : "linuxdo-access-token" }));
+        }
+        if (req.url.startsWith("/api/user")) {
+            const invited = String(req.headers.authorization || "").includes("linuxdo-invited-token");
+            return res.end(JSON.stringify(invited ? { id: 515151, username: "smoke-invited", name: "邀请码用户" } : { id: 424242, username: "smoke-linuxdo", name: "冒烟测试" }));
+        }
         // 文本任务走流式的 /responses 与 Gemini 的 streamGenerateContent，请求体用不上。
         if (req.url.includes("/responses")) return streamText(res, (text) => ({ type: "response.output_text.delta", delta: text }));
         if (req.url.includes("streamGenerateContent")) return streamText(res, (text) => ({ candidates: [{ content: { parts: [{ text }] } }] }));
@@ -1240,6 +1257,147 @@ job_stream "$WORK/stream-other.txt" 3 1 "$ADMIN_TOKEN"
 check "换个账号订阅不到别人的任务" "$(grep -c "$CATCH_JOB" "$WORK/stream-other.txt")" "0"
 check "换个账号的流也拿不到别人的文本" "$(stream_text "$WORK/stream-other.txt" "$CATCH_JOB")" ""
 check "换个账号的流里没有任何别人的任务快照" "$(grep '^data: ' "$WORK/stream-other.txt" | sed 's/^data: //' | jq -rs '[.[] | select(.type=="job")] | length')" "0"
+
+echo "邀请码"
+invite_settings() {
+    curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{
+      "public": { "auth": { "allowRegister": true, "requireInvite": '"$1"', "linuxDo": { "enabled": true } } },
+      "private": { "auth": { "linuxDo": { "clientId": "smoke-id", "clientSecret": "smoke-secret" } } }
+    }' >/dev/null
+}
+new_invites() { curl -s -X POST "$BASE/admin/invites" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d "$1"; }
+invite_row() { curl -s --get "$BASE/admin/invites" --data-urlencode "keyword=$1" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r ".data.items[] | select(.code==\"$1\")"; }
+register_invited() { curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' -d "{\"username\":\"$1\",\"password\":\"invite-pass\",\"inviteCode\":\"$2\"}"; }
+oauth_callback_code() { curl -s -o /dev/null -w '%{redirect_url}' "$BASE/auth/linux-do/callback?code=$2&state=$1"; }
+complete_linuxdo() { curl -s -X POST "$BASE/auth/linux-do/complete" -H 'Content-Type: application/json' -d "{\"pendingToken\":\"$1\",\"inviteCode\":\"$2\"}"; }
+
+invite_settings false
+check "开关默认关闭" "$(curl -s "$BASE/settings" | jq -r .data.auth.requireInvite)" "false"
+check "普通用户读不到邀请码列表" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/admin/invites" -H "Authorization: Bearer $USER_TOKEN")" "401"
+check "未登录也读不到邀请码列表" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/admin/invites")" "401"
+check "普通用户不能批量生成" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/admin/invites" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"count":1}')" "401"
+
+# 批量生成：一次要出 N 个互不相同、且看不出规律的码。
+BATCH=$(new_invites '{"count":8,"maxUses":2,"credits":7,"note":"冒烟批量"}')
+check "批量生成返回指定数量" "$(echo "$BATCH" | jq -r '.data | length')" "8"
+check "批量生成的码互不相同" "$(echo "$BATCH" | jq -r '[.data[].code] | unique | length')" "8"
+# 不可枚举：10 位随机大写码，去掉了 0/O/1/I/L 这些形近字，既猜不出也没有连号规律。
+check "码值长度固定" "$(echo "$BATCH" | jq -r '[.data[].code | length] | unique | join(",")')" "10"
+check "码值只含约定字母表" "$(echo "$BATCH" | jq -r '[.data[].code | test("^[A-HJ-KM-NP-Z2-9]+$")] | all')" "true"
+check "码值没有公共前缀（不可预测）" "$(echo "$BATCH" | jq -r '[.data[].code[0:4]] | unique | length > 1')" "true"
+check "生成时写入了配置" "$(echo "$BATCH" | jq -r '.data[0] | "\(.maxUses)/\(.credits)/\(.note)/\(.enabled)/\(.usedCount)"')" "2/7/冒烟批量/true/0"
+check "批量生成的码都能在列表里查到" "$(curl -s --get "$BASE/admin/invites" --data-urlencode 'keyword=冒烟批量' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "8"
+check "列表带出使用情况" "$(invite_row "$(echo "$BATCH" | jq -r '.data[0].code')" | jq -r '"\(.usedCount)/\(.maxUses)"')" "0/2"
+
+GIFT_CODE=$(echo "$BATCH" | jq -r '.data[0].code')
+LIMIT_CODE=$(echo "$BATCH" | jq -r '.data[1].code')
+CASE_CODE=$(echo "$BATCH" | jq -r '.data[2].code')
+OFF_CODE=$(echo "$BATCH" | jq -r '.data[3].code')
+RACE_CODE=$(echo "$BATCH" | jq -r '.data[4].code')
+PATCH_CODE=$(echo "$BATCH" | jq -r '.data[5].code')
+DROP_CODE=$(echo "$BATCH" | jq -r '.data[6].code')
+LINUXDO_CODE=$(echo "$BATCH" | jq -r '.data[7].code')
+
+# 开关关着的时候，不填邀请码必须照常能注册，不能因为后台建了码就把大门堵上。
+check "关闭强制邀请码时不填也能注册" "$(curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' -d '{"username":"invite-off","password":"invite-pass"}' | jq -r .code)" "0"
+
+invite_settings true
+check "开关打开后公开配置能读到" "$(curl -s "$BASE/settings" | jq -r .data.auth.requireInvite)" "true"
+check "开启后不填邀请码被拒" "$(curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' -d '{"username":"invite-none","password":"invite-pass"}' | jq -r .msg)" "请输入邀请码"
+check "开启后填错邀请码被拒" "$(register_invited invite-bad NOTEXISTCODE | jq -r .msg)" "邀请码无效"
+check "被拒时没有凭空建出账号" "$(curl -s "$BASE/admin/users?keyword=invite-none" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "0"
+
+# 用码注册：算力点要真的到账，而且能在流水里查到是哪个码送的。
+GIFT_TOKEN=$(register_invited invite-gift "$GIFT_CODE" | jq -r .data.token)
+check "用有效邀请码能注册" "$([ -n "$GIFT_TOKEN" ] && [ "$GIFT_TOKEN" != "null" ] && echo yes || echo no)" "yes"
+check "赠送的算力点已到账" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $GIFT_TOKEN" | jq -r .data.credits)" "7"
+check "赠送算力点写了流水" "$(curl -s "$BASE/admin/credit-logs?keyword=$GIFT_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].type')" "invite_gift"
+check "流水里能看出是哪个邀请码送的" "$(curl -s "$BASE/admin/credit-logs?keyword=$GIFT_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].remark')" "邀请码 $GIFT_CODE 注册赠送"
+check "流水金额与配置一致" "$(curl -s "$BASE/admin/credit-logs?keyword=$GIFT_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].amount')" "7"
+check "已用次数递增" "$(invite_row "$GIFT_CODE" | jq -r .usedCount)" "1"
+
+# 大小写策略：码只存大写，输入一律 trim + 转大写，用户抄成小写照样能用。
+check "小写输入的邀请码同样有效" "$(register_invited invite-lower "$(echo "$CASE_CODE" | tr 'A-Z' 'a-z')" | jq -r .code)" "0"
+check "前后空格不影响使用" "$(register_invited invite-space "  $CASE_CODE  " | jq -r .code)" "0"
+check "两次都记在同一个码上" "$(invite_row "$CASE_CODE" | jq -r .usedCount)" "2"
+
+# 次数用完：第 3 个人再用同一个码必须被拒。
+check "用完前两次名额" "$(register_invited invite-limit-1 "$LIMIT_CODE" | jq -r .code)$(register_invited invite-limit-2 "$LIMIT_CODE" | jq -r .code)" "00"
+check "次数用完后同一个码被拒" "$(register_invited invite-limit-3 "$LIMIT_CODE" | jq -r .msg)" "邀请码已用完"
+check "被拒后已用次数没有超上限" "$(invite_row "$LIMIT_CODE" | jq -r '"\(.usedCount)/\(.maxUses)"')" "2/2"
+
+# 停用的码立刻失效，不用等次数用完。
+curl -s -X PATCH "$BASE/admin/invites/$OFF_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"enabled":false}' >/dev/null
+check "停用后的码被拒" "$(register_invited invite-disabled "$OFF_CODE" | jq -r .msg)" "邀请码已停用"
+
+# 并发抢最后一个名额：两个注册请求同时打进来，只能成功一个，usedCount 不能超过 maxUses。
+curl -s -X PATCH "$BASE/admin/invites/$RACE_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"maxUses":1}' >/dev/null
+register_invited invite-race-a "$RACE_CODE" >"$WORK/race-a.json" &
+RACE_A=$!
+register_invited invite-race-b "$RACE_CODE" >"$WORK/race-b.json" &
+RACE_B=$!
+wait "$RACE_A" "$RACE_B"
+RACE_CODES="$(jq -r .code "$WORK/race-a.json") $(jq -r .code "$WORK/race-b.json")"
+check "并发抢最后一个名额只成功一个" "$(echo "$RACE_CODES" | tr ' ' '\n' | grep -c '^0$')" "1"
+check "另一个并发请求被明确拒绝" "$(jq -r .msg "$WORK/race-a.json" "$WORK/race-b.json" | grep -c '邀请码已用完')" "1"
+check "并发后已用次数没有超上限" "$(invite_row "$RACE_CODE" | jq -r '"\(.usedCount)/\(.maxUses)"')" "1/1"
+check "并发后只建出了一个账号" "$(curl -s "$BASE/admin/users?keyword=invite-race" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "1"
+
+# 使用记录：后台要能查到这个码被谁、在什么时候用了。
+USES=$(curl -s "$BASE/admin/invites/$CASE_CODE/uses" -H "Authorization: Bearer $ADMIN_TOKEN")
+check "使用记录条数与已用次数一致" "$(echo "$USES" | jq -r .data.total)" "2"
+check "使用记录带出用户名" "$(echo "$USES" | jq -r '[.data.items[].username] | sort | join(",")')" "invite-lower,invite-space"
+check "使用记录带出使用时间" "$(echo "$USES" | jq -r '[.data.items[] | select(.usedAt | test("^[0-9]{4}-"))] | length')" "2"
+check "使用记录带出当时赠送的点数" "$(echo "$USES" | jq -r '.data.items[0].credits')" "7"
+check "没人用过的码查不到使用记录" "$(curl -s "$BASE/admin/invites/$DROP_CODE/uses" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "0"
+check "普通用户查不到使用记录" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/admin/invites/$CASE_CODE/uses" -H "Authorization: Bearer $USER_TOKEN")" "401"
+
+# 编辑与删除。
+PATCHED=$(curl -s -X PATCH "$BASE/admin/invites/$PATCH_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"maxUses":5,"credits":13,"note":"改过的备注","enabled":false}')
+check "可以改次数上限与赠送点数" "$(echo "$PATCHED" | jq -r '.data | "\(.maxUses)/\(.credits)/\(.note)/\(.enabled)"')" "5/13/改过的备注/false"
+check "改不存在的码有明确文案" "$(curl -s -X PATCH "$BASE/admin/invites/NOTEXISTCODE" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"enabled":true}' | jq -r .msg)" "邀请码不存在"
+# 上限不允许改到已用次数以下，否则后台会显示出 1/0 这种看着像坏了的数据。
+curl -s -X PATCH "$BASE/admin/invites/$CASE_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"maxUses":1}' >/dev/null
+check "上限不会被改到已用次数以下" "$(invite_row "$CASE_CODE" | jq -r '"\(.usedCount)/\(.maxUses)"')" "2/2"
+# maxUses 为 0 是「不限次」：前端后台就是这么标的，改成 0 之后不能被当成 0 个名额直接作废。
+curl -s -X PATCH "$BASE/admin/invites/$GIFT_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"maxUses":0}' >/dev/null
+check "上限可以改成不限次" "$(invite_row "$GIFT_CODE" | jq -r .maxUses)" "0"
+check "不限次的码还能继续用" "$(register_invited invite-unlimited-1 "$GIFT_CODE" | jq -r .code)$(register_invited invite-unlimited-2 "$GIFT_CODE" | jq -r .code)" "00"
+check "不限次的码照常累计已用次数" "$(invite_row "$GIFT_CODE" | jq -r .usedCount)" "3"
+check "没人用过的码可以删除" "$(curl -s -X DELETE "$BASE/admin/invites/$DROP_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .code)" "0"
+check "删除后列表里查不到" "$(invite_row "$DROP_CODE" | jq -r .code)" ""
+# 用过的码不物理删除：删了使用记录就成了孤儿，后台再也查不出这个人是拿哪个码进来的。
+check "用过的码不允许删除" "$(curl -s -X DELETE "$BASE/admin/invites/$GIFT_CODE" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .msg)" "该邀请码已被使用，不能删除，请改为停用"
+check "用过的码删除后仍在" "$(invite_row "$GIFT_CODE" | jq -r .code)" "$GIFT_CODE"
+check "使用记录没有被带走" "$(curl -s "$BASE/admin/invites/$GIFT_CODE/uses" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "3"
+
+# 第三方登录：新用户在开启强制邀请码时只能拿到待注册凭据，绝不能直接换到登录令牌。
+PENDING_CB="$(oauth_callback_code "$(oauth_state)" invite-code-flow)"
+PENDING_TOKEN="$(echo "$PENDING_CB" | sed -n 's/.*[?&]pendingToken=\([^&]*\).*/\1/p')"
+check "第三方新用户拿不到登录令牌" "$(echo "$PENDING_CB" | grep -c '[?&]token=')" "0"
+check "拿到的是待注册凭据而不是登录令牌" "$(echo "$PENDING_CB" | grep -c 'pendingToken=')" "1"
+check "待注册阶段没有凭空建号" "$(curl -s "$BASE/admin/users?keyword=smoke-invited" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "0"
+check "伪造的待注册凭据被拒" "$(complete_linuxdo forged-pending-token "$LINUXDO_CODE" | jq -r .msg)" "注册凭据已过期，请重新发起 Linux.do 登录"
+# 拿 OAuth 的 state 令牌来顶待注册凭据：签名是对的，但用途不同，必须靠 kind 挡住。
+check "拿 state 令牌冒充待注册凭据被拒" "$(complete_linuxdo "$(oauth_state)" "$LINUXDO_CODE" | jq -r .msg)" "注册凭据无效，请重新发起 Linux.do 登录"
+check "凭据有效但邀请码错误被拒" "$(complete_linuxdo "$PENDING_TOKEN" NOTEXISTCODE | jq -r .msg)" "邀请码无效"
+check "邀请码错误时仍然没有建号" "$(curl -s "$BASE/admin/users?keyword=smoke-invited" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "0"
+
+LINUXDO_SESSION=$(complete_linuxdo "$PENDING_TOKEN" "$LINUXDO_CODE")
+LINUXDO_TOKEN=$(echo "$LINUXDO_SESSION" | jq -r .data.token)
+check "补交邀请码后拿到登录会话" "$([ -n "$LINUXDO_TOKEN" ] && [ "$LINUXDO_TOKEN" != "null" ] && echo yes || echo no)" "yes"
+check "补交后账号才被建出来" "$(curl -s "$BASE/admin/users?keyword=smoke-invited" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "1"
+check "新账号确实绑着第三方身份" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $LINUXDO_TOKEN" | jq -r .data.linuxDoBound)" "true"
+check "第三方注册也拿到赠送的算力点" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $LINUXDO_TOKEN" | jq -r .data.credits)" "7"
+check "第三方注册的使用记录能查到人" "$(curl -s "$BASE/admin/invites/$LINUXDO_CODE/uses" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].username')" "smoke-invited"
+check "同一张凭据不会重复建号" "$(complete_linuxdo "$PENDING_TOKEN" "$LINUXDO_CODE" | jq -r .code)$(curl -s "$BASE/admin/users?keyword=smoke-invited" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "01"
+
+# 已经存在的第三方用户不该被要求邀请码，否则老用户全被挡在门外。
+EXISTING_CB="$(oauth_callback_code "$(oauth_state)" smoke-code)"
+check "已存在的第三方用户直接换到登录令牌" "$(echo "$EXISTING_CB" | grep -c '[?&]token=')" "1"
+check "已存在的第三方用户不被要求邀请码" "$(echo "$EXISTING_CB" | grep -c 'pendingToken=')" "0"
+invite_settings false
+check "关掉开关后第三方登录不再签待注册凭据" "$(oauth_callback_code "$(oauth_state)" invite-code-flow | grep -c 'pendingToken=')" "0"
 
 echo "服务重启"
 # 重启会把内存里的推理循环全丢掉。running 会话早就有兜底，awaiting 也必须一起收尾：

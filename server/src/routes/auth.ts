@@ -7,6 +7,7 @@ import {
     adjustUserCredits,
     adjustUserQuota,
     changePassword,
+    completeLinuxDoRegister,
     deleteCreditLog,
     deleteUser,
     guestUser,
@@ -24,7 +25,10 @@ import {
 
 export const authRouter = Router();
 
-authRouter.post("/auth/register", handle(async (req, res) => ok(res, await register(String(req.body?.username || ""), String(req.body?.password || "")))));
+authRouter.post(
+    "/auth/register",
+    handle(async (req, res) => ok(res, await register(String(req.body?.username || ""), String(req.body?.password || ""), String(req.body?.inviteCode || "")))),
+);
 
 authRouter.post("/auth/login", handle(async (req, res) => ok(res, await login(String(req.body?.username || ""), String(req.body?.password || "")))));
 
@@ -75,11 +79,15 @@ authRouter.get("/auth/linux-do/callback", async (req, res) => {
     const params = new URLSearchParams();
     let target = "/login";
     try {
-        const { session, redirect, bound } = await loginWithLinuxDo(req, String(req.query.code || ""), String(req.query.state || ""));
+        const { session, redirect, bound, pendingToken } = await loginWithLinuxDo(req, String(req.query.code || ""), String(req.query.state || ""));
         // 绑定场景用户本来就登录着，直接回原页面提示成功，不换发令牌。
         if (bound) {
             target = redirect || "/";
             params.set("bound", "linux-do");
+        } else if (pendingToken) {
+            // 新用户且要求邀请码：这里只发待注册凭据，绝不发令牌，用户在前端补完邀请码前始终是未登录状态。
+            params.set("pendingToken", pendingToken);
+            if (redirect) params.set("redirect", redirect);
         } else {
             params.set("token", session?.token || "");
             if (redirect) params.set("redirect", redirect);
@@ -91,6 +99,12 @@ authRouter.get("/auth/linux-do/callback", async (req, res) => {
     }
     res.redirect(`${requestOrigin(req)}${target}?${params}`);
 });
+
+/** 补交邀请码完成第三方注册。身份只认 pendingToken 里的签名内容，请求体不接受任何第三方身份字段。 */
+authRouter.post(
+    "/auth/linux-do/complete",
+    handle(async (req, res) => ok(res, await completeLinuxDoRegister(String(req.body?.pendingToken || ""), String(req.body?.inviteCode || "")))),
+);
 
 export const adminUserRouter = Router();
 adminUserRouter.use(adminAuth);
