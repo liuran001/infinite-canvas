@@ -100,6 +100,8 @@ export type AgentChatMessageItem = {
     attachments?: AgentChatAttachment[];
     /** Present while the message is actively streaming; cleared on completion. */
     streamId?: string;
+    /** 用户消息里含画布节点引用时的富文本版本：引用要能悬停高亮、点击定位，纯文本表达不了。 */
+    body?: ReactNode;
 };
 
 export function AgentChatMessage({ item, theme, onRejectTool, onApproveTool }: { item: AgentChatMessageItem; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; onRejectTool?: (id: string) => void; onApproveTool?: (id: string) => void }) {
@@ -127,7 +129,7 @@ export function AgentChatMessage({ item, theme, onRejectTool, onApproveTool }: {
                 style={{ color }}
             >
                 {isUser ? (
-                    <div className="whitespace-pre-wrap break-words">{item.text}</div>
+                    <div className="whitespace-pre-wrap break-words">{item.body || item.text}</div>
                 ) : (
                     <Streamdown {...streamdownProps} animated={streamdownAnimation} isAnimating={!!item.streamId}>{item.text}</Streamdown>
                 )}

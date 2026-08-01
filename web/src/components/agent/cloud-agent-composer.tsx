@@ -4,6 +4,7 @@ import { ArrowUp, ImagePlus, LoaderCircle, Square, X } from "lucide-react";
 
 import { CanvasResourceMentionTextarea } from "@/components/canvas/canvas-resource-mention-textarea";
 import type { canvasThemes } from "@/lib/canvas-theme";
+import { useMissingCanvasNodeIds } from "@/stores/canvas/use-canvas-store";
 import { useCloudAgentStore, type CloudAgentAttachment } from "@/stores/use-cloud-agent-store";
 import { CLOUD_AGENT_IMAGE_MIME } from "./cloud-agent-references";
 
@@ -21,10 +22,19 @@ export function CloudAgentComposer({ theme, disabled, sending, placeholder, visi
     const pendingInsert = useCloudAgentStore((state) => state.pendingInsert);
     const referenceDropActive = useCloudAgentStore((state) => state.referenceDropActive);
     const uploading = useCloudAgentStore((state) => state.uploading);
+    const projectId = useCloudAgentStore((state) => state.projectId);
     const setPrompt = useCloudAgentStore((state) => state.setPrompt);
     const addAttachments = useCloudAgentStore((state) => state.addAttachments);
     const removeAttachment = useCloudAgentStore((state) => state.removeAttachment);
     const consumePendingInsert = useCloudAgentStore((state) => state.consumePendingInsert);
+    const highlightReference = useCloudAgentStore((state) => state.highlightReference);
+    const revealReference = useCloudAgentStore((state) => state.revealReference);
+    // 引用的节点可能在插入之后又被删掉了，标签要能自己变灰，不能等用户点了才发现指不到东西。
+    const missingNodeIds = useMissingCanvasNodeIds(
+        projectId,
+        draftReferences.map((item) => item.nodeId),
+    );
+    const nodeIdOfLabel = (label: string) => draftReferences.find((item) => item.label === label)?.nodeId || "";
 
     const fileInputRef = useRef<HTMLInputElement>(null);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -55,8 +65,8 @@ export function CloudAgentComposer({ theme, disabled, sending, placeholder, visi
 
     // mention 输入框只认 CanvasResourceReference：草稿引用照它的形状转一层，就能直接复用高亮与整块删除。
     const mentionReferences = useMemo(
-        () => draftReferences.map((item) => ({ id: item.nodeId, nodeId: item.nodeId, kind: item.kind, label: item.label, title: item.title || item.label, previewUrl: item.previewUrl, active: true })),
-        [draftReferences],
+        () => draftReferences.map((item) => ({ id: item.nodeId, nodeId: item.nodeId, kind: item.kind, label: item.label, title: item.title || item.label, previewUrl: item.previewUrl, active: true, missing: missingNodeIds.has(item.nodeId) })),
+        [draftReferences, missingNodeIds],
     );
     const canSubmit = !disabled && !sending && !visionWarning && Boolean(prompt.trim() || attachments.length);
 
@@ -99,6 +109,12 @@ export function CloudAgentComposer({ theme, disabled, sending, placeholder, visi
                     onKeyUp={rememberCaret}
                     onPointerUp={rememberCaret}
                     onBlur={rememberCaret}
+                    // 悬停引用即在画布上高亮对应节点，移开（label 为空）就撤掉；点击再把节点带进视口。
+                    onLabelHover={(label) => highlightReference(nodeIdOfLabel(label))}
+                    onLabelClick={(label) => {
+                        const nodeId = nodeIdOfLabel(label);
+                        if (nodeId && !missingNodeIds.has(nodeId)) revealReference(nodeId);
+                    }}
                     onPaste={(event) => {
                         const images = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith("image/"));
                         if (!images.length) return;

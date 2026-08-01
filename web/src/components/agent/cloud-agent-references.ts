@@ -74,3 +74,21 @@ export function expandDraftReferences(prompt: string, draft: CloudAgentDraftRefe
 export function stripReferenceMarkers(content: string) {
     return content.replace(REFERENCE_MARKER, (_match, label: string) => `@${label}`);
 }
+
+/**
+ * 把用户消息拆成「普通文字」和「节点引用」两种片段。
+ * 已发送消息里的引用同样要能悬停高亮、点击定位，所以不能像 stripReferenceMarkers 那样压成一整段纯文本。
+ */
+export function splitReferenceContent(content: string) {
+    const parts: Array<{ text: string; nodeId?: string }> = [];
+    let cursor = 0;
+    for (const match of content.matchAll(REFERENCE_MARKER)) {
+        const at = match.index ?? 0;
+        if (at > cursor) parts.push({ text: content.slice(cursor, at) });
+        // 标记里的目标写成「节点ID#类型」，类型只是给模型看的，定位只需要 ID。
+        parts.push({ text: `@${match[1]}`, nodeId: match[2].split("#")[0] });
+        cursor = at + match[0].length;
+    }
+    if (cursor < content.length) parts.push({ text: content.slice(cursor) });
+    return parts;
+}

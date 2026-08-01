@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 
+import { useMemo } from "react";
 import { nanoid } from "nanoid";
 import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
@@ -154,3 +155,18 @@ export const useCanvasStore = create<CanvasStore>()(
         },
     ),
 );
+
+/**
+ * 挑出这些节点里已经不在画布上的（用户引用了某个节点之后又把它删了）。
+ * 画布页会把节点实时写回本 store，所以这里查到的就是当前画布。
+ * 选择器只返回字符串：拖动节点时 store 每帧都在变，返回数组/Set 会让调用方跟着白白重渲染。
+ */
+export function useMissingCanvasNodeIds(projectId: string, nodeIds: string[]) {
+    const missing = useCanvasStore((state) => {
+        const project = state.projects.find((item) => item.id === projectId);
+        // 画布还没加载出来时一律当成「还在」，别在数据没到位时就把引用标成已删除。
+        if (!project) return "";
+        return nodeIds.filter((id) => !project.nodes.some((node) => node.id === id)).join(",");
+    });
+    return useMemo(() => new Set(missing ? missing.split(",") : []), [missing]);
+}

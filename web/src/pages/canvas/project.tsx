@@ -202,6 +202,10 @@ function InfiniteCanvasPage() {
     const currentProject = useCanvasStore((state) => state.projects.find((project) => project.id === projectId));
     const bindCloudAgentProject = useCloudAgentStore((state) => state.bindProject);
     const cloudAgentCanvasReload = useCloudAgentStore((state) => state.canvasReload);
+    /** Agent 面板里悬停/点击的那个引用，画布把它高亮出来，好让用户确认自己引的到底是哪个节点。 */
+    const cloudReferenceNodeId = useCloudAgentStore((state) => state.referenceNodeId);
+    const cloudReferenceReveal = useCloudAgentStore((state) => state.referenceReveal);
+    const consumeCloudReferenceReveal = useCloudAgentStore((state) => state.consumeReferenceReveal);
     const isServerModeReady = useIsServerMode();
     const serverToken = useServerStore((state) => state.token);
     const cloudAgentEnabled = useServerStore((state) => Boolean(state.settings?.agent.enabled));
@@ -989,6 +993,23 @@ function InfiniteCanvasPage() {
         setContextMenu(null);
     }, [size.height, size.width]);
 
+    /** 平滑滑到目标视口。侧栏定位与面板引用定位共用一份缓动，别各写各的。 */
+    const animateViewport = useCallback((target: ViewportTransform) => {
+        if (focusAnimRef.current) cancelAnimationFrame(focusAnimRef.current);
+        const start = { ...viewportRef.current };
+        const duration = 450;
+        const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+        let startTime: number | null = null;
+        const step = (now: number) => {
+            if (startTime === null) startTime = now;
+            const progress = Math.min((now - startTime) / duration, 1);
+            const t = easeOutCubic(progress);
+            setViewport({ x: start.x + (target.x - start.x) * t, y: start.y + (target.y - start.y) * t, k: start.k + (target.k - start.k) * t });
+            focusAnimRef.current = progress < 1 ? requestAnimationFrame(step) : null;
+        };
+        focusAnimRef.current = requestAnimationFrame(step);
+    }, []);
+
     const focusNode = useCallback(
         (nodeId: string) => {
             const node = nodesRef.current.find((item) => item.id === nodeId);
@@ -996,29 +1017,36 @@ function InfiniteCanvasPage() {
             const worldX = node.position.x + node.width / 2;
             const worldY = node.position.y + node.height / 2;
             const k = Math.min(Math.max(Math.min((size.width * 0.6) / node.width, (size.height * 0.6) / node.height), 0.05), 1.5);
-            const target = { x: size.width / 2 - worldX * k, y: size.height / 2 - worldY * k, k };
             setSelectedNodeIds(new Set([nodeId]));
             setSelectedConnectionId(null);
             setContextMenu(null);
-
-            if (focusAnimRef.current) cancelAnimationFrame(focusAnimRef.current);
-            const start = { ...viewportRef.current };
-            const duration = 450;
-            const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
-            let startTime: number | null = null;
-            const step = (now: number) => {
-                if (startTime === null) startTime = now;
-                const progress = Math.min((now - startTime) / duration, 1);
-                const t = easeOutCubic(progress);
-                setViewport({ x: start.x + (target.x - start.x) * t, y: start.y + (target.y - start.y) * t, k: start.k + (target.k - start.k) * t });
-                focusAnimRef.current = progress < 1 ? requestAnimationFrame(step) : null;
-            };
-            focusAnimRef.current = requestAnimationFrame(step);
+            animateViewport({ x: size.width / 2 - worldX * k, y: size.height / 2 - worldY * k, k });
         },
-        [size.height, size.width],
+        [animateViewport, size.height, size.width],
     );
 
     useEffect(() => () => void (focusAnimRef.current && cancelAnimationFrame(focusAnimRef.current)), []);
+
+    /**
+     * 面板里点了某个节点引用：节点已经看得见就别动画面，看不见才平移过去。
+     * 只改 x/y 不改 k——缩放是用户自己调的，替他改掉等于把他的视角搞乱；也不碰 selectedNodeIds。
+     */
+    useEffect(() => {
+        if (!cloudReferenceReveal) return;
+        consumeCloudReferenceReveal();
+        const node = nodesRef.current.find((item) => item.id === cloudReferenceReveal.nodeId);
+        if (!node) return;
+        const rect = containerRef.current?.getBoundingClientRect();
+        const width = rect?.width || size.width;
+        const height = rect?.height || size.height;
+        // 视口边缘留一圈余量，节点刚好卡在边上也算「看不见」，照样移过去。
+        const margin = 60;
+        const topLeft = screenToCanvas((rect?.left || 0) + margin, (rect?.top || 0) + margin);
+        const bottomRight = screenToCanvas((rect?.left || 0) + width - margin, (rect?.top || 0) + height - margin);
+        if (node.position.x >= topLeft.x && node.position.y >= topLeft.y && node.position.x + node.width <= bottomRight.x && node.position.y + node.height <= bottomRight.y) return;
+        const k = viewportRef.current.k;
+        animateViewport({ x: width / 2 - (node.position.x + node.width / 2) * k, y: height / 2 - (node.position.y + node.height / 2) * k, k });
+    }, [animateViewport, cloudReferenceReveal, consumeCloudReferenceReveal, screenToCanvas, size.height, size.width]);
 
     const setZoomScale = useCallback(
         (scale: number) => {
@@ -2985,7 +3013,7 @@ function InfiniteCanvasPage() {
                             scale={viewport.k}
                             isSelected={selectedNodeIds.has(node.id)}
                             isRelated={relatedHighlight.nodeIds.has(node.id)}
-                            isFocusRelated={activeNodeId === node.id}
+                            isFocusRelated={activeNodeId === node.id || cloudReferenceNodeId === node.id}
                             isConnectionTarget={connectionTargetNodeId === node.id}
                             isConnecting={Boolean(connectingParams)}
                             editRequestNonce={editingNodeId === node.id ? editRequestNonce : 0}

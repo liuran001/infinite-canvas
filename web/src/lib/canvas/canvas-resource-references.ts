@@ -14,6 +14,8 @@ export type CanvasResourceReference = {
     previewUrl?: string;
     text?: string;
     active: boolean;
+    /** 引用的节点已经不在画布上了（先引用、后删节点）。标签据此置灰划掉，别让用户以为还引用得到。 */
+    missing?: boolean;
 };
 
 export function buildNodeMentionReferences(node: CanvasNodeData, nodes: CanvasNodeData[], connections: CanvasConnection[]) {

@@ -26,9 +26,14 @@ let loadedProjectId = "";
 let pendingSend: { clientMessageId: string; key: string } | null = null;
 /** 每次拖入都要触发一次插入，即使拖的是同一个节点；用自增序号让输入框认得出「这是新的一次」。 */
 let insertToken = 0;
+/** 同上：重复点同一个引用也该再定位一次，靠自增序号区分「又点了一下」。 */
+let revealToken = 0;
 
 /** 用户在面板里上传的图片。走的是和素材同一套服务端文件，storageKey 形如 server:<fileId>。 */
 export type CloudAgentAttachment = { id: string; name: string; url: string; storageKey: string; width: number; height: number };
+
+/** 换画布、换会话时必须收回引用高亮，否则画布上会留下一个永远亮着、也没人再取消得掉的节点。 */
+const clearedHighlight = { referenceNodeId: "", referenceReveal: null };
 
 
 function errorText(error: unknown) {
@@ -74,6 +79,10 @@ type CloudAgentStore = {
     pendingInsert: { label: string; token: number } | null;
     /** 画布节点正被拖到面板上方，输入框据此给出可以松手的提示。 */
     referenceDropActive: boolean;
+    /** 鼠标停在（或点了）哪个引用标签上，画布据此把对应节点高亮出来；面板和画布是两棵组件树，只能靠 store 递这个信号。 */
+    referenceNodeId: string;
+    /** 点击引用时请画布把节点移进视口；token 自增，重复点同一个引用也能再定位一次。 */
+    referenceReveal: { nodeId: string; token: number } | null;
     attachments: CloudAgentAttachment[];
     uploading: boolean;
     /** 服务端改过画布的次数，画布页据此重新拉一次远程画布并刷新到界面上。 */
@@ -86,6 +95,9 @@ type CloudAgentStore = {
     dropReference: (node: CanvasNodeData) => void;
     consumePendingInsert: () => void;
     setReferenceDropActive: (active: boolean) => void;
+    highlightReference: (nodeId: string) => void;
+    revealReference: (nodeId: string) => void;
+    consumeReferenceReveal: () => void;
     bindProject: (projectId: string) => void;
     refreshSessions: () => Promise<void>;
     openSession: (sessionId: string) => Promise<void>;
@@ -168,6 +180,8 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         draftReferences: [],
         pendingInsert: null,
         referenceDropActive: false,
+        referenceNodeId: "",
+        referenceReveal: null,
         attachments: [],
         uploading: false,
         canvasReload: 0,
@@ -213,6 +227,20 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         setReferenceDropActive: (referenceDropActive) => set({ referenceDropActive }),
 
         /**
+         * 悬停引用标签只高亮，绝不动 selectedNodeIds：用户可能正框着一堆节点，
+         * 顺手替他改选中集合会直接毁掉他手上的多选。传空串表示鼠标移开、取消高亮。
+         */
+        highlightReference: (referenceNodeId) => set({ referenceNodeId }),
+
+        /** 点击引用：高亮之外再请画布把节点移进视口，具体移不移由画布判断（已经看得见就别乱动画面）。 */
+        revealReference: (nodeId) => {
+            revealToken += 1;
+            set({ referenceNodeId: nodeId, referenceReveal: { nodeId, token: revealToken } });
+        },
+
+        consumeReferenceReveal: () => set({ referenceReveal: null }),
+
+        /**
          * 面板上换模型：既改当前会话下一轮要用的模型，也写进用户偏好当作以后新会话的默认。
          * 偏好走 updateConfig，跟着账号云端同步，换设备、换会话回来还是这个选择。
          */
@@ -230,7 +258,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (get().projectId !== projectId) {
                 detach();
                 loadedProjectId = "";
-                set({ projectId, sessions: [], sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", draftReferences: [], attachments: [], sending: false });
+                set({ projectId, sessions: [], sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", draftReferences: [], attachments: [], sending: false, ...clearedHighlight });
             }
             if (!projectId || loadedProjectId === projectId || !isServerMode() || !useServerStore.getState().settings?.agent.enabled) return;
             loadedProjectId = projectId;
@@ -243,7 +271,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (!sessionId) return;
             detach();
             localStorage.setItem(SESSION_KEY, sessionId);
-            set({ sessionId, model: "", messages: [], status: "idle", error: "", loading: true });
+            set({ sessionId, model: "", messages: [], status: "idle", error: "", loading: true, ...clearedHighlight });
             try {
                 // 先补齐历史再挂流：服务端循环不依赖前端连接，断线期间跑完的结果都已经落库。
                 const [session, { items }] = await Promise.all([serverApi.agentSession(sessionId), serverApi.agentMessages(sessionId, 0)]);
@@ -262,7 +290,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             detach();
             localStorage.removeItem(SESSION_KEY);
             // 模型清空，新会话按用户偏好（没设过就按管理员默认）起头。
-            set({ sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", draftReferences: [], attachments: [] });
+            set({ sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", draftReferences: [], attachments: [], ...clearedHighlight });
         },
 
         deleteSession: async (sessionId) => {
@@ -274,7 +302,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (get().sessionId === sessionId) {
                 detach();
                 localStorage.removeItem(SESSION_KEY);
-                set({ sessionId: "", model: "", messages: [], status: "idle", error: "" });
+                set({ sessionId: "", model: "", messages: [], status: "idle", error: "", ...clearedHighlight });
             }
             set((state) => ({ sessions: state.sessions.filter((item) => item.id !== sessionId) }));
         },

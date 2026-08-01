@@ -5,10 +5,12 @@ import { useShallow } from "zustand/react/shallow";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { ModelPicker } from "@/components/model-picker";
+import { MENTION_LABEL_CLASS, MENTION_LABEL_MISSING_CLASS } from "@/components/canvas/canvas-resource-mention-textarea";
 import { serverFileUrl } from "@/services/api/server";
 import { serverStorageKey } from "@/services/image-storage";
 import { modelCreditCost, modelOptionLabel, resolveAgentModel, useEffectiveConfig } from "@/stores/use-config-store";
 import { useAgentStore } from "@/stores/use-agent-store";
+import { useMissingCanvasNodeIds } from "@/stores/canvas/use-canvas-store";
 import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
 import { useIsServerMode, useServerStore } from "@/stores/use-server-store";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -18,7 +20,7 @@ import { AgentPanelTabs } from "./agent-panel-tabs";
 import { AgentScrollToBottom } from "./agent-scroll-to-bottom";
 import { CloudAgentComposer, CloudAgentImageStrip } from "./cloud-agent-composer";
 import { cloudAgentActivity, toCloudChatItem } from "./cloud-agent-format";
-import { stripReferenceMarkers } from "./cloud-agent-references";
+import { splitReferenceContent, stripReferenceMarkers } from "./cloud-agent-references";
 
 const SCROLL_BOTTOM_THRESHOLD = 48;
 type CloudAgentTab = "chat" | "sessions";
@@ -66,13 +68,19 @@ export function CloudAgentPanel() {
     const maxRounds = settings?.agent.maxRounds || 0;
     // 附件要进上下文，模型不支持视觉时上游会直接报一串看不懂的错；这里先明确挡住，服务端仍然会再校验一次。
     const visionWarning = attachments.length && !settings?.modelChannel.models.some((item) => item.name === model && item.vision) ? "当前模型不支持识别图片，请换一个标注了「支持视觉」的模型，或先移除图片" : "";
-    // 用户消息里的引用标记是给模型看的，展示时还原成「@标题」；附件按文件 ID 直接取直链画缩略图。
+    // 用户消息里的引用标记是给模型看的，展示时还原成可交互的标签；附件按文件 ID 直接取直链画缩略图。
     const items = useMemo(
         () =>
-            messages.map((message) => ({
-                view: message.role === "user" ? { ...toCloudChatItem(message), text: stripReferenceMarkers(message.content) } : toCloudChatItem(message),
-                images: (message.attachments || []).map((id) => ({ id, name: "图片", url: serverFileUrl(id), storageKey: serverStorageKey(id), width: 0, height: 0 })),
-            })),
+            messages.map((message) => {
+                const parts = message.role === "user" ? splitReferenceContent(message.content) : [];
+                return {
+                    view:
+                        message.role === "user"
+                            ? { ...toCloudChatItem(message), text: stripReferenceMarkers(message.content), body: parts.some((part) => part.nodeId) ? <CloudAgentMessageText parts={parts} /> : undefined }
+                            : toCloudChatItem(message),
+                    images: (message.attachments || []).map((id) => ({ id, name: "图片", url: serverFileUrl(id), storageKey: serverStorageKey(id), width: 0, height: 0 })),
+                };
+            }),
         [messages],
     );
     // 等待提示按实际进度说话：在跑工具就报工具名，其余情况说「正在思考」。
@@ -101,6 +109,9 @@ export function CloudAgentPanel() {
         const frame = requestAnimationFrame(() => (followRef.current ? scrollToBottom("auto") : updateScrollState()));
         return () => cancelAnimationFrame(frame);
     }, [items, running, scrollToBottom, updateScrollState]);
+
+    // 面板关掉时组件被卸载，这时候必须收回引用高亮，否则画布上会留下一个再也取消不掉的亮节点。
+    useEffect(() => () => useCloudAgentStore.getState().highlightReference(""), []);
 
     const confirmDelete = (id: string, title: string) => {
         modal.confirm({
@@ -248,6 +259,44 @@ export function CloudAgentPanel() {
                     />
                 </>
             )}
+        </>
+    );
+}
+
+/**
+ * 已发送消息里的节点引用。和输入框里的标签一样：悬停在画布上高亮，点击把节点带进视口。
+ * 引用的节点可能早就被删了，这种就置灰划掉，别让用户对着一个指不到东西的标签乱点。
+ */
+function CloudAgentMessageText({ parts }: { parts: ReturnType<typeof splitReferenceContent> }) {
+    const projectId = useCloudAgentStore((state) => state.projectId);
+    const highlightReference = useCloudAgentStore((state) => state.highlightReference);
+    const revealReference = useCloudAgentStore((state) => state.revealReference);
+    const missingNodeIds = useMissingCanvasNodeIds(
+        projectId,
+        parts.flatMap((part) => (part.nodeId ? [part.nodeId] : [])),
+    );
+    return (
+        <>
+            {parts.map((part, index) => {
+                const nodeId = part.nodeId;
+                if (!nodeId) return <span key={index}>{part.text}</span>;
+                const missing = missingNodeIds.has(nodeId);
+                return (
+                    <span
+                        key={index}
+                        data-canvas-node-reference={nodeId}
+                        className={missing ? MENTION_LABEL_MISSING_CLASS : `${MENTION_LABEL_CLASS} cursor-pointer`}
+                        title={missing ? "引用的节点已从画布中删除" : "点击在画布上定位这个节点"}
+                        onMouseEnter={() => highlightReference(nodeId)}
+                        onMouseLeave={() => highlightReference("")}
+                        onClick={() => {
+                            if (!missing) revealReference(nodeId);
+                        }}
+                    >
+                        {part.text}
+                    </span>
+                );
+            })}
         </>
     );
 }

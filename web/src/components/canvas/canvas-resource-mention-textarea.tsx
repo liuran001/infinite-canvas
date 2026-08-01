@@ -13,6 +13,11 @@ type MentionState = {
     query: string;
 };
 
+/** 引用标签的样式：面板里已发送消息的引用也用同一套，别在两个地方各造一套配色。 */
+export const MENTION_LABEL_CLASS = "rounded-md bg-[#2f80ff]/16 px-1 py-0.5 font-medium text-[#2f80ff] ring-1 ring-[#2f80ff]/24";
+/** 节点已被删掉的引用：去掉高亮蓝、划掉并压暗，一眼能看出这个引用已经指不到东西了。 */
+export const MENTION_LABEL_MISSING_CLASS = "rounded-md bg-black/[.06] px-1 py-0.5 font-medium line-through opacity-55 ring-1 ring-black/10 dark:bg-white/10 dark:ring-white/15";
+
 type Props = Omit<TextareaHTMLAttributes<HTMLTextAreaElement>, "onChange" | "value"> & {
     value: string;
     references: CanvasResourceReference[];
@@ -20,15 +25,20 @@ type Props = Omit<TextareaHTMLAttributes<HTMLTextAreaElement>, "onChange" | "val
     onSubmit?: () => void;
     containerClassName?: string;
     highlightLabels?: boolean;
+    /** 鼠标移到某个引用标签上（移开时给空串）。textarea 里没有真正的元素可挂事件，只能靠高亮层做命中测试。 */
+    onLabelHover?: (label: string) => void;
+    /** 点中某个引用标签。点击照常落到 textarea 上，光标定位不受影响。 */
+    onLabelClick?: (label: string) => void;
 };
 
-export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Props>(function CanvasResourceMentionTextarea({ value, references, onChange, onSubmit, onKeyDown, className, containerClassName, style, highlightLabels = true, ...props }, forwardedRef) {
+export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Props>(function CanvasResourceMentionTextarea({ value, references, onChange, onSubmit, onKeyDown, className, containerClassName, style, highlightLabels = true, onLabelHover, onLabelClick, ...props }, forwardedRef) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const overlayRef = useRef<HTMLDivElement | null>(null);
     const [mention, setMention] = useState<MentionState | null>(null);
     const [activeIndex, setActiveIndex] = useState(0);
     const [hasSelection, setHasSelection] = useState(false);
+    const [hoveredLabel, setHoveredLabel] = useState("");
     const candidates = useMemo(() => {
         if (!mention) return [];
         const query = mention.query.trim().toLowerCase();
@@ -37,6 +47,8 @@ export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Pro
         return activeReferences.filter((item) => `${item.label} ${item.title} ${item.kind} ${item.text || ""}`.toLowerCase().includes(query));
     }, [mention, references]);
     const activeLabels = useMemo(() => (highlightLabels ? Array.from(new Set(references.filter((item) => item.active).map((item) => item.label))).sort((a, b) => b.length - a.length) : []), [highlightLabels, references]);
+    // 节点已被删掉的引用单独标出来：标签置灰划掉，也不再当成可点的目标。
+    const missingLabels = useMemo(() => new Set(references.filter((item) => item.active && item.missing).map((item) => item.label)), [references]);
 
     const updateValue = (next: string, selectionStart?: number) => {
         onChange(next);
@@ -85,11 +97,23 @@ export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Pro
     };
 
     const showOverlay = Boolean(activeLabels.length && !hasSelection);
+    // 标签画在高亮层里，而高亮层被 textarea 盖在下面，拿不到真正的鼠标事件；只能按指针坐标反查压在下面的标签。
+    // 标签自己开了 pointer-events（父层是 pointer-events-none），elementsFromPoint 才会把它列进结果里。
+    const labelAtPoint = (clientX: number, clientY: number) => {
+        if (!onLabelHover && !onLabelClick) return "";
+        const hit = document.elementsFromPoint(clientX, clientY).find((element) => element instanceof HTMLElement && element.dataset.mentionLabel);
+        return hit instanceof HTMLElement ? hit.dataset.mentionLabel || "" : "";
+    };
+    const syncHoveredLabel = (label: string) => {
+        if (label === hoveredLabel) return;
+        setHoveredLabel(label);
+        onLabelHover?.(label);
+    };
     const mergedStyle = {
         ...(style || {}),
         color: showOverlay ? "transparent" : style?.color,
         caretColor: style?.color || theme.node.text,
-        cursor: "text",
+        cursor: hoveredLabel && !missingLabels.has(hoveredLabel) ? "pointer" : "text",
         // showOverlay 时高亮 div 覆盖在 textarea 上,若不把 textarea 提到上层,原生插入光标(caret)会被盖住看不见
         ...(showOverlay ? { position: "relative", zIndex: 1, background: "transparent", backgroundColor: "transparent" } : {}),
     } as CSSProperties;
@@ -99,7 +123,7 @@ export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Pro
         <div className={`relative h-full w-full ${containerClassName || ""}`}>
             {showOverlay ? (
                 <div ref={overlayRef} className={`${className || ""} pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words`} style={{ ...style, color: theme.node.text }}>
-                    <MentionHighlightText value={value || props.placeholder?.toString() || ""} labels={activeLabels} placeholder={!value} />
+                    <MentionHighlightText value={value || props.placeholder?.toString() || ""} labels={activeLabels} missingLabels={missingLabels} placeholder={!value} />
                 </div>
             ) : null}
             <textarea
@@ -112,6 +136,8 @@ export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Pro
                 value={value}
                 className={className}
                 style={mergedStyle}
+                // 标签压在 textarea 底下，自己的 title 弹不出来；停在已删除的引用上时借 textarea 说清楚原因。
+                title={hoveredLabel && missingLabels.has(hoveredLabel) ? "引用的节点已从画布中删除" : props.title}
                 onChange={(event) => {
                     const next = event.target.value;
                     onChange(next);
@@ -132,6 +158,19 @@ export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Pro
                 onPointerUp={(event) => {
                     updateSelectionState();
                     props.onPointerUp?.(event);
+                }}
+                onMouseMove={(event) => {
+                    syncHoveredLabel(labelAtPoint(event.clientX, event.clientY));
+                    props.onMouseMove?.(event);
+                }}
+                onMouseLeave={(event) => {
+                    syncHoveredLabel("");
+                    props.onMouseLeave?.(event);
+                }}
+                onClick={(event) => {
+                    const label = labelAtPoint(event.clientX, event.clientY);
+                    if (label) onLabelClick?.(label);
+                    props.onClick?.(event);
                 }}
                 onKeyDown={(event) => {
                     if (isImeComposing(event)) {
@@ -194,7 +233,7 @@ export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Pro
     );
 });
 
-function MentionHighlightText({ value, labels, placeholder }: { value: string; labels: string[]; placeholder: boolean }) {
+function MentionHighlightText({ value, labels, missingLabels, placeholder }: { value: string; labels: string[]; missingLabels: Set<string>; placeholder: boolean }) {
     if (placeholder) return <span className="opacity-45">{value}</span>;
     if (!labels.length) return <>{value}</>;
     const pattern = new RegExp(`(${labels.map(escapeRegExp).join("|")})`, "g");
@@ -202,7 +241,8 @@ function MentionHighlightText({ value, labels, placeholder }: { value: string; l
         <>
             {value.split(pattern).map((part, index) =>
                 labels.includes(part) ? (
-                    <span key={`${part}-${index}`} className="rounded-md bg-[#2f80ff]/16 px-1 py-0.5 font-medium text-[#2f80ff] ring-1 ring-[#2f80ff]/24">
+                    // pointer-events 必须打开：父层不吃鼠标事件，textarea 靠 elementsFromPoint 才认得出指针压在哪个标签上。
+                    <span key={`${part}-${index}`} data-mention-label={part} className={`pointer-events-auto ${missingLabels.has(part) ? MENTION_LABEL_MISSING_CLASS : MENTION_LABEL_CLASS}`}>
                         {part}
                     </span>
                 ) : (
