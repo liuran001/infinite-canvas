@@ -22,6 +22,8 @@ export type AgentCanvasContext = { snapshot: CanvasAgentSnapshot; applyOps: (ops
 export type AgentThreadSummary = { id: string; preview: string; name?: string | null; cwd?: string; status?: string; source?: unknown; createdAt?: number; updatedAt?: number };
 export type AgentTokenUsage = { input: number; cached: number; output: number };
 export type AgentPanelTab = "chat" | "setup" | "history" | "log";
+/** cloud 走服务端系统模型，local 连本机 codex；两种模式各自独立，互不影响。 */
+export type AgentPanelMode = "cloud" | "local";
 
 const CONNECT_TIMEOUT_MS = 6000;
 let agentSource: EventSource | null = null;
@@ -59,13 +61,15 @@ type AgentStore = {
     connectError: string;
     pendingTool: AgentPendingToolCall | null;
     pendingApprovals: AgentPendingApproval[];
-    setAgentState: (patch: Partial<Omit<AgentStore, "setAgentState" | "connectAgent" | "disconnectAgent" | "addMessage" | "addEventLog" | "clearEventLogs" | "openPanel" | "closePanel" | "togglePanel" | "setCanvasContext">>) => void;
+    panelMode: AgentPanelMode;
+    setPanelMode: (panelMode: AgentPanelMode) => void;
+    setAgentState: (patch: Partial<Omit<AgentStore, "setAgentState" | "setPanelMode" | "connectAgent" | "disconnectAgent" | "addMessage" | "addEventLog" | "clearEventLogs" | "openPanel" | "closePanel" | "togglePanel" | "setCanvasContext">>) => void;
     openPanel: () => void;
     closePanel: () => void;
     togglePanel: () => void;
     setCanvasContext: (context: AgentCanvasContext | null) => void;
     connectAgent: (options?: { silent?: boolean }) => void;
-    disconnectAgent: (patch?: Partial<Omit<AgentStore, "setAgentState" | "connectAgent" | "disconnectAgent" | "addMessage" | "addEventLog" | "clearEventLogs" | "openPanel" | "closePanel" | "togglePanel" | "setCanvasContext">>) => void;
+    disconnectAgent: (patch?: Partial<Omit<AgentStore, "setAgentState" | "setPanelMode" | "connectAgent" | "disconnectAgent" | "addMessage" | "addEventLog" | "clearEventLogs" | "openPanel" | "closePanel" | "togglePanel" | "setCanvasContext">>) => void;
     addMessage: (item: AgentChatItem) => void;
     addEventLog: (item: AgentEventLog) => void;
     clearEventLogs: () => void;
@@ -105,6 +109,12 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
     connectError: "",
     pendingTool: null,
     pendingApprovals: [],
+    // 面板模式记住用户选择，跟本地 agent 的其余偏好一样放 localStorage。
+    panelMode: typeof window === "undefined" ? "cloud" : (localStorage.getItem("canvas-agent-panel-mode") as AgentPanelMode) || "cloud",
+    setPanelMode: (panelMode) => {
+        localStorage.setItem("canvas-agent-panel-mode", panelMode);
+        set({ panelMode });
+    },
     setAgentState: (patch) => set(patch),
     openPanel: () => set({ panelOpen: true, panelMounted: true, panelClosing: false }),
     closePanel: () => {

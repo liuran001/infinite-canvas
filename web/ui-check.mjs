@@ -30,8 +30,11 @@ async function main() {
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 
     // 前端默认连同源 /api，dev server 没有代理，这里把服务端地址注入本地存储。
+    // 只在首次写入：addInitScript 每次导航都会重跑，无条件覆盖会把登录拿到的令牌清掉，
+    // 后续访问二级页面就会被登录守卫踢回首页。
     await context.addInitScript((api) => {
-        localStorage.setItem("infinite-canvas:server_store", JSON.stringify({ state: { mode: "on", baseUrl: api, token: "", syncedAt: "" }, version: 0 }));
+        const key = "infinite-canvas:server_store";
+        if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({ state: { mode: "on", baseUrl: api, token: "", syncedAt: "" }, version: 0 }));
     }, API);
 
     let page = await context.newPage();
@@ -55,17 +58,15 @@ async function main() {
     check("首页可渲染", await page.locator("h1").first().isVisible());
     check("首页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
 
-    await visit("/login");
-    check("登录页可渲染", (await page.getByRole("button", { name: /登录|注册并登录/ }).count()) > 0);
-    check("登录页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+    // 未登录访问二级页面应当被守卫挡回首页并弹出登录框，顺带验证守卫本身。
+    await visit("/canvas");
+    await page.waitForTimeout(800);
+    check("未登录访问画布被挡回首页", new URL(page.url()).pathname === "/", `当前地址 ${page.url()}`);
+    check("被挡回后弹出登录框", (await page.getByRole("button", { name: /^登录$/ }).count()) > 0);
+    check("登录守卫无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
 
     console.log("注册与登录");
-    await page
-        .getByRole("tab", { name: "注册" })
-        .click()
-        .catch(async () => {
-            await page.getByText("注册", { exact: true }).first().click();
-        });
+    await page.getByText("还没有账号？立即注册").first().click();
     await page.waitForTimeout(400);
     // 随机用户名，脚本可以重复跑而不撞上「用户名已存在」。
     const username = `uitester-${Date.now().toString(36)}`;
@@ -106,15 +107,48 @@ async function main() {
     check("画布页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
     await page.screenshot({ path: "ui-check-canvas.png" }).catch(() => {});
 
-    console.log("管理后台");
-    const adminToken = await page.evaluate(async (api) => {
-        const response = await fetch(`${api}/api/admin/login`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username: process.env.UI_ADMIN || "admin", password: process.env.UI_ADMIN_PASSWORD || "infinite-canvas" }),
-        });
-        return (await response.json()).data?.token || "";
+    console.log("画布 Agent 面板");
+    // 系统模型模式由后台开关控制，关掉时面板只剩本地 Agent，断言要跟着实际配置走。
+    const cloudAgentEnabled = await page.evaluate(async (api) => {
+        const response = await fetch(`${api}/api/settings`);
+        return Boolean((await response.json()).data?.agent?.enabled);
     }, API);
+    await page.getByRole("button", { name: "Agent", exact: true }).last().click();
+    await page.waitForTimeout(1200);
+    const panelOpened = (await page.getByRole("tablist", { name: "Agent 面板" }).count()) > 0;
+    check("Agent 面板可打开", panelOpened);
+    const modeSwitch = page.getByRole("button", { name: "切换 Agent 模式" });
+    if (cloudAgentEnabled) {
+        check("默认进入系统模型模式", (await modeSwitch.count()) > 0 && (await modeSwitch.first().innerText()).includes("系统模型"));
+        check("系统模型面板说明按轮计费", (await page.getByText(/按轮计费/).count()) > 0);
+        // 切到本地再切回来，确认两种模式都能挂载，本地 Agent 没有被云端模式挤坏。
+        await modeSwitch.first().click();
+        await page.getByRole("menuitem", { name: /本地 Agent/ }).click();
+        await page.waitForTimeout(800);
+        check("可切换到本地 Agent 模式", (await page.getByRole("tab", { name: /连接/ }).count()) > 0);
+        await modeSwitch.first().click();
+        await page.getByRole("menuitem", { name: /系统模型/ }).click();
+        await page.waitForTimeout(800);
+        check("可切回系统模型模式", (await page.getByText(/按轮计费/).count()) > 0);
+    } else {
+        check("未开放系统模型时只保留本地 Agent", (await modeSwitch.count()) === 0);
+    }
+    check("Agent 面板无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+    await page.screenshot({ path: "ui-check-agent.png" }).catch(() => {});
+
+    console.log("管理后台");
+    // 凭据要当参数传进去：evaluate 的回调跑在浏览器里，那边没有 process。
+    const adminToken = await page.evaluate(
+        async ([api, username, password]) => {
+            const response = await fetch(`${api}/api/admin/login`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ username, password }),
+            });
+            return (await response.json()).data?.token || "";
+        },
+        [API, process.env.UI_ADMIN || "admin", process.env.UI_ADMIN_PASSWORD || "infinite-canvas"],
+    );
     check("管理员登录接口可用", Boolean(adminToken));
 
     // 用带管理员令牌的新 context：addInitScript 每次导航都会重跑，

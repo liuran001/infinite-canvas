@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { App, Button, Tooltip } from "antd";
 import dayjs from "dayjs";
-import { Bot, History, MessageSquare, PanelRightClose, PlugZap, Plus, Terminal } from "lucide-react";
+import { History, MessageSquare, PanelRightClose, PlugZap, Plus, Terminal } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { imageMetadata } from "@/lib/canvas/canvas-node-factory";
@@ -56,6 +56,7 @@ import {
 } from "./agent-event-formatters";
 import { AgentHistoryView } from "./agent-history-view";
 import { AgentLogView } from "./agent-log-view";
+import { AgentModeSwitch } from "./agent-mode-switch";
 import { AgentPanelTabs } from "./agent-panel-tabs";
 
 const MAX_ATTACHMENTS = 6;
@@ -851,14 +852,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             <AgentPanelTabs
                 value={activeTab}
                 theme={theme}
-                leading={
-                    <div className="flex items-center gap-2 pr-1">
-                        <span className="grid size-8 place-items-center">
-                            <Bot className="size-4" />
-                        </span>
-                        <div className="text-base font-semibold leading-5">Agent</div>
-                    </div>
-                }
+                leading={<AgentModeSwitch theme={theme} />}
                 items={[
                     { value: "setup", label: "连接", icon: <PlugZap className="size-3.5" /> },
                     { value: "chat", label: "对话", icon: <MessageSquare className="size-3.5" /> },

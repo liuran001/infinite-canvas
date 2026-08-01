@@ -164,3 +164,18 @@ export function useEnabledCapabilities() {
     const settings = useServerStore((state) => state.settings);
     return useMemo(() => Object.fromEntries(modelCapabilities.map((capability) => [capability, isCapabilityEnabled(capability)])) as Record<ModelCapability, boolean>, [settings]);
 }
+
+/**
+ * 单次调用要消耗的算力点：基础价加上画质档位加价。
+ * 与服务端 modelCost() 保持同一套算法，界面上给出的预估才不会和实际扣费对不上。
+ */
+export function modelCreditCost(model: string, quality?: string) {
+    const cost = useServerStore.getState().settings?.modelChannel.modelCosts.find((item) => item.model === modelOptionName(model));
+    if (!cost) return 0;
+    return cost.credits + (quality ? cost.qualityCredits?.[quality.trim()] || 0 : 0);
+}
+
+/** 本次生成的总消耗，count 是张数。 */
+export function generationCreditCost(model: string, quality?: string, count = 1) {
+    return modelCreditCost(model, quality) * Math.max(1, count);
+}

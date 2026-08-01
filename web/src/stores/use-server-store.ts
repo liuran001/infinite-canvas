@@ -33,12 +33,17 @@ export type ServerSettings = {
         allowCustomChannel: boolean;
     };
     auth: { allowRegister: boolean; linuxDo: { enabled: boolean } };
-    storage: { remoteEnabled: boolean };
+    /** searchEnabled 由后台「搜索开关 + 是否配了 key」推导，没配 key 时后端不会把联网搜索给 agent。 */
+    agent: { enabled: boolean; model: string; maxRounds: number; searchEnabled: boolean };
+    /** defaultQuota 是新账号的云空间上限（字节）。 */
+    storage: { remoteEnabled: boolean; defaultQuota: number };
     /** 管理员统一控制的功能入口开关，关掉后所有用户都看不到对应入口。 */
     capabilities: Record<ServerCapability, boolean>;
 };
 
 export type ServerStatus = "idle" | "connecting" | "ready" | "error";
+/** 画布等数据推送到服务端的状态，失败时界面要明确告诉用户可能没同步上。 */
+export type SyncState = "idle" | "saving" | "saved" | "failed";
 /** auto 表示自动探测同源后端，探测到就用；on / off 为用户手动固定。 */
 export type ServerModeSetting = "auto" | "on" | "off";
 
@@ -56,6 +61,10 @@ type ServerStore = {
     error: string;
     /** 本地已同步到的服务端时间戳，用于增量拉取项目与素材。 */
     syncedAt: string;
+    /** 登录弹窗开关。全站数据都在服务端，未登录时由它引导登录。 */
+    loginOpen: boolean;
+    syncState: SyncState;
+    syncError: string;
     setMode: (mode: ServerModeSetting) => void;
     setDetected: (detected: boolean) => void;
     setBaseUrl: (baseUrl: string) => void;
@@ -64,6 +73,8 @@ type ServerStore = {
     setSettings: (settings: ServerSettings | null) => void;
     setStatus: (status: ServerStatus, error?: string) => void;
     setSyncedAt: (syncedAt: string) => void;
+    setLoginOpen: (loginOpen: boolean) => void;
+    setSyncState: (syncState: SyncState, syncError?: string) => void;
     clearSession: () => void;
 };
 
@@ -81,14 +92,19 @@ export const useServerStore = create<ServerStore>()(
             status: "idle",
             error: "",
             syncedAt: "",
+            loginOpen: false,
+            syncState: "idle",
+            syncError: "",
             setMode: (mode) => set(mode === "off" ? { mode, status: "idle", error: "" } : { mode }),
             setDetected: (detected) => set({ detected }),
             setBaseUrl: (baseUrl) => set({ baseUrl: baseUrl.trim().replace(/\/+$/, ""), status: "idle", error: "" }),
-            setSession: (token, user) => set({ token, user, status: "ready", error: "" }),
+            setSession: (token, user) => set({ token, user, status: "ready", error: "", loginOpen: false }),
             setUser: (user) => set({ user }),
             setSettings: (settings) => set({ settings }),
             setStatus: (status, error = "") => set({ status, error }),
             setSyncedAt: (syncedAt) => set({ syncedAt }),
+            setLoginOpen: (loginOpen) => set({ loginOpen }),
+            setSyncState: (syncState, syncError = "") => set({ syncState, syncError }),
             clearSession: () => set({ token: "", user: null, status: "idle", error: "", syncedAt: "" }),
         }),
         {

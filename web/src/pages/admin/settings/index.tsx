@@ -4,7 +4,7 @@ import { Pencil, Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { useAdminAction } from "@/pages/admin/use-admin-action";
-import { adminApi, type AdminChannel, type AdminChannelModel, type AdminSettings, type ModelCost } from "@/services/api/admin";
+import { adminApi, type AdminChannel, type AdminChannelModel, type AdminSearchProvider, type AdminSettings, type ModelCost } from "@/services/api/admin";
 import { imageQualityOptions } from "@/components/image-settings-panel";
 import type { ServerCapability, ServerSettings } from "@/stores/use-server-store";
 import { ChannelEditorModal } from "./components/channel-editor-modal";
@@ -12,6 +12,9 @@ import { ChannelEditorModal } from "./components/channel-editor-modal";
 const newChannel = (): AdminChannel => ({ apiFormat: "openai", name: "", baseUrl: "", apiKey: "", models: [], weight: 1, enabled: true, remark: "" });
 
 const sectionClass = "mt-4 rounded-lg border border-stone-200 p-4 dark:border-stone-800";
+
+/** 服务端目前只注册了 Exa 一个搜索服务，之后接新服务在这里补一项即可。 */
+const searchProviderOptions: Array<{ label: string; value: AdminSearchProvider }> = [{ label: "Exa", value: "exa" }];
 
 const capabilityItems: Array<{ key: ServerCapability; label: string; hint: string }> = [
     { key: "image", label: "图片生成", hint: "图片页与画布生图节点" },
@@ -50,12 +53,14 @@ export default function AdminSettingsPage() {
 
     const patchModelChannel = (value: Partial<ServerSettings["modelChannel"]>) => setDraft((current) => current && { ...current, public: { ...current.public, modelChannel: { ...current.public.modelChannel, ...value } } });
     const patchAuth = (value: Partial<ServerSettings["auth"]>) => setDraft((current) => current && { ...current, public: { ...current.public, auth: { ...current.public.auth, ...value } } });
-    const patchStorage = (remoteEnabled: boolean) => setDraft((current) => current && { ...current, public: { ...current.public, storage: { remoteEnabled } } });
+    const patchStorage = (remoteEnabled: boolean, defaultQuota?: number) => setDraft((current) => current && { ...current, public: { ...current.public, storage: { remoteEnabled, defaultQuota: defaultQuota ?? current.public.storage.defaultQuota } } });
     const patchCapabilities = (key: ServerCapability, enabled: boolean) => setDraft((current) => current && { ...current, public: { ...current.public, capabilities: { ...current.public.capabilities, [key]: enabled } } });
+    const patchAgent = (value: Partial<ServerSettings["agent"]>) => setDraft((current) => current && { ...current, public: { ...current.public, agent: { ...current.public.agent, ...value } } });
     const patchPrivate = (value: Partial<AdminSettings["private"]>) => setDraft((current) => current && { ...current, private: { ...current.private, ...value } });
+    const patchSearch = (value: Partial<AdminSettings["private"]["search"]>) => setDraft((current) => current && { ...current, private: { ...current.private, search: { ...current.private.search, ...value } } });
 
-    const { channels, promptSync } = draft.private;
-    const { modelChannel, auth, storage, capabilities } = draft.public;
+    const { channels, promptSync, search } = draft.private;
+    const { modelChannel, auth, storage, capabilities, agent } = draft.public;
     const models = channelModels(channels);
     const optionsFor = (capability: ServerCapability) => models.filter((model) => model.capability === capability).map(toOption);
     const allOptions = models.map(toOption);
@@ -188,6 +193,64 @@ export default function AdminSettingsPage() {
             </section>
 
             <section className={sectionClass}>
+                <h2 className="text-sm font-semibold">画布 Agent</h2>
+                <p className="mt-0.5 text-xs text-stone-500">画布里的对话式 Agent，会按需调用生图、生视频等工具替用户干活。</p>
+                <div className="mt-3 flex items-center gap-2">
+                    <Switch checked={agent.enabled} onChange={(enabled) => patchAgent({ enabled })} />
+                    <span className="text-sm">启用画布 Agent</span>
+                </div>
+                <div className="mt-4 grid gap-4 md:grid-cols-2">
+                    <label className="block">
+                        <span className="mb-1 block text-sm font-medium">Agent 主模型</span>
+                        {/* 服务端只接受 capability 为 text 的模型，选到生图模型会被直接丢弃，所以这里也只列文本模型。 */}
+                        <Select className="w-full" allowClear showSearch value={agent.model || undefined} options={optionsFor("text")} placeholder="留空表示用默认文本模型" onChange={(value) => patchAgent({ model: value || "" })} />
+                        <span className="mt-1 block text-xs text-stone-500">只能选文本模型；留空时服务端回落到上面的「默认文本模型」。</span>
+                    </label>
+                    <label className="block">
+                        <span className="mb-1 block text-sm font-medium">最大工具调用轮数</span>
+                        {/* 这里的钳位和服务端 normalizePublic 保持一致，免得填了越界值保存后被悄悄改掉。 */}
+                        <InputNumber className="w-full" min={1} max={50} precision={0} suffix="轮" value={agent.maxRounds} onChange={(value) => patchAgent({ maxRounds: Math.min(50, Math.max(1, Number(value) || 25)) })} />
+                        <span className="mt-1 block text-xs text-stone-500">单次对话最多让模型连续调用几轮工具，范围 1-50，默认 25；调大更能自己纠错，但也更慢、更费算力点。</span>
+                    </label>
+                </div>
+            </section>
+
+            <section className={sectionClass}>
+                <h2 className="text-sm font-semibold">联网搜索</h2>
+                <p className="mt-0.5 text-xs text-stone-500">给画布 Agent 提供联网搜索工具；密钥保存后不会回传，留空表示保持不变。</p>
+                <div className="mt-3 flex items-center gap-2">
+                    <Switch checked={search.enabled} onChange={(enabled) => patchSearch({ enabled })} />
+                    <span className="text-sm">启用联网搜索</span>
+                </div>
+                <div className="mt-4 grid gap-4 md:grid-cols-2">
+                    <label className="block">
+                        <span className="mb-1 block text-sm font-medium">搜索服务</span>
+                        <Select className="w-full" value={search.provider} options={searchProviderOptions} onChange={(provider) => patchSearch({ provider })} />
+                    </label>
+                    <label className="block">
+                        <span className="mb-1 block text-sm font-medium">搜索 API Key</span>
+                        <Input.Password value={search.apiKey} onChange={(event) => patchSearch({ apiKey: event.target.value })} placeholder="留空表示不修改" />
+                    </label>
+                    <label className="block">
+                        <span className="mb-1 block text-sm font-medium">结果条数上限</span>
+                        {/* 同样按服务端的 1-20 钳位，默认 5。 */}
+                        <InputNumber className="w-full" min={1} max={20} precision={0} suffix="条" value={search.maxResults} onChange={(value) => patchSearch({ maxResults: Math.min(20, Math.max(1, Number(value) || 5)) })} />
+                        <span className="mt-1 block text-xs text-stone-500">每次搜索最多返回几条结果，范围 1-20，默认 5；条数越多上下文越长。</span>
+                    </label>
+                </div>
+                {/*
+                 * 服务端读取时会把 apiKey 抹成空串，前端没法直接判断「配没配 key」，
+                 * 只能看公开配置里由「开关打开 + key 非空」推导出来的 agent.searchEnabled。
+                 * 它反映的是已保存的配置，所以文案统一说「当前」，避免和还没保存的草稿混淆。
+                 */}
+                <p className={`mt-3 text-xs ${agent.searchEnabled ? "text-stone-500" : "text-amber-600 dark:text-amber-500"}`}>
+                    {agent.searchEnabled
+                        ? "当前联网搜索已生效，Agent 可以调用搜索工具。"
+                        : "当前联网搜索不会生效：服务端只有在开关打开且 API Key 非空时，才会把搜索工具下发给 Agent。填好 API Key 并保存后这条提示会变为已生效。"}
+                </p>
+            </section>
+
+            <section className={sectionClass}>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
                         <h2 className="text-sm font-semibold">模型算力点成本</h2>
@@ -214,24 +277,26 @@ export default function AdminSettingsPage() {
                                         }
                                         onChange={(value) => patchCost(index, { model: value || "" })}
                                     />
-                                    <InputNumber className="w-32" min={0} precision={0} value={cost.credits} addonAfter="点" onChange={(value) => patchCost(index, { credits: value || 0 })} />
+                                    <InputNumber className="w-32" min={0} precision={0} value={cost.credits} suffix="点" onChange={(value) => patchCost(index, { credits: value || 0 })} />
                                     <Button danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => patchModelChannel({ modelCosts: modelChannel.modelCosts.filter((_, current) => current !== index) })} />
                                 </div>
-                                <div className="mt-2 flex flex-wrap items-center gap-2">
-                                    <span className="text-xs text-stone-500">画质档位加价</span>
-                                    {imageQualityOptions.map((option) => (
-                                        <InputNumber
-                                            key={option.value}
-                                            size="small"
-                                            className="w-32"
-                                            min={0}
-                                            precision={0}
-                                            addonBefore={option.label}
-                                            value={cost.qualityCredits?.[option.value] || 0}
-                                            onChange={(value) => patchCost(index, { qualityCredits: { ...cost.qualityCredits, [option.value]: value || 0 } })}
-                                        />
-                                    ))}
-                                </div>
+                                {models.find((model) => model.name === cost.model)?.capability === "image" ? (
+                                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                                        <span className="text-xs text-stone-500">画质档位加价</span>
+                                        {imageQualityOptions.map((option) => (
+                                            <InputNumber
+                                                key={option.value}
+                                                size="small"
+                                                className="w-32"
+                                                min={0}
+                                                precision={0}
+                                                prefix={<span className="text-xs text-stone-500">{option.label}</span>}
+                                                value={cost.qualityCredits?.[option.value] || 0}
+                                                onChange={(value) => patchCost(index, { qualityCredits: { ...cost.qualityCredits, [option.value]: value || 0 } })}
+                                            />
+                                        ))}
+                                    </div>
+                                ) : null}
                             </div>
                         ))
                     ) : (
@@ -268,7 +333,7 @@ export default function AdminSettingsPage() {
                 <h2 className="text-sm font-semibold">存储与提示词同步</h2>
                 <div className="mt-3 flex flex-wrap items-center gap-6">
                     <div className="flex items-center gap-2">
-                        <Switch checked={storage.remoteEnabled} onChange={patchStorage} />
+                        <Switch checked={storage.remoteEnabled} onChange={(checked) => patchStorage(checked)} />
                         <span className="text-sm">启用云端存储</span>
                     </div>
                     <div className="flex items-center gap-2">
@@ -276,6 +341,11 @@ export default function AdminSettingsPage() {
                         <span className="text-sm">定时同步远程提示词</span>
                     </div>
                 </div>
+                <label className="mt-4 block max-w-xs">
+                    <span className="mb-1 block text-sm font-medium">新账号默认云空间</span>
+                    <InputNumber className="w-full" min={1} precision={0} suffix="MB" value={Math.round(storage.defaultQuota / 1024 / 1024)} onChange={(value) => patchStorage(storage.remoteEnabled, Math.max(1, Number(value) || 1) * 1024 * 1024)} />
+                    <span className="mt-1 block text-xs text-stone-500">只影响之后注册的账号；已有账号请到用户管理里单独调整。</span>
+                </label>
                 <label className="mt-4 block max-w-xs">
                     <span className="mb-1 block text-sm font-medium">同步 cron 表达式</span>
                     <Input value={promptSync.cron} onChange={(event) => patchPrivate({ promptSync: { ...promptSync, cron: event.target.value } })} placeholder="0 4 * * *" />

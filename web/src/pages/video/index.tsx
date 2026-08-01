@@ -18,7 +18,7 @@ import { createVideoTask, isGenerationReady, pollVideoTask, serverVideoTask, VID
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useJobStore } from "@/stores/use-job-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
-import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { generationCreditCost, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -104,6 +104,8 @@ export default function VideoPage() {
     const agentTaskIdRef = useRef<string | undefined>(undefined);
 
     const model = effectiveConfig.videoModel || effectiveConfig.model;
+    // 视频没有画质档位加价，按模型基础价算就行。
+    const generationCost = generationCreditCost(model);
     const canGenerate = Boolean(prompt.trim());
 
     useEffect(() => {
@@ -586,6 +588,7 @@ export default function VideoPage() {
                         <div className="mt-auto pt-6">
                             <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} loading={running} disabled={!canGenerate || running} onClick={() => void generate()}>
                                 开始生成
+                                {generationCost ? <span className="opacity-70"> · {generationCost} 点</span> : null}
                             </Button>
                         </div>
                     </div>

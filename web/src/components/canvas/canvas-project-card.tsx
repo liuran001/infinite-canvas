@@ -1,10 +1,28 @@
+import { useMemo, useState } from "react";
 import { Check, Download, Pencil, Trash2, X } from "lucide-react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Button, Input } from "antd";
 
+import { resolveImageUrl } from "@/services/image-storage";
 import { useCanvasStore, type CanvasProject } from "@/stores/canvas/use-canvas-store";
 import { useCanvasUiStore } from "@/stores/canvas/use-canvas-ui-store";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
+import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
+
+/** 缩略图只是让人认出画布，多了会盖过卡片本身的信息。 */
+const PREVIEW_LIMIT = 4;
+
+/** 节点里存的 content 可能是别的设备写下的旧地址，有 storageKey 时以当前服务端直链为准。 */
+function previewImageUrls(nodes: CanvasNodeData[]) {
+    const urls = new Set<string>();
+    for (const node of nodes) {
+        if (node.type !== CanvasNodeType.Image) continue;
+        const url = resolveImageUrl(node.metadata?.storageKey, node.metadata?.content || "");
+        if (url) urls.add(url);
+        if (urls.size >= PREVIEW_LIMIT) break;
+    }
+    return [...urls];
+}
 
 export function CanvasProjectCard({ project }: { project: CanvasProject }) {
     const navigate = useNavigate();
@@ -18,8 +36,10 @@ export function CanvasProjectCard({ project }: { project: CanvasProject }) {
     const stopEditing = useCanvasUiStore((state) => state.stopEditingProject);
     const toggleSelected = useCanvasUiStore((state) => state.toggleSelectedProjectId);
     const setDeleteIds = useCanvasUiStore((state) => state.setDeleteProjectIds);
+    const [failedUrls, setFailedUrls] = useState<string[]>([]);
     const editing = editingId === project.id;
     const selected = selectedIds.includes(project.id);
+    const previews = useMemo(() => previewImageUrls(project.nodes), [project.nodes]).filter((url) => !failedUrls.includes(url));
     const open = () => navigate(`/canvas/${project.id}${searchParams.toString() ? `?${searchParams.toString()}` : ""}`);
     const saveTitle = () => {
         renameProject(project.id, editingTitle);
@@ -55,6 +75,14 @@ export function CanvasProjectCard({ project }: { project: CanvasProject }) {
                     </button>
                 )}
             </div>
+            {previews.length ? (
+                <div className="mt-4 grid grid-cols-4 gap-1.5">
+                    {previews.map((url) => (
+                        // 图片可能已被清理或换了服务端，加载失败就把这张剔掉，别留破图占位
+                        <img key={url} src={url} alt="" loading="lazy" onError={() => setFailedUrls((urls) => [...urls, url])} className="aspect-square w-full rounded-lg bg-black/5 object-cover dark:bg-white/10" />
+                    ))}
+                </div>
+            ) : null}
             <div className="mt-8 flex items-end justify-between gap-3">
                 <p className="text-xs text-stone-500">更新于 {new Date(project.updatedAt).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}</p>
                 <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}>

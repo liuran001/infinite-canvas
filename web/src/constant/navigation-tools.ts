@@ -1,4 +1,4 @@
-import { FileText, ImagePlus, Images, Maximize2, Settings2, Video } from "lucide-react";
+import { FileText, ImagePlus, Images, Maximize2, Video } from "lucide-react";
 
 import type { ModelCapability } from "@/stores/use-config-store";
 
@@ -30,11 +30,6 @@ export const navigationTools: ReadonlyArray<{ slug: string; label: string; icon:
         slug: "assets",
         label: "我的资产",
         icon: Images,
-    },
-    {
-        slug: "config",
-        label: "配置",
-        icon: Settings2,
     },
 ];
 

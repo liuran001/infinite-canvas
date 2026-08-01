@@ -7,6 +7,7 @@ import type { InstalledPlugin } from "@/stores/canvas/use-plugin-store";
 import { usePluginStore } from "@/stores/canvas/use-plugin-store";
 import type { Asset } from "@/stores/use-asset-store";
 import { useAssetStore } from "@/stores/use-asset-store";
+import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
 import type { AiConfig } from "@/stores/use-config-store";
 import { useConfigStore } from "@/stores/use-config-store";
 import { isServerMode, useServerStore } from "@/stores/use-server-store";
@@ -132,12 +133,25 @@ export function pushPreferences() {
 async function flushProject(id: string) {
     const project = useCanvasStore.getState().projects.find((item) => item.id === id);
     if (!project || !isServerMode()) return;
+    // 云端 Agent 正在改这个画布时不推本地快照：本地这份是它改之前的状态，推上去会把 agent 的改动顶掉。
+    // 跑完之后画布页会拉一次远程并回写，改动照样会同步上去。
+    const cloudAgent = useCloudAgentStore.getState();
+    if (cloudAgent.status === "running" && cloudAgent.projectId === id) return;
+    const store = useServerStore.getState();
+    store.setSyncState("saving");
     try {
         const saved = await serverApi.saveProject(id, { title: project.title, data: project, revision: project.revision });
         useCanvasStore.setState((state) => ({ projects: state.projects.map((item) => (item.id === id ? { ...item, revision: saved.revision, updatedAt: saved.updatedAt } : item)) }));
+        useServerStore.getState().setSyncState("saved");
     } catch (error) {
         console.warn("推送云端画布失败", error);
-        if (isConflict(error)) void syncProjects();
+        // 冲突不是网络问题，重新拉一次以远程为准即可，不必吓用户。
+        if (isConflict(error)) {
+            useServerStore.getState().setSyncState("saved");
+            void syncProjects();
+            return;
+        }
+        useServerStore.getState().setSyncState("failed", error instanceof Error ? error.message : "同步失败");
     }
 }
 
@@ -247,6 +261,25 @@ async function pullUserPlugins(since: string) {
     if (items.length) usePluginStore.setState({ plugins: [...merged.values()] });
     pending.forEach((id) => pump(() => flushUserPlugin(id)));
     return latestUpdatedAt(items, since);
+}
+
+/**
+ * 按 ID 强制以远程为准覆盖本地画布，云端 Agent 改完画布后由画布页调用。
+ * 不能复用 pullProjects 的「按 updatedAt 后写胜出」：本地这份刚被用户操作过，
+ * updatedAt 往往比服务端新，后写胜出会把 agent 的改动当成过期数据丢掉。
+ */
+export async function pullProject(id: string) {
+    if (!isServerMode()) return null;
+    const item = await serverApi.project(id);
+    if (item.deleted) return null;
+    // 先取消本地待推送的防抖任务，否则刚覆盖完又会被旧状态推回服务端。
+    cancel(`project:${id}`);
+    const project = toProject(item);
+    // 本地可能压根没有这张画布（换设备、或直接打开画布链接），这时要补进列表而不是只替换。
+    useCanvasStore.setState((state) => ({
+        projects: state.projects.some((current) => current.id === id) ? state.projects.map((current) => (current.id === id ? project : current)) : [project, ...state.projects],
+    }));
+    return project;
 }
 
 export function syncProjects() {

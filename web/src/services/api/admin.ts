@@ -53,6 +53,9 @@ export type AdminChannel = {
 /** 模型算力点成本，qualityCredits 按画质档位在基础价上叠加。 */
 export type ModelCost = ServerSettings["modelChannel"]["modelCosts"][number];
 
+/** 联网搜索服务商，与服务端 search 服务里注册的 PROVIDERS 一一对应。 */
+export type AdminSearchProvider = "exa";
+
 /** public 与前端公开配置同构；private 只有管理后台可见，密钥字段读取时被服务端抹成空串。 */
 export type AdminSettings = {
     public: ServerSettings;
@@ -60,6 +63,8 @@ export type AdminSettings = {
         channels: AdminChannel[];
         promptSync: { enabled: boolean; cron: string };
         auth: { linuxDo: { clientId: string; clientSecret: string } };
+        /** 联网搜索配置，apiKey 与渠道密钥一样：读取时被服务端抹空，回传空串表示保持不变。 */
+        search: { enabled: boolean; provider: AdminSearchProvider; apiKey: string; maxResults: number };
     };
 };
 

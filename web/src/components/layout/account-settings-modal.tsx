@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 
 import { formatBytes } from "@/lib/image-utils";
 import { serverApi, type ServerStorage } from "@/services/api/server";
+import { PasskeyManager } from "@/components/layout/passkey-manager";
 import { useServerStore } from "@/stores/use-server-store";
 
 type PasswordForm = { oldPassword?: string; newPassword: string };
@@ -79,12 +80,22 @@ export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose
                 </>
             ) : null}
 
+            <PasskeyManager />
+
             <div className="mt-5 text-sm font-semibold">修改密码</div>
             <Form form={form} layout="vertical" className="mt-3" requiredMark={false} disabled={saving} onFinish={submitPassword}>
                 <Form.Item name="oldPassword" label="原密码" extra="第三方登录创建的账号没有原密码，留空即可。" className="mb-4">
                     <Input.Password autoComplete="current-password" placeholder="留空表示当前账号还没有密码" />
                 </Form.Item>
-                <Form.Item name="newPassword" label="新密码" rules={[{ required: true, message: "请输入新密码" }, { min: 6, message: "新密码至少 6 位" }]} className="mb-4">
+                <Form.Item
+                    name="newPassword"
+                    label="新密码"
+                    rules={[
+                        { required: true, message: "请输入新密码" },
+                        { min: 6, message: "新密码至少 6 位" },
+                    ]}
+                    className="mb-4"
+                >
                     <Input.Password autoComplete="new-password" placeholder="至少 6 位" />
                 </Form.Item>
                 <Button type="primary" htmlType="submit" loading={saving}>

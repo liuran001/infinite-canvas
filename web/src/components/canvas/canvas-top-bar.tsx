@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { BookOpen, Bot, Download, Home, Images, Menu, PanelLeftClose, PanelLeftOpen, Plus, Redo2, Trash2, Undo2, Upload } from "lucide-react";
+import { Bot, CloudOff, Download, Home, Images, Loader2, Menu, PanelLeftClose, PanelLeftOpen, Plus, Redo2, Trash2, Undo2, Upload } from "lucide-react";
 import { Button, Dropdown, Modal, Tooltip } from "antd";
 
 import { UserStatusActions } from "@/components/layout/user-status-actions";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { useCanvasSidePanelStore } from "@/stores/use-canvas-side-panel-store";
+import { useServerStore } from "@/stores/use-server-store";
 import { useThemeStore } from "@/stores/use-theme-store";
-import { DOCS_URL } from "@/constant/env";
 
 export function CanvasTopBar({
     title,
@@ -89,7 +89,6 @@ export function CanvasTopBar({
                         menu={{
                             items: [
                                 { key: "home", icon: <Home className="size-4" />, label: "主页", onClick: onHome },
-                                { key: "docs", icon: <BookOpen className="size-4" />, label: "文档", onClick: () => window.open(DOCS_URL, "_blank", "noopener,noreferrer") },
                                 { key: "projects", icon: <Images className="size-4" />, label: "我的画布", onClick: onProjects },
                                 { type: "divider" },
                                 { key: "new", icon: <Plus className="size-4" />, label: "新建画布", onClick: onCreateProject },
@@ -133,6 +132,7 @@ export function CanvasTopBar({
                             </button>
                         )}
                     </div>
+                    <CanvasSyncStatus />
                     <CompactAgentStatus status={compactAgentStatus} onClick={onToggleAgent} />
                 </div>
 
@@ -183,7 +183,9 @@ function MenuLabel({ text, shortcut }: { text: string; shortcut: string }) {
 function CompactAgentStatus({ status, onClick }: { status: { connected: boolean; enabled: boolean; activity: string }; onClick: () => void }) {
     const colorTheme = useThemeStore((state) => state.theme);
     const theme = canvasThemes[colorTheme];
-    const label = status.connected ? "Codex 已连接" : status.enabled ? `Codex ${status.activity || "连接中"}` : "Codex 未连接";
+    // 未启用本地 Agent 是常态，不必常驻一条「未连接」占位。
+    if (!status.connected && !status.enabled) return null;
+    const label = status.connected ? "Codex 已连接" : `Codex ${status.activity || "连接中"}`;
     const dotColor = status.connected ? "#22c55e" : status.enabled ? "#f59e0b" : theme.node.muted;
     return (
         <button type="button" className="flex h-8 items-center gap-1.5 text-xs transition hover:opacity-75" style={{ color: status.connected ? "#16a34a" : status.enabled ? "#d97706" : theme.node.muted }} onClick={onClick} title="打开本地 Codex 面板">
@@ -211,5 +213,27 @@ function Shortcut({ keys, value }: { keys: string[]; value: string }) {
             </span>
             <span className="text-right text-sm opacity-55">{value}</span>
         </div>
+    );
+}
+
+/**
+ * 画布改动是自动推送到服务端的，失败时必须让用户看见，
+ * 否则他会以为已经存上了而直接关掉页面。
+ */
+function CanvasSyncStatus() {
+    const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    const syncState = useServerStore((state) => state.syncState);
+    const syncError = useServerStore((state) => state.syncError);
+    if (syncState === "idle" || syncState === "saved") return null;
+    const failed = syncState === "failed";
+    return (
+        <span
+            className="inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-xs"
+            style={failed ? { background: "rgba(239,68,68,.12)", color: "#ef4444" } : { color: theme.node.muted }}
+            title={failed ? syncError || "同步失败" : "正在保存到服务器"}
+        >
+            {failed ? <CloudOff className="size-3.5" /> : <Loader2 className="size-3.5 animate-spin" />}
+            {failed ? "网络异常，可能未同步" : "保存中"}
+        </span>
     );
 }

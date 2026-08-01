@@ -40,7 +40,10 @@ import { CanvasMobileHintDialog } from "@/components/canvas/canvas-mobile-hint-d
 import { CanvasSidePanel } from "@/components/canvas/canvas-side-panel";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useAgentStore } from "@/stores/use-agent-store";
+import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
+import { isServerMode, useIsServerMode, useServerStore } from "@/stores/use-server-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { pullProject } from "@/services/remote-sync";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
@@ -197,6 +200,12 @@ function InfiniteCanvasPage() {
     const renameProject = useCanvasStore((state) => state.renameProject);
     const deleteProjects = useCanvasStore((state) => state.deleteProjects);
     const currentProject = useCanvasStore((state) => state.projects.find((project) => project.id === projectId));
+    const bindCloudAgentProject = useCloudAgentStore((state) => state.bindProject);
+    const cloudAgentCanvasReload = useCloudAgentStore((state) => state.canvasReload);
+    const isServerModeReady = useIsServerMode();
+    const cloudAgentEnabled = useServerStore((state) => Boolean(state.settings?.agent.enabled));
+    const appliedCanvasReloadRef = useRef(0);
+    const canvasReloadRetryRef = useRef(0);
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const [nodes, setNodes] = useState<CanvasNodeData[]>([]);
     const [connections, setConnections] = useState<CanvasConnection[]>([]);
@@ -337,13 +346,21 @@ function InfiniteCanvasPage() {
     useEffect(() => {
         if (!hydrated) return;
         setProjectLoaded(false);
-        const project = openProject(projectId);
-        if (!project) {
-            navigate("/canvas", { replace: true });
-            return;
-        }
+        let cancelled = false;
 
         const restore = async () => {
+            let project = openProject(projectId);
+            // 换设备登录或直接打开画布链接时，本地还没同步到这张画布。
+            // 这时先按 ID 拉一次再判定，否则会被误判成「画布不存在」踢回列表。
+            if (!project && isServerMode()) {
+                await pullProject(projectId).catch(() => null);
+                if (cancelled) return;
+                project = openProject(projectId);
+            }
+            if (!project) {
+                navigate("/canvas", { replace: true });
+                return;
+            }
             // 服务端仍在跑的任务对应的节点保持「生成中」并继续续查，其余中断节点照常标记为失败。
             const pendingJobs = (await useJobStore.getState().restorePendingJobs()).filter((job) => job.context.source === "canvas" && job.context.projectId === projectId);
             const resumable = pendingJobs.filter((job) => project.nodes.some((node) => node.id === job.context.nodeId));
@@ -375,12 +392,46 @@ function InfiniteCanvasPage() {
             resumable.forEach((job) => void resumeCanvasJob(job));
         };
         void restore();
+        return () => {
+            cancelled = true;
+        };
     }, [hydrated, navigate, openProject, projectId]);
 
     useEffect(() => {
         if (!projectLoaded) return;
         setAgentState({ activeThreadId: "", messages: [], tokenUsage: null, pendingTool: null });
     }, [projectId, projectLoaded, setAgentState]);
+
+    // 云端 Agent 的会话按画布归属，进入画布就绑定：面板没打开也会挂上事件流，
+    // agent 在后台改画布时画面才能实时刷新。登录态与服务端配置是异步就绪的，就绪后要再绑一次。
+    useEffect(() => {
+        if (!projectLoaded) return;
+        bindCloudAgentProject(projectId);
+    }, [bindCloudAgentProject, cloudAgentEnabled, isServerModeReady, projectId, projectLoaded]);
+
+    // 离开画布就解绑并断开事件流，免得在别的页面对着上一张画布继续发指令；回来会重新绑定并补齐进度。
+    useEffect(() => () => useCloudAgentStore.getState().bindProject(""), []);
+
+    // 画布是被服务端直接改的，本地这份是 React state，必须显式拉回来覆盖，
+    // 否则不仅看不到新节点，本地旧状态回写还会把 agent 的改动顶掉。
+    useEffect(() => {
+        if (!projectLoaded || cloudAgentCanvasReload === appliedCanvasReloadRef.current) return;
+        appliedCanvasReloadRef.current = cloudAgentCanvasReload;
+        void pullProject(projectId)
+            .then(async (project) => {
+                if (!project || useCloudAgentStore.getState().projectId !== projectId) return;
+                canvasReloadRetryRef.current = 0;
+                setNodes(await hydrateCanvasImages(project.nodes));
+                setConnections(project.connections);
+            })
+            .catch((error) => {
+                console.warn("拉取云端画布失败", error);
+                // 断网时这次拉取必然失败，隔一会再排一次，恢复网络后画布才不会停在旧数据上。
+                if (canvasReloadRetryRef.current >= 5) return;
+                canvasReloadRetryRef.current += 1;
+                setTimeout(() => useCloudAgentStore.getState().requestCanvasReload(), 3000);
+            });
+    }, [cloudAgentCanvasReload, projectId, projectLoaded]);
 
     useEffect(() => {
         if (!projectLoaded || !["new", "recent", "choose"].includes(searchParams.get("mode") || "")) return;

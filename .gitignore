@@ -17,3 +17,6 @@ plugins/canvas/*/node_modules
 web/public/plugins
 # UI 验证脚本的截图产物
 web/ui-check-*.png
+
+# oh-my-claudecode 运行时状态，不入库
+.omc/

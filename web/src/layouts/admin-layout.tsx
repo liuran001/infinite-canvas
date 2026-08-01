@@ -2,6 +2,7 @@ import { Button, Menu, Result } from "antd";
 import { ArrowLeft, Coins, FolderOpen, Images, Settings, Sparkles, Users, Wand2 } from "lucide-react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 
+import { LoginModal } from "@/components/layout/login-modal";
 import { useServerStore } from "@/stores/use-server-store";
 
 const navItems = [
@@ -31,11 +32,12 @@ export default function AdminLayout() {
                     title="无权访问管理后台"
                     subTitle={user ? "当前账号不是管理员，请换用管理员账号登录。" : "请先使用管理员账号登录。"}
                     extra={
-                        <Button type="primary" onClick={() => navigate("/login?redirect=/admin")}>
+                        <Button type="primary" onClick={() => useServerStore.getState().setLoginOpen(true)}>
                             去登录
                         </Button>
                     }
                 />
+                <LoginModal />
             </div>
         );
     }
@@ -57,6 +59,7 @@ export default function AdminLayout() {
                 <main className="min-h-0 flex-1 overflow-y-auto p-6">
                     <Outlet />
                 </main>
+                <LoginModal />
             </div>
         </div>
     );

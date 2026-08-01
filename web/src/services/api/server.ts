@@ -36,6 +36,13 @@ export type ServerJobInput = {
     context?: Record<string, unknown>;
 };
 
+export type ServerAgentSessionStatus = "idle" | "running" | "failed";
+export type ServerAgentMessageRole = "user" | "assistant" | "tool";
+export type ServerAgentSession = { id: string; projectId: string; title: string; status: ServerAgentSessionStatus; model: string; error: string; lastSeq: number; createdAt: string; updatedAt: string };
+/** seq 是会话内自增游标，断线重连按它拉增量；工具消息会先后推「已调用」和「有结果」两次，seq 相同。 */
+export type ServerAgentMessage = { seq: number; role: ServerAgentMessageRole; content: string; toolName: string; toolArgs: string; toolResult: string; createdAt: string };
+export type ServerAgentEvent = { type: "message"; message: ServerAgentMessage } | { type: "status"; status: ServerAgentSessionStatus; error: string };
+
 export type ServerProject = { id: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerUserAsset = { id: string; kind: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerUserPlugin = { id: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
@@ -66,6 +73,7 @@ async function readEnvelope<T>(response: Response, fallback: string): Promise<T>
     // 401 只可能是登录态失效，直接清理本地会话让界面回到登录入口。
     if (response.status === 401) {
         useServerStore.getState().clearSession();
+        useServerStore.getState().setLoginOpen(true);
         throw new Error("登录状态已失效，请重新登录");
     }
     const text = await response.text();
@@ -142,6 +150,7 @@ export const serverApi = {
     cancelJob: (id: string) => serverRequest<ServerJob>(`/v1/jobs/${id}/cancel`, { method: "POST" }, "取消生成任务失败"),
 
     projects: (since = "") => serverRequest<{ items: ServerProject[] }>(`/v1/projects${since ? `?since=${encodeURIComponent(since)}` : ""}`, {}, "读取云端画布失败"),
+    project: (id: string) => serverRequest<ServerProject>(`/v1/projects/${id}`, {}, "读取云端画布失败"),
     saveProject: (id: string, body: { title: string; data: unknown; revision?: number }) => serverRequest<ServerProject>(`/v1/projects/${id}`, { method: "PUT", ...jsonBody(body) }, "保存云端画布失败"),
     deleteProject: (id: string) => serverRequest<boolean>(`/v1/projects/${id}`, { method: "DELETE" }, "删除云端画布失败"),
 
@@ -154,7 +163,52 @@ export const serverApi = {
     deleteUserPlugin: (id: string) => serverRequest<boolean>(`/v1/user-plugins/${encodeURIComponent(id)}`, { method: "DELETE" }, "删除云端插件失败"),
 
     aiModels: (model: string) => serverRequest<string[]>(`/v1/ai/models?model=${encodeURIComponent(model)}`, {}, "读取模型失败"),
+
+    agentSessions: (projectId: string) => serverRequest<{ items: ServerAgentSession[] }>(`/v1/agent/sessions?projectId=${encodeURIComponent(projectId)}`, {}, "读取 Agent 会话失败"),
+    createAgentSession: (body: { sessionId: string; projectId: string; title: string }) => serverRequest<ServerAgentSession>("/v1/agent/sessions", { method: "POST", ...jsonBody(body) }, "新建 Agent 会话失败"),
+    agentSession: (id: string) => serverRequest<ServerAgentSession>(`/v1/agent/sessions/${id}`, {}, "读取 Agent 会话失败"),
+    deleteAgentSession: (id: string) => serverRequest<boolean>(`/v1/agent/sessions/${id}`, { method: "DELETE" }, "删除 Agent 会话失败"),
+    agentMessages: (id: string, sinceSeq: number) => serverRequest<{ items: ServerAgentMessage[] }>(`/v1/agent/sessions/${id}/messages?sinceSeq=${sinceSeq}`, {}, "读取 Agent 消息失败"),
+    /** clientMessageId 是幂等键：断网重发同一个键只会拿回已存在的那条消息，不会重复执行也不会重复扣点。 */
+    sendAgentMessage: (id: string, body: { clientMessageId: string; content: string }) => serverRequest<ServerAgentMessage>(`/v1/agent/sessions/${id}/messages`, { method: "POST", ...jsonBody(body) }, "发送消息失败"),
+    abortAgentSession: (id: string) => serverRequest<ServerAgentSession>(`/v1/agent/sessions/${id}/abort`, { method: "POST" }, "中止 Agent 执行失败"),
 };
+
+/**
+ * Agent 事件流。鉴权靠请求头带令牌，EventSource 不支持自定义头，只能自己 fetch + 读流解析 SSE。
+ * 断开只是取消订阅，服务端的推理循环照常跑完并落库，重连时带上 sinceSeq 就能把断线期间的消息补齐。
+ */
+export async function serverAgentStream(sessionId: string, sinceSeq: number, onEvent: (event: ServerAgentEvent) => void, signal: AbortSignal) {
+    const response = await fetch(serverApiUrl(`/v1/agent/sessions/${sessionId}/stream?sinceSeq=${sinceSeq}`), { headers: authHeaders({ Accept: "text/event-stream" }), signal }).catch(() => {
+        throw new Error("Agent 事件流连接失败：无法连接服务端，请检查网络");
+    });
+    if (response.status === 401) {
+        useServerStore.getState().clearSession();
+        useServerStore.getState().setLoginOpen(true);
+        throw new Error("登录状态已失效，请重新登录");
+    }
+    if (!response.ok) throw new Error(`Agent 事件流连接失败（HTTP ${response.status}）`);
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("Agent 事件流没有返回内容");
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        buffer += decoder.decode(value, { stream: true });
+        // SSE 按空行分块；保活帧是 ": keep-alive" 注释，没有 data 行，这里自然跳过。
+        for (let index = buffer.indexOf("\n\n"); index >= 0; index = buffer.indexOf("\n\n")) {
+            const data = buffer
+                .slice(0, index)
+                .split("\n")
+                .filter((line) => line.startsWith("data:"))
+                .map((line) => line.slice(5).trim())
+                .join("");
+            buffer = buffer.slice(index + 2);
+            if (data) onEvent(JSON.parse(data) as ServerAgentEvent);
+        }
+    }
+}
 
 /** 文本类调用需要流式读取，单独走 fetch 拿原始 Response。 */
 export async function serverAiStream(path: string, body: unknown, signal?: AbortSignal) {
@@ -168,6 +222,7 @@ export async function serverAiStream(path: string, body: unknown, signal?: Abort
     });
     if (response.status === 401) {
         useServerStore.getState().clearSession();
+        useServerStore.getState().setLoginOpen(true);
         throw new Error("登录状态已失效，请重新登录");
     }
     if (!response.ok) {

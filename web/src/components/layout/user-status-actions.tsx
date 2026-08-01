@@ -1,13 +1,14 @@
 import { useEffect, useState, type CSSProperties } from "react";
-import { App, Dropdown, Typography, type MenuProps } from "antd";
-import { BookOpen, Keyboard, LogIn, LogOut, Puzzle, Settings2, Shield, UserRound } from "lucide-react";
+import { App, Dropdown, Progress, Typography, type MenuProps } from "antd";
+import { Keyboard, LogIn, LogOut, Puzzle, Settings2, Shield, UserRound } from "lucide-react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { AccountSettingsModal } from "@/components/layout/account-settings-modal";
+import { formatBytes } from "@/lib/image-utils";
+import { serverApi } from "@/services/api/server";
 import { AnimatedThemeToggler } from "@/components/ui/animated-theme-toggler";
 import { GitHubLink } from "@/components/layout/github-link";
 import { VersionReleaseModal } from "@/components/layout/version-release-modal";
-import { DOCS_URL } from "@/constant/env";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { useConfigStore } from "@/stores/use-config-store";
 import { useServerStore } from "@/stores/use-server-store";
@@ -25,10 +26,12 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
     const navigate = useNavigate();
     const [searchParams, setSearchParams] = useSearchParams();
     const [accountOpen, setAccountOpen] = useState(false);
+    const [storage, setStorage] = useState<{ used: number; quota: number } | null>(null);
     const theme = useThemeStore((state) => state.theme);
     const setTheme = useThemeStore((state) => state.setTheme);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const user = useServerStore((state) => state.user);
+    const setLoginOpen = useServerStore((state) => state.setLoginOpen);
     const canvasTheme = canvasThemes[theme];
     const naturalIconClass = "inline-flex size-7 shrink-0 items-center justify-center text-stone-600 transition hover:text-stone-950 dark:text-stone-300 dark:hover:text-white [&_svg]:size-4";
     const iconStyle: CSSProperties | undefined = variant === "canvas" ? { color: canvasTheme.node.text } : undefined;
@@ -46,14 +49,26 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
         setSearchParams(next, { replace: true });
     }, [bound, authError]);
 
+    const storagePercent = storage && storage.quota ? Math.min(100, (storage.used / storage.quota) * 100) : 0;
+    const storageNearlyFull = storagePercent >= 90;
+
     const menuItems: MenuProps["items"] = [
         {
             key: "profile",
             type: "group",
             label: (
-                <div className="py-1">
+                <div className="w-56 py-1">
                     <Typography.Text strong>{user?.displayName || user?.username}</Typography.Text>
                     <div className="mt-0.5 text-xs">剩余算力点 {user?.credits ?? 0}</div>
+                    {storage ? (
+                        <>
+                            <Progress className="!mb-0 mt-2" percent={Number(storagePercent.toFixed(1))} showInfo={false} size="small" status={storageNearlyFull ? "exception" : "normal"} />
+                            <div className={`text-xs ${storageNearlyFull ? "font-medium text-red-500" : ""}`}>
+                                云空间 {formatBytes(storage.used)} / {formatBytes(storage.quota)}
+                            </div>
+                            {storageNearlyFull ? <div className="mt-1 text-xs text-red-500">空间快满了，建议清理不再需要的资产和过时画布</div> : null}
+                        </>
+                    ) : null}
                 </div>
             ),
         },
@@ -64,6 +79,18 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
         { key: "logout", icon: <LogOut className="size-4" />, label: "退出登录", onClick: () => useServerStore.getState().clearSession() },
     ];
 
+    // 云空间只在登录后拉一次，用户菜单展开时再刷新，避免频繁打接口。
+    useEffect(() => {
+        if (!user) {
+            setStorage(null);
+            return;
+        }
+        void serverApi
+            .storage()
+            .then(setStorage)
+            .catch(() => undefined);
+    }, [user?.id]);
+
     return (
         <div className="inline-flex shrink-0 items-center gap-1">
             {onOpenPlugins ? (
@@ -71,17 +98,18 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
                     <Puzzle className="size-4" />
                 </button>
             ) : null}
-            <a href={DOCS_URL} target="_blank" rel="noopener noreferrer" className={naturalIconClass} style={iconStyle} aria-label="文档" title="文档">
-                <BookOpen className="size-4" />
-            </a>
             {showConfig ? (
                 <button type="button" className={naturalIconClass} style={iconStyle} onClick={() => openConfigDialog(false)} aria-label="偏好设置" title="偏好设置">
                     <Settings2 className="size-4" />
                 </button>
             ) : null}
             <AnimatedThemeToggler theme={theme} onThemeChange={setTheme} className={naturalIconClass} style={iconStyle} aria-label={theme === "dark" ? "切换到浅色主题" : "切换到深色主题"} title={theme === "dark" ? "切换到浅色主题" : "切换到深色主题"} />
-            <VersionReleaseModal style={iconStyle} />
-            <GitHubLink className="size-7 bg-transparent text-base hover:bg-transparent dark:hover:bg-transparent" style={iconStyle} />
+            {variant === "canvas" ? null : (
+                <>
+                    <VersionReleaseModal style={iconStyle} />
+                    <GitHubLink className="size-7 bg-transparent text-base hover:bg-transparent dark:hover:bg-transparent" style={iconStyle} />
+                </>
+            )}
             {onOpenShortcuts ? (
                 <button type="button" className={naturalIconClass} style={iconStyle} onClick={onOpenShortcuts} aria-label="快捷键" title="快捷键">
                     <Keyboard className="size-4" />
@@ -89,12 +117,25 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
             ) : null}
             {user ? (
                 <Dropdown trigger={["click"]} placement="bottomRight" menu={{ items: menuItems }}>
-                    <button type="button" className={naturalIconClass} style={iconStyle} aria-label="账号" title={user.displayName || user.username}>
+                    <button
+                        type="button"
+                        className="inline-flex h-7 shrink-0 items-center gap-1.5 px-1 text-stone-600 transition hover:text-stone-950 dark:text-stone-300 dark:hover:text-white"
+                        style={iconStyle}
+                        aria-label="账号"
+                        title={user.displayName || user.username}
+                    >
                         {user.avatarUrl ? <img src={user.avatarUrl} alt="" className="size-5 rounded-full object-cover" /> : <UserRound className="size-4" />}
+                        <span className="text-sm tabular-nums">{user.credits ?? 0}</span>
                     </button>
                 </Dropdown>
             ) : (
-                <button type="button" className="inline-flex h-7 shrink-0 items-center gap-1 px-1 text-sm text-stone-600 transition hover:text-stone-950 dark:text-stone-300 dark:hover:text-white" style={iconStyle} onClick={() => navigate("/login")} title="登录">
+                <button
+                    type="button"
+                    className="inline-flex h-7 shrink-0 items-center gap-1 px-1 text-sm text-stone-600 transition hover:text-stone-950 dark:text-stone-300 dark:hover:text-white"
+                    style={iconStyle}
+                    onClick={() => setLoginOpen(true)}
+                    title="登录"
+                >
                     <LogIn className="size-4" />
                     登录
                 </button>
