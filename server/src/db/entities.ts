@@ -13,8 +13,15 @@ export type CreditLogType = "admin_adjust" | "ai_consume" | "ai_refund";
 export type JobKind = "image" | "video" | "audio" | "text";
 export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
 export type FileStorage = "local" | "s3";
-export type AgentSessionStatus = "idle" | "running" | "failed";
+export type AgentSessionStatus = "idle" | "running" | "awaiting" | "failed";
 export type AgentMessageRole = "user" | "assistant" | "tool";
+
+/**
+ * 执行到一半、需要用户点头才能继续的请求。
+ * 刻意做成一套通用结构而不是给每种情况各加一个字段：续跑和改标题的交互完全一样，
+ * 都是「服务端暂停 → 前端弹确认 → 批准或拒绝」，前端只认 type 就能复用同一套界面与同一个接口。
+ */
+export type AgentPendingAction = { type: "continue"; roundsUsed: number; credits: number } | { type: "rename_canvas"; title: string; reason: string };
 
 /** 默认云空间配额 100MB，管理员可按用户单独调整。 */
 export const DEFAULT_STORAGE_QUOTA = 100 << 20;
@@ -244,6 +251,18 @@ export class AgentSession {
     @Column(short) model!: string;
     @Column({ type: "text", nullable: true }) error!: string;
     @Column({ type: "int", default: 0 }) lastSeq!: number;
+    /**
+     * 待用户确认的请求，空表示没有。必须落库而不是只放内存：
+     * 手机上点了同意、电脑上还显示等待，就是因为这份状态只活在某一个连接里。
+     */
+    @Column({ type: "simple-json", nullable: true }) pendingAction!: AgentPendingAction | null;
+    /** 本次执行已经用掉的轮数。落库才能在「等待用户确认」这段时间里保住轮数预算，批准续跑时再清零重来。 */
+    @Column({ type: "int", default: 0 }) rounds!: number;
+    /**
+     * 画布还是默认标题时，允许模型主动改一次标题不用确认；用掉之后记在这里。
+     * 只靠提示词说「只能改一次」是拦不住的：模型每一轮都可能重新起念再改一次，必须落到数据上。
+     */
+    @Column({ type: "boolean", default: false }) autoRenamed!: boolean;
     @Column({ type: "boolean", default: false }) deleted!: boolean;
     @Column(short) createdAt!: string;
     @Index() @Column(short) updatedAt!: string;

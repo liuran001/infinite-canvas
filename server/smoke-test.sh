@@ -32,25 +32,25 @@ check() {
 }
 
 cd "$ROOT"
-PORT="$PORT" \
-    ADMIN_USERNAME=admin ADMIN_PASSWORD=smoke-test \
-    JWT_SECRET=smoke-test-secret \
-    STORAGE_DRIVER=sqlite DATABASE_DSN="$WORK/test.db" DATA_DIR="$WORK/data" \
-    LINUX_DO_TOKEN_URL="http://127.0.0.1:$UPSTREAM_PORT/oauth2/token" \
-    LINUX_DO_USERINFO_URL="http://127.0.0.1:$UPSTREAM_PORT/api/user" \
-    npx tsx src/index.ts >"$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-
-for _ in $(seq 1 60); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    sleep 0.5
-done
-
-if ! curl -sf "$BASE/health" >/dev/null 2>&1; then
+# 抽成函数是因为「服务重启」那一节要用完全相同的环境变量再起一次，两处配置不能有半点漂移。
+start_server() {
+    PORT="$PORT" \
+        ADMIN_USERNAME=admin ADMIN_PASSWORD=smoke-test \
+        JWT_SECRET=smoke-test-secret \
+        STORAGE_DRIVER=sqlite DATABASE_DSN="$WORK/test.db" DATA_DIR="$WORK/data" \
+        LINUX_DO_TOKEN_URL="http://127.0.0.1:$UPSTREAM_PORT/oauth2/token" \
+        LINUX_DO_USERINFO_URL="http://127.0.0.1:$UPSTREAM_PORT/api/user" \
+        npx tsx src/index.ts >>"$WORK/server.log" 2>&1 &
+    SERVER_PID=$!
+    for _ in $(seq 1 60); do
+        curl -sf "$BASE/health" >/dev/null 2>&1 && return 0
+        sleep 0.5
+    done
     echo "服务启动失败，日志："
     cat "$WORK/server.log"
     exit 1
-fi
+}
+start_server
 
 echo "健康检查与公开接口"
 check "GET /health" "$(curl -s "$BASE/health" | jq -r .data)" "ok"
@@ -181,6 +181,8 @@ let lastTools = [];
 // 最后一次 agent 请求的原始请求体。冒烟脚本据此断言上下文里到底带了什么，
 // 尤其是「引用只带 ID、绝不带图片数据」这条核心约定。
 let lastChat = null;
+// 最后一次生图请求的原始请求体，用来断言工具参数真的透传到了上游，而不是在半路被丢掉。
+let lastImage = null;
 
 function streamText(res, toEvent) {
     res.setHeader("Content-Type", "text/event-stream");
@@ -205,9 +207,30 @@ function messageText(item) {
     return (content || []).map((part) => part.text || "").join(" ");
 }
 
+function lastUserText(messages) {
+    return messageText([...messages].reverse().find((item) => item.role === "user"));
+}
+
+// 「一直干活」的会话永远返回工具调用，用来把轮数真的耗尽，验证耗尽后是暂停请求授权而不是直接结束。
+function keepsGoing(messages) {
+    return lastUserText(messages).includes("一直干活");
+}
+
 function toolCall(messages) {
-    const text = messageText([...messages].reverse().find((item) => item.role === "user"));
+    const text = lastUserText(messages);
     if (text.includes("生成图片")) return { name: "generate_image", args: { prompt: "一只猫" } };
+    // 生成类工具的全量参数：这一条会被断言「一个不落地透传到了上游请求体」。
+    if (text.includes("全参数生图")) {
+        return { name: "generate_image", args: { prompt: "一只猫", model: "mock-image-pro", count: 2, size: "1024x1024", quality: "high", background: "transparent" } };
+    }
+    // 拿文本模型去生图：服务端要按 capability 挡下来并回落到默认生图模型，而不是报错。
+    if (text.includes("用文本模型生图")) return { name: "generate_image", args: { prompt: "一只猫", model: "mock-text" } };
+    if (text.includes("写一篇长文")) return { name: "generate_text", args: { prompt: "介绍一下无限画布", model: "mock-text", title: "长文" } };
+    // 不带 model 的生文调用：用来验证「工具没指定模型时按用户偏好里的生文模型来」。
+    if (text.includes("按偏好写长文")) return { name: "generate_text", args: { prompt: "介绍一下无限画布", title: "偏好长文" } };
+    if (text.includes("改画布标题")) return { name: "rename_canvas", args: { title: "猫咪画册", reason: "用户整张画布都在做猫咪主题" } };
+    if (text.includes("再改一次标题")) return { name: "rename_canvas", args: { title: "猫咪画册二版", reason: "用户又加了新内容" } };
+    if (text.includes("一直干活")) return { name: "create_node", args: { type: "text", title: "干活节点", content: "还在干" } };
     // 读网页：内网地址用来验证服务端会直接拒绝，普通地址会被搜索服务的 mock 接住返回长正文。
     if (text.includes("读取内网")) return { name: "read_webpage", args: { url: "http://127.0.0.1:9/admin" } };
     if (text.includes("读取网页")) return { name: "read_webpage", args: { url: "https://example.com/long-article" } };
@@ -236,6 +259,7 @@ require("http").createServer((req, res) => {
         res.setHeader("Content-Type", "application/json");
         if (req.url === "/_tools") return res.end(JSON.stringify({ tools: lastTools }));
         if (req.url === "/_last") return res.end(JSON.stringify(lastChat || {}));
+        if (req.url === "/_lastimage") return res.end(JSON.stringify(lastImage || {}));
         if (IMAGES[req.url]) {
             const [type, buffer] = IMAGES[req.url];
             res.setHeader("Content-Type", type);
@@ -299,9 +323,14 @@ require("http").createServer((req, res) => {
 
         if (req.url.includes("/chat/completions")) {
             lastTools = (body.tools || []).map((item) => item.function.name);
-            lastChat = body;
             const messages = body.messages || [];
-            const done = messages[messages.length - 1].role === "tool";
+            // 起标题是一次独立的短请求，不带工具也不该被当成 agent 的一轮：直接回一个标题字符串。
+            // 标题里回带用户原话的前三个字，冒烟脚本据此分得出「标题是第几条消息生成的」，才验得了「只生成一次」。
+            if (messageText(messages[0] || {}).includes("起一个标题")) {
+                return res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: `「冒烟-${lastUserText(messages).slice(0, 3)}」` } }] }));
+            }
+            lastChat = body;
+            const done = messages[messages.length - 1].role === "tool" && !keepsGoing(messages);
             const call = toolCall(messages);
             const message = done
                 ? { role: "assistant", content: "已经按你的要求改好画布了。" }
@@ -319,6 +348,7 @@ require("http").createServer((req, res) => {
             return setTimeout(() => res.end(JSON.stringify({ candidates: [{ content: { parts } }] })), AGENT_DELAY_MS);
         }
 
+        lastImage = body;
         res.end(JSON.stringify({ data: [{ b64_json: PNG }] }));
     });
 // 监听所有网卡而不是只监听 127.0.0.1：import_image 的地址要用本机主机名才能过服务端的内网拦截，
@@ -329,6 +359,8 @@ EOF
 # 主机名字面量上不是内网地址，正好把 mock 图床装扮成一个「公网图床」，
 # 让「下载 → 校验大小与格式 → 落库占配额」整条真链路都能在离线环境里跑一遍。
 IMG_ORIGIN="http://${HOSTNAME:-$(uname -n)}:$UPSTREAM_PORT"
+# mock 上游流式吐出来的完整文本，文本任务与 agent 的 generate_text 都拿它当预期值。
+TEXT_FULL="无限画布把生成任务放在服务端，刷新页面也不会丢，内容会接着写完。"
 node "$WORK/upstream.js" "$UPSTREAM_PORT" "$IMG_ORIGIN" &
 UPSTREAM_PID=$!
 sleep 1
@@ -552,17 +584,21 @@ check "设好密码后可以删除最后一个 Passkey" "$(curl -s -X DELETE "$B
 check "删除后列表为空" "$(curl -s "$BASE/auth/passkeys" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data | length')" "0"
 
 echo "画布 Agent"
+# mock-image-pro 专门用来验「工具指定的生成模型真的被用上」，mock-title-broken 挂在一个必定连不上的渠道上，
+# 用来验「标题模型挂了就回落到截断，绝不能连累发消息」。
 AGENT_CHANNELS='[
-  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-text", "capability": "text" }, { "name": "mock-text-vision", "capability": "text", "vision": true }], "weight": 1, "enabled": true },
+  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-image-pro", "capability": "image" }, { "name": "mock-text", "capability": "text" }, { "name": "mock-text-vision", "capability": "text", "vision": true }], "weight": 1, "enabled": true },
+  { "apiFormat": "openai", "name": "断掉的渠道", "baseUrl": "http://127.0.0.1:1", "apiKey": "sk-test", "models": [{ "name": "mock-title-broken", "capability": "text" }], "weight": 1, "enabled": true },
   { "apiFormat": "gemini", "name": "本地假 Gemini", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-gemini-text", "capability": "text" }], "weight": 1, "enabled": true }
 ]'
 # 把 Gemini 渠道停用，用来验证「用户选的模型被管理员下线」这条路径。
 AGENT_CHANNELS_NO_GEMINI='[
-  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-text", "capability": "text" }, { "name": "mock-text-vision", "capability": "text", "vision": true }], "weight": 1, "enabled": true },
+  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-image-pro", "capability": "image" }, { "name": "mock-text", "capability": "text" }, { "name": "mock-text-vision", "capability": "text", "vision": true }], "weight": 1, "enabled": true },
+  { "apiFormat": "openai", "name": "断掉的渠道", "baseUrl": "http://127.0.0.1:1", "apiKey": "sk-test", "models": [{ "name": "mock-title-broken", "capability": "text" }], "weight": 1, "enabled": true },
   { "apiFormat": "gemini", "name": "本地假 Gemini", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-gemini-text", "capability": "text" }], "weight": 1, "enabled": false }
 ]'
 # 三个文本模型故意定不同单价：agent 按消息计费，换模型必须换单价，只有价差才验得出「计费真的按所选模型走」。
-AGENT_COSTS='[{ "model": "mock-text", "credits": 1 }, { "model": "mock-gemini-text", "credits": 3 }, { "model": "mock-text-vision", "credits": 2 }, { "model": "mock-image", "credits": 1 }]'
+AGENT_COSTS='[{ "model": "mock-text", "credits": 1 }, { "model": "mock-gemini-text", "credits": 3 }, { "model": "mock-text-vision", "credits": 2 }, { "model": "mock-image", "credits": 1 }, { "model": "mock-image-pro", "credits": 1 }]'
 # 搜索服务全部指向本地 mock 上游：baseUrl 留空才走官方地址，填了就能在冒烟里把搜索与读网页整条链路真跑一遍。
 SEARCH_EMPTY='{ "enabled": true, "maxResults": 5, "services": [] }'
 search_service() { echo '{ "provider": "'"$1"'", "name": "冒烟'"$1"'", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'/'"${3:-$1}"'", "apiKey": "'"$2"'", "weight": '"${4:-10}"', "enabled": true }'; }
@@ -573,17 +609,19 @@ SEARCH_DISABLED='{ "enabled": false, "maxResults": 3, "services": ['"$(search_se
 SEARCH_TAVILY='{ "enabled": true, "maxResults": 3, "services": ['"$(search_service tavily tavily-test-key)"'] }'
 # 权重高的那条指向必定 500 的路径，验证会自动降级到后面那条。
 SEARCH_FAILOVER='{ "enabled": true, "maxResults": 3, "services": ['"$(search_service exa exa-test-key broken/exa 20)"', '"$(search_service tavily tavily-test-key tavily 5)"'] }'
-# 第三个参数是渠道配置，默认两条渠道都开着。
+# 参数依次是：搜索配置、agent 主模型、渠道配置（默认两条渠道都开着）、标题模型、最大轮数。
 agent_settings() {
     curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{
       "private": { "channels": '"${3:-$AGENT_CHANNELS}"', "search": '"$1"' },
       "public": {
         "modelChannel": { "defaultTextModel": "mock-text", "defaultImageModel": "mock-image", "modelCosts": '"$AGENT_COSTS"' },
-        "agent": { "enabled": true, "model": '"$2"', "maxRounds": 5 }
+        "agent": { "enabled": true, "model": '"$2"', "titleModel": '"${4:-\"\"}"', "maxRounds": '"${5:-5}"' }
       }
     }' >/dev/null
 }
 credits_now() { curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits; }
+agent_session() { curl -s "$BASE/v1/agent/sessions/$1" -H "Authorization: Bearer $USER_TOKEN"; }
+agent_title() { agent_session "$1" | jq -r .data.title; }
 agent_model() { curl -s "$BASE/v1/agent/sessions/$1" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.model; }
 agent_status() { curl -s "$BASE/v1/agent/sessions/$1" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status; }
 wait_agent_idle() {
@@ -592,6 +630,7 @@ wait_agent_idle() {
         sleep 1
     done
 }
+agent_resolve() { curl -s -X POST "$BASE/v1/agent/sessions/$1/resolve" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"approved":'"$2"'}'; }
 new_agent_session() { curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "$1" | jq -r .data.id; }
 agent_settings "$SEARCH_EMPTY" '""'
 curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
@@ -887,6 +926,190 @@ check "附件的 storageKey 也给了模型" "$(echo "$ATT_CONTEXT" | jq -r 'tos
 check "工具能按 storageKey 引用到附件" "$(curl -s "$BASE/v1/projects/agent-ref" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.data.nodes[] | select(.metadata.storageKey=="server:'"$REF_FILE"'" and .title=="附件节点")] | length')" "1"
 
 
+# 生成工具的全量参数：模型给什么就透传什么，服务端不再自己写一套归一化，也不能在半路把参数吃掉。
+agent_settings "$SEARCH_EMPTY" '""'
+curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
+GEN_SESSION=$(new_agent_session '{"projectId":"agent-p1","title":"生成参数会话"}')
+agent_message "$GEN_SESSION" "gen-m1" "帮我全参数生图"
+GEN_IMAGE=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_lastimage")
+check "工具指定的生图模型真的用上了" "$(echo "$GEN_IMAGE" | jq -r .model)" "mock-image-pro"
+check "画质档位透传到上游请求" "$(echo "$GEN_IMAGE" | jq -r .quality)" "high"
+check "背景参数透传到上游请求" "$(echo "$GEN_IMAGE" | jq -r .background)" "transparent"
+check "尺寸参数透传到上游请求" "$(echo "$GEN_IMAGE" | jq -r .size)" "1024x1024"
+check "张数透传到上游请求" "$(echo "$GEN_IMAGE" | jq -r .n)" "2"
+check "工具结果里回报了实际用的模型" "$(last_tool_result "$GEN_SESSION" "generate_image" | jq -r .data.model)" "mock-image-pro"
+
+# 拿文本模型去生图：按 capability 挡下来并静默回落到默认生图模型，而不是报错让这一轮白跑。
+agent_message "$GEN_SESSION" "gen-m2" "帮我用文本模型生图"
+check "能力不匹配的模型回落到默认生图模型" "$(last_tool_result "$GEN_SESSION" "generate_image" | jq -r .data.model)" "mock-image"
+check "回落之后照样生成成功" "$(last_tool_result "$GEN_SESSION" "generate_image" | jq -r .ok)" "true"
+
+# generate_text 复用 jobs 里已有的 text 任务：计费、落库、幂等都跟着那一套走，不另起一份。
+check "文本生成工具下发给了模型" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="generate_text")] | length')" "1"
+GEN_TEXT_BEFORE=$(credits_now)
+agent_message "$GEN_SESSION" "gen-m3" "帮我写一篇长文"
+check "文本生成工具执行成功" "$(last_tool_result "$GEN_SESSION" "generate_text" | jq -r .ok)" "true"
+check "文本生成走的是现有任务队列" "$(curl -s "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.items[] | select(.context.source=="agent" and .kind=="text" and .status=="succeeded")] | length')" "1"
+check "生成的正文落到了文本节点上" "$(curl -s "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.data.nodes[] | select(.title=="长文")][0].metadata.content')" "$TEXT_FULL"
+# 发消息 1 点 + 文本任务 1 点：两笔都要真的扣到，少一笔就说明有一条路径没走计费。
+check "文本生成照常按模型单价计费" "$((GEN_TEXT_BEFORE - $(credits_now)))" "2"
+
+# Agent 生成默认设置：优先级是「模型显式传的 > 用户偏好 > 全站默认」。
+# 断言一律看 mock 上游真正收到的请求体，只看接口返回成功的话，参数在半路被吃掉也验不出来。
+set_agent_prefs() { curl -s -X PUT "$BASE/v1/preferences" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "$1" >/dev/null; }
+
+# 先钉住「没配过偏好」时的老行为：模型是全站默认，尺寸画质背景一个都不该凭空冒出来。
+set_agent_prefs '{}'
+agent_message "$GEN_SESSION" "pref-m0" "帮我生成图片"
+PREF_NONE=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_lastimage")
+check "没配偏好时用全站默认生图模型" "$(echo "$PREF_NONE" | jq -r .model)" "mock-image"
+check "没配偏好时不给上游塞尺寸" "$(echo "$PREF_NONE" | jq -r '.size // "none"')" "none"
+check "没配偏好时不给上游塞画质" "$(echo "$PREF_NONE" | jq -r '.quality // "none"')" "none"
+check "没配偏好时不给上游塞背景" "$(echo "$PREF_NONE" | jq -r '.background // "none"')" "none"
+check "没配偏好时张数仍是 1" "$(echo "$PREF_NONE" | jq -r .n)" "1"
+
+# 配上偏好后，同一句「帮我生成图片」（工具只传了提示词）发给上游的请求体必须是偏好里的规格。
+set_agent_prefs '{"agentImageModel":"mock-image-pro","agentImageSize":"1024x1024","agentImageQuality":"high","agentImageCount":"2","agentImageBackground":"transparent"}'
+agent_message "$GEN_SESSION" "pref-m1" "帮我生成图片"
+PREF_IMAGE=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_lastimage")
+check "偏好里的生图模型进了上游请求" "$(echo "$PREF_IMAGE" | jq -r .model)" "mock-image-pro"
+check "偏好里的尺寸进了上游请求" "$(echo "$PREF_IMAGE" | jq -r .size)" "1024x1024"
+check "偏好里的画质进了上游请求" "$(echo "$PREF_IMAGE" | jq -r .quality)" "high"
+check "偏好里的背景进了上游请求" "$(echo "$PREF_IMAGE" | jq -r .background)" "transparent"
+check "偏好里的张数进了上游请求" "$(echo "$PREF_IMAGE" | jq -r .n)" "2"
+check "工具结果里回报的是偏好模型" "$(last_tool_result "$GEN_SESSION" "generate_image" | jq -r .data.model)" "mock-image-pro"
+
+# 模型自己传了参数就以它为准，偏好只补它没传的那部分。这里偏好与显式参数每一项都不同，才验得出到底谁赢。
+set_agent_prefs '{"agentImageModel":"mock-image","agentImageSize":"512x512","agentImageQuality":"low","agentImageCount":"3","agentImageBackground":"opaque"}'
+agent_message "$GEN_SESSION" "pref-m2" "帮我全参数生图"
+PREF_OVERRIDE=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_lastimage")
+check "显式模型覆盖偏好模型" "$(echo "$PREF_OVERRIDE" | jq -r .model)" "mock-image-pro"
+check "显式尺寸覆盖偏好尺寸" "$(echo "$PREF_OVERRIDE" | jq -r .size)" "1024x1024"
+check "显式画质覆盖偏好画质" "$(echo "$PREF_OVERRIDE" | jq -r .quality)" "high"
+check "显式背景覆盖偏好背景" "$(echo "$PREF_OVERRIDE" | jq -r .background)" "transparent"
+check "显式张数覆盖偏好张数" "$(echo "$PREF_OVERRIDE" | jq -r .n)" "2"
+
+# 偏好里的模型被管理员下线之后要静默回落到全站默认：不能报错，也不能连带把其他偏好参数丢掉。
+set_agent_prefs '{"agentImageModel":"已经下线的模型","agentImageSize":"1024x1024"}'
+agent_message "$GEN_SESSION" "pref-m3" "帮我生成图片"
+PREF_GONE=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_lastimage")
+check "偏好模型被下线后回落到全站默认" "$(echo "$PREF_GONE" | jq -r .model)" "mock-image"
+check "回落之后偏好里的其他参数照样生效" "$(echo "$PREF_GONE" | jq -r .size)" "1024x1024"
+check "偏好模型被下线也不报错" "$(last_tool_result "$GEN_SESSION" "generate_image" | jq -r .ok)" "true"
+
+# 偏好里存的模型还在、但能力被管理员改成了文本：同样只能回落，绝不能拿文本模型去生图。
+set_agent_prefs '{"agentImageModel":"mock-text"}'
+agent_message "$GEN_SESSION" "pref-m4" "帮我生成图片"
+PREF_WRONG_KIND=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_lastimage")
+check "偏好里配成文本模型时回落到全站默认" "$(echo "$PREF_WRONG_KIND" | jq -r .model)" "mock-image"
+# 这条同时钉住「拿到的是这次的请求体」：上一次偏好里带着尺寸，这次没带，尺寸就不该还在。
+check "上一次偏好的尺寸不会残留到这次请求" "$(echo "$PREF_WRONG_KIND" | jq -r '.size // "none"')" "none"
+
+# 生文默认模型同理：工具没指定模型时用偏好里的那个，计费也跟着按它的单价走。
+set_agent_prefs '{"agentTextModel":"mock-text-vision"}'
+PREF_TEXT_BEFORE=$(credits_now)
+agent_message "$GEN_SESSION" "pref-m5" "帮我按偏好写长文"
+check "偏好里的生文模型被用上" "$(last_tool_result "$GEN_SESSION" "generate_text" | jq -r .data.model)" "mock-text-vision"
+# 发消息按会话模型 mock-text 扣 1 点 + 文本任务按偏好模型 mock-text-vision 扣 2 点。
+check "文本生成按偏好模型的单价计费" "$((PREF_TEXT_BEFORE - $(credits_now)))" "3"
+# 后面几节都按「没有偏好」的口径断言，这里清干净，免得偏好串到别的用例里。
+set_agent_prefs '{}'
+
+# 会话标题：配了标题模型就用模型起名，且只在第一条用户消息时起一次。
+agent_settings "$SEARCH_EMPTY" '""' "$AGENT_CHANNELS" '"mock-text"'
+TITLE_SESSION=$(new_agent_session '{"projectId":"agent-p1","title":"新会话"}')
+curl -s -X POST "$BASE/v1/agent/sessions/$TITLE_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"title-m1","content":"在画布上加一个文本节点"}' >/dev/null
+for _ in $(seq 1 20); do
+    [ "$(agent_title "$TITLE_SESSION")" = "冒烟-在画布" ] && break
+    sleep 1
+done
+check "配了标题模型时用模型生成会话标题" "$(agent_title "$TITLE_SESSION")" "冒烟-在画布"
+wait_agent_idle "$TITLE_SESSION"
+# 标题里带着第一条消息的原话，所以第二条消息如果又生成一次，标题会变成「冒烟-再加一」。
+agent_message "$TITLE_SESSION" "title-m2" "再加一个文本节点"
+check "标题只在第一条消息时生成一次" "$(agent_title "$TITLE_SESSION")" "冒烟-在画布"
+
+# 标题模型挂掉：发消息必须照常成功，标题回落到截断，绝不能让起标题拖垮主链路。
+agent_settings "$SEARCH_EMPTY" '""' "$AGENT_CHANNELS" '"mock-title-broken"'
+BROKEN_SESSION=$(new_agent_session '{"projectId":"agent-p1","title":"新会话"}')
+check "标题模型挂掉不影响发消息" "$(curl -s -X POST "$BASE/v1/agent/sessions/$BROKEN_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"title-m3","content":"标题模型挂了也要能发消息"}' | jq -r .data.seq)" "1"
+sleep 3
+check "标题生成失败时回落到截断" "$(agent_title "$BROKEN_SESSION")" "标题模型挂了也要能发消息"
+wait_agent_idle "$BROKEN_SESSION"
+check "没配标题模型时也用截断" "$(agent_settings "$SEARCH_EMPTY" '""' && NOTITLE=$(new_agent_session '{"projectId":"agent-p1","title":"新会话"}') && agent_message "$NOTITLE" "title-m4" "没配标题模型时用截断" && agent_title "$NOTITLE")" "没配标题模型时用截断"
+
+# 轮数耗尽不再直接收工，而是暂停下来向用户申请继续。maxRounds 压到 2，冒烟里才跑得快。
+agent_settings "$SEARCH_EMPTY" '""' "$AGENT_CHANNELS" '""' 2
+curl -s -X PUT "$BASE/v1/projects/agent-rounds" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"轮数画布","data":{"nodes":[],"connections":[]}}' >/dev/null
+curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
+ROUND_SESSION=$(new_agent_session '{"projectId":"agent-rounds","title":"轮数会话"}')
+ROUND_BEFORE=$(credits_now)
+agent_message "$ROUND_SESSION" "round-m1" "你就一直干活别停"
+ROUND_VIEW=$(agent_session "$ROUND_SESSION")
+check "轮数耗尽后进入等待确认而不是直接结束" "$(echo "$ROUND_VIEW" | jq -r .data.status)" "awaiting"
+check "待确认请求的类型是续跑" "$(echo "$ROUND_VIEW" | jq -r .data.pendingAction.type)" "continue"
+check "待确认请求带上已用轮数" "$(echo "$ROUND_VIEW" | jq -r .data.pendingAction.roundsUsed)" "2"
+check "待确认请求带上继续要花的算力点" "$(echo "$ROUND_VIEW" | jq -r .data.pendingAction.credits)" "1"
+check "轮数真的按上限跑满" "$(curl -s "$BASE/v1/projects/agent-rounds" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.data.nodes | length')" "2"
+check "等待确认期间只扣了发消息那一次" "$((ROUND_BEFORE - $(credits_now)))" "1"
+check "等待确认时不能再发新消息" "$(curl -s -X POST "$BASE/v1/agent/sessions/$ROUND_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"round-m2","content":"插队"}' | jq -r .msg)" "当前会话正在等待你确认，请先处理确认请求或中止"
+
+# 批准续跑：轮数重置成上限，并且按当前模型单价再扣一次点。
+APPROVE_BEFORE=$(credits_now)
+check "批准续跑后回到执行中" "$(agent_resolve "$ROUND_SESSION" true | jq -r .data.status)" "running"
+check "批准续跑确实又扣了一次点" "$((APPROVE_BEFORE - $(credits_now)))" "1"
+wait_agent_idle "$ROUND_SESSION"
+check "续跑后轮数是重置过的" "$(agent_session "$ROUND_SESSION" | jq -r .data.pendingAction.roundsUsed)" "2"
+check "续跑真的多干了两轮活" "$(curl -s "$BASE/v1/projects/agent-rounds" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.data.nodes | length')" "4"
+
+# 拒绝：正常收尾，不再扣点，也不留下待确认状态。
+REJECT_BEFORE=$(credits_now)
+check "拒绝后本次执行正常结束" "$(agent_resolve "$ROUND_SESSION" false | jq -r .data.status)" "idle"
+check "拒绝不扣算力点" "$((REJECT_BEFORE - $(credits_now)))" "0"
+check "拒绝后清掉待确认请求" "$(agent_session "$ROUND_SESSION" | jq -r '.data.pendingAction // "none"')" "none"
+check "拒绝后留下可见的收尾消息" "$(curl -s "$BASE/v1/agent/sessions/$ROUND_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items[-1].content')" "好的，本次执行到此为止。"
+check "没有待确认请求时答复被拒绝" "$(agent_resolve "$ROUND_SESSION" true | jq -r .msg)" "当前没有待确认的请求"
+
+# 余额不足时批准续跑要明确拒绝，不能悄悄放行跑一段免费的。
+agent_message "$ROUND_SESSION" "round-m3" "你就一直干活别停"
+check "再次跑满仍然进入等待确认" "$(agent_status "$ROUND_SESSION")" "awaiting"
+curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":0}' >/dev/null
+check "余额不足时批准续跑被明确拒绝" "$(agent_resolve "$ROUND_SESSION" true | jq -r .msg)" "算力点不足"
+check "被拒绝后仍停在等待确认" "$(agent_status "$ROUND_SESSION")" "awaiting"
+curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
+curl -s -X POST "$BASE/v1/agent/sessions/$ROUND_SESSION/abort" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
+check "等待确认时中止可用" "$(agent_status "$ROUND_SESSION")" "idle"
+check "中止后待确认请求被清掉" "$(agent_session "$ROUND_SESSION" | jq -r '.data.pendingAction // "none"')" "none"
+
+# 画布标题：还是系统默认标题时允许主动改一次，之后一律要确认。
+agent_settings "$SEARCH_EMPTY" '""'
+curl -s -X PUT "$BASE/v1/projects/agent-title" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"无限画布 3","data":{"nodes":[],"connections":[]}}' >/dev/null
+TITLE_CANVAS=$(new_agent_session '{"projectId":"agent-title","title":"标题会话"}')
+agent_message "$TITLE_CANVAS" "ct-m1" "帮我改画布标题"
+check "默认标题下主动改名立刻生效" "$(curl -s "$BASE/v1/projects/agent-title" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.title)" "猫咪画册"
+check "主动改名不需要用户确认" "$(agent_status "$TITLE_CANVAS")" "idle"
+agent_message "$TITLE_CANVAS" "ct-m2" "帮我再改一次标题"
+CT_VIEW=$(agent_session "$TITLE_CANVAS")
+check "第二次改名必须用户确认" "$(echo "$CT_VIEW" | jq -r .data.status)" "awaiting"
+check "待确认请求的类型是改标题" "$(echo "$CT_VIEW" | jq -r .data.pendingAction.type)" "rename_canvas"
+check "待确认请求带上新标题" "$(echo "$CT_VIEW" | jq -r .data.pendingAction.title)" "猫咪画册二版"
+check "待确认请求带上改名理由" "$(echo "$CT_VIEW" | jq -r .data.pendingAction.reason)" "用户又加了新内容"
+check "等待确认期间画布标题没有被改掉" "$(curl -s "$BASE/v1/projects/agent-title" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.title)" "猫咪画册"
+# 刷新或换设备后靠 SSE 首帧就能把待确认请求原样恢复出来。
+curl -s -N --max-time 2 "$BASE/v1/agent/sessions/$TITLE_CANVAS/stream?sinceSeq=0" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/pending-sse.txt"
+check "SSE 重连能拿回待确认请求" "$(grep '^data: ' "$WORK/pending-sse.txt" | sed 's/^data: //' | jq -rs '[.[] | select(.type=="status") | .pendingAction.type] | last // ""')" "rename_canvas"
+check "批准改名后回到执行中" "$(agent_resolve "$TITLE_CANVAS" true | jq -r .data.status)" "running"
+wait_agent_idle "$TITLE_CANVAS"
+check "批准后画布标题才真的改掉" "$(curl -s "$BASE/v1/projects/agent-title" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.title)" "猫咪画册二版"
+
+# 「无限画布精选」只是前缀像默认标题，用户自己起的名字一样不能被擅自改掉。
+curl -s -X PUT "$BASE/v1/projects/agent-title2" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"无限画布精选","data":{"nodes":[],"connections":[]}}' >/dev/null
+TITLE_CANVAS2=$(new_agent_session '{"projectId":"agent-title2","title":"标题会话2"}')
+agent_message "$TITLE_CANVAS2" "ct-m3" "帮我改画布标题"
+check "非默认标题第一次改名就要确认" "$(agent_status "$TITLE_CANVAS2")" "awaiting"
+check "拒绝改名后正常收尾" "$(agent_resolve "$TITLE_CANVAS2" false | jq -r .data.status)" "idle"
+check "拒绝后画布标题原样保留" "$(curl -s "$BASE/v1/projects/agent-title2" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.title)" "无限画布精选"
+
 curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m4","content":"再加一个文本节点"}' >/dev/null
 check "执行中不允许并发发消息" "$(curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m5","content":"插队"}' | jq -r .msg)" "当前会话正在执行中，请等待完成或先中止"
 curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/abort" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
@@ -903,7 +1126,6 @@ check "删除后拉消息被拒绝" "$(curl -s "$BASE/v1/agent/sessions/$SESSION
 
 echo "文本任务"
 # 文本生成和生图走同一套任务队列：服务端边收上游流边落库，前端断开也不影响任务继续跑完。
-TEXT_FULL="无限画布把生成任务放在服务端，刷新页面也不会丢，内容会接着写完。"
 # 任务事件流是一条连接推当前用户所有任务的状态与文本增量，下面三个函数从抓下来的流里取某个任务的内容、终态和游标。
 stream_text() { grep '^data: ' "$1" | sed 's/^data: //' | jq -rs --arg id "$2" '[.[] | select(.type=="text" and .id==$id) | .text] | add // ""'; }
 stream_status() { grep '^data: ' "$1" | sed 's/^data: //' | jq -rs --arg id "$2" '[.[] | select(.type=="job" and .job.id==$id) | .job.status] | last // ""'; }
@@ -977,7 +1199,8 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 check "Gemini 格式的文本流也能跑通" "$(text_job "$GEMINI_TEXT_JOB" | jq -r .data.text)" "$TEXT_FULL"
-check "文本任务也能被后台按类型筛出来" "$(curl -s "$BASE/admin/jobs?kind=text" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "4"
+# 这里数的是全库文本任务：本节建的 4 条，加上 agent 那一节的两条（工具指定模型的那条、按用户偏好模型的那条）。
+check "文本任务也能被后台按类型筛出来" "$(curl -s "$BASE/admin/jobs?kind=text" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "6"
 
 echo "任务事件流"
 # 生成任务的进度不再靠轮询：一条 SSE 连接订阅当前用户的所有任务。
@@ -1017,6 +1240,25 @@ job_stream "$WORK/stream-other.txt" 3 1 "$ADMIN_TOKEN"
 check "换个账号订阅不到别人的任务" "$(grep -c "$CATCH_JOB" "$WORK/stream-other.txt")" "0"
 check "换个账号的流也拿不到别人的文本" "$(stream_text "$WORK/stream-other.txt" "$CATCH_JOB")" ""
 check "换个账号的流里没有任何别人的任务快照" "$(grep '^data: ' "$WORK/stream-other.txt" | sed 's/^data: //' | jq -rs '[.[] | select(.type=="job")] | length')" "0"
+
+echo "服务重启"
+# 重启会把内存里的推理循环全丢掉。running 会话早就有兜底，awaiting 也必须一起收尾：
+# 那条待确认请求属于上一次执行，留着只会变成一个点了也没人接的确认框。
+agent_settings "$SEARCH_EMPTY" '""' "$AGENT_CHANNELS" '""' 2
+curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
+RESTART_SESSION=$(new_agent_session '{"projectId":"agent-rounds","title":"重启会话"}')
+agent_message "$RESTART_SESSION" "restart-m1" "你就一直干活别停"
+check "重启前会话停在等待确认" "$(agent_status "$RESTART_SESSION")" "awaiting"
+
+kill "$SERVER_PID" 2>/dev/null
+wait "$SERVER_PID" 2>/dev/null
+start_server
+check "服务重启后恢复可用" "$(curl -s "$BASE/health" | jq -r .data)" "ok"
+RESTARTED=$(agent_session "$RESTART_SESSION")
+check "重启后 awaiting 会话不再挂着" "$(echo "$RESTARTED" | jq -r .data.status)" "failed"
+check "重启后待确认请求已被清掉" "$(echo "$RESTARTED" | jq -r '.data.pendingAction // "none"')" "none"
+check "重启后给出可读的中文原因" "$(echo "$RESTARTED" | jq -r .data.error)" "服务已重启，待确认的请求已失效，请重新发送消息"
+check "重启后不能再答复这个请求" "$(agent_resolve "$RESTART_SESSION" true | jq -r .msg)" "当前没有待确认的请求"
 
 echo
 printf '通过 %d 项，失败 %d 项\n' "$PASS" "$FAIL"

@@ -1,11 +1,12 @@
 import { config } from "../config";
-import type { Job, JobKind, StoredFile } from "../db/entities";
+import type { AgentPendingAction, Job, JobKind, StoredFile } from "../db/entities";
 import { fail, newId } from "../lib/errors";
 import { imageTypeOf, listFiles, publicFileUrl, saveFile } from "./files";
 import type { GenerationParams } from "./generation";
 import { createJob, getJob, toJobView } from "./jobs";
+import type { AgentGenerationPreference } from "./preferences";
 import { safeWebUrl, webFetch, webSearch } from "./search";
-import { publicSettings } from "./settings";
+import { publicSettings, type ModelCapability, type PublicSetting } from "./settings";
 import { readProjectCanvas, renameProjectCanvas, updateProjectCanvas, type CanvasNodeData, type CanvasProjectData } from "./sync";
 
 /** 工具描述用 JSON Schema 表达，OpenAI 与 Gemini 两种格式都能直接套用，不用各写一份。 */
@@ -15,9 +16,16 @@ export type AgentTool = { name: string; description: string; parameters: { type:
  * 工具门禁。前端不显示只是省得用户困惑，真正拦住的是这里：
  * 下发工具列表和执行工具都要过同一份开关，模型硬编一个工具名调过来也会被挡下。
  */
-export type AgentToolAccess = { search: boolean; image: boolean; video: boolean; audio: boolean; vision: boolean };
+export type AgentToolAccess = { search: boolean; image: boolean; video: boolean; audio: boolean; text: boolean; vision: boolean };
 
-export type ToolContext = { userId: string; projectId: string; sessionId: string; seq: number; access: AgentToolAccess; signal: AbortSignal };
+/**
+ * 一次执行里工具与推理循环共享的可变状态。
+ * 工具只往里写，落库、暂停、恢复统一由推理循环做：
+ * 工具自己去改会话行的话，「请求确认」这件事就会散落在每个工具里各写一遍。
+ */
+export type ToolState = { autoRenamed: boolean; action?: AgentPendingAction };
+
+export type ToolContext = { userId: string; projectId: string; sessionId: string; seq: number; access: AgentToolAccess; prefs: AgentGenerationPreference; state: ToolState; signal: AbortSignal };
 
 /** 与 web/src/constant/canvas.ts 的 NODE_SPECS 保持一致，agent 建的节点才不会在前端显示成畸形尺寸或缺默认元数据。 */
 const NODE_SPECS: Record<string, { width: number; height: number; title: string; metadata: Record<string, unknown> }> = {
@@ -63,9 +71,27 @@ const IMPORT_IMAGE_MIME: Record<string, string> = { png: "image/png", jpg: "imag
 /** 画布里的图片引用统一是 server:<fileId>，工具参数也用同一套写法，模型不用去猜内部 ID。 */
 const STORAGE_PREFIX = "server:";
 
+/** 画布标题落库前的截断长度，标题栏再长也放不下。 */
+const MAX_CANVAS_TITLE_CHARS = 60;
+
+/**
+ * 前端新建画布时用的两种默认标题：`无限画布 N`（画布列表页新建时按序号生成）与 `未命名画布`（store 兜底）。
+ * 只有严格精确匹配这两种格式才算「用户还没起过名字」——用户自己把画布命名成「无限画布 3」时，
+ * 那就是他要的名字，不该被模型擅自改掉，所以这里不做包含匹配、不做前缀匹配。
+ */
+const DEFAULT_CANVAS_TITLE = /^(?:无限画布 \d+|未命名画布)$/;
+
 const string = (description: string) => ({ type: "string", description });
 const number = (description: string) => ({ type: "number", description });
+const boolean = (description: string) => ({ type: "boolean", description });
 const stringList = (description: string) => ({ type: "array", description, items: { type: "string" } });
+
+/**
+ * 生成类工具的模型参数说明。四个工具共用一句，既省描述长度，也保证四处口径一致。
+ * 校验放在服务端而不是靠这句话：模型完全可能拿文本模型来生图。
+ * 「默认」是用户偏好里配的那个，没配过才是全站默认，所以这里不写死成「系统默认」。
+ */
+const modelParam = (kind: string) => string(`指定${kind}模型，留空用默认设置；填了不存在或能力不匹配的模型会自动回落到默认，不会报错`);
 
 export function listAgentTools(access: AgentToolAccess): AgentTool[] {
     const tools: AgentTool[] = [
@@ -133,7 +159,13 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
             description: "断开两个节点之间的连线。",
             parameters: { type: "object", properties: { fromNodeId: string("起点节点 ID"), toNodeId: string("终点节点 ID") }, required: ["fromNodeId", "toNodeId"] },
         },
-        { name: "rename_canvas", description: "重命名当前画布。", parameters: { type: "object", properties: { title: string("新的画布标题") }, required: ["title"] } },
+        {
+            name: "rename_canvas",
+            description:
+                "重命名当前画布。画布还是系统默认标题（「无限画布 N」或「未命名画布」）时，可以在弄清用户意图后主动改一次，立刻生效；" +
+                "其余情况会先向用户发出确认请求，等他同意后才会真的改，所以 reason 要写清楚为什么值得改。",
+            parameters: { type: "object", properties: { title: string("新的画布标题"), reason: string("改名理由，会原样展示给用户确认") }, required: ["title"] },
+        },
     ];
     if (access.image) {
         tools.push({
@@ -144,8 +176,11 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
                 properties: {
                     prompt: string("生图提示词，尽量具体"),
                     referenceStorageKeys: stringList("参考图的 storageKey 列表（形如 server:xxx），可以是用户上传的附件或画布上已有的图片"),
+                    model: modelParam("生图"),
                     count: number("生成张数，默认 1"),
                     size: string("尺寸或比例，例如 1024x1024、16:9"),
+                    quality: string("画质档位，例如 low、medium、high；档位越高越贵"),
+                    background: string("背景，例如 transparent 透明、opaque 不透明"),
                     x: number("图片节点左上角横坐标"),
                     y: number("图片节点左上角纵坐标"),
                 },
@@ -162,9 +197,12 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
                 properties: {
                     prompt: string("视频提示词，尽量具体"),
                     referenceStorageKeys: stringList("参考图的 storageKey 列表（形如 server:xxx）"),
+                    model: modelParam("视频"),
                     seconds: string("时长秒数，例如 5"),
                     ratio: string("画面比例，例如 16:9"),
                     resolution: string("分辨率档位，例如 720p"),
+                    generateAudio: boolean("是否同时生成配音，默认生成"),
+                    watermark: boolean("是否打水印，默认不打"),
                     x: number("视频节点左上角横坐标"),
                     y: number("视频节点左上角纵坐标"),
                 },
@@ -180,11 +218,34 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
                 type: "object",
                 properties: {
                     prompt: string("要朗读的文字内容"),
+                    model: modelParam("音频"),
                     voice: string("音色名，例如 alloy"),
                     format: string("音频格式，例如 mp3"),
                     speed: number("语速倍率，1 为正常"),
+                    instructions: string("朗读方式说明，例如语气、情绪、口音"),
                     x: number("音频节点左上角横坐标"),
                     y: number("音频节点左上角纵坐标"),
+                },
+                required: ["prompt"],
+            },
+        });
+    }
+    if (access.text) {
+        tools.push({
+            name: "generate_text",
+            description:
+                "让文本模型写一段内容，并把结果建成画布上的文本节点。会消耗算力点，长文可能要等十几秒到一分钟。" +
+                "默认自己写：短文案、标题、清单、表格、总结，以及你已经想清楚该写什么的内容，直接用 create_node 写进去更快，也不用额外花钱。" +
+                "只有这三种情况才调这个工具：需要成篇的长文（例如整篇文章、故事、报告）；需要特定文风或专业深度而你自己写不到位；用户明确要求换某个模型来写。",
+            parameters: {
+                type: "object",
+                properties: {
+                    prompt: string("要写什么，把体裁、篇幅、风格、受众都写清楚，模型看不到当前对话"),
+                    model: modelParam("文本"),
+                    reasoningEffort: string("推理强度，例如 low、medium、high；需要深度思考时才填"),
+                    title: string("文本节点标题，留空用默认名"),
+                    x: number("文本节点左上角横坐标"),
+                    y: number("文本节点左上角纵坐标"),
                 },
                 required: ["prompt"],
             },
@@ -239,6 +300,15 @@ function text(args: Record<string, unknown>, key: string) {
 function num(args: Record<string, unknown>, key: string) {
     const value = Number(args[key]);
     return Number.isFinite(value) ? value : undefined;
+}
+
+/** 布尔参数要容忍模型传字符串 "true"/"false"，各家模型对 boolean 的序列化并不一致。 */
+function bool(args: Record<string, unknown>, key: string) {
+    const value = args[key];
+    if (typeof value === "boolean") return value;
+    if (value === "true") return true;
+    if (value === "false") return false;
+    return undefined;
 }
 
 /** 数组参数要容忍模型只传一个字符串的写法，否则一个格式抖动就整条工具调用失败。 */
@@ -355,9 +425,24 @@ async function runGenerationJob(ctx: ToolContext, kind: JobKind, model: string, 
     if (job.status === "failed" || job.status === "canceled") throw fail(job.error || "生成失败");
     if (job.status !== "succeeded") throw fail("生成超时，请稍后在画布上查看任务结果");
 
-    const outputs = (await toJobView(job)).outputs;
-    if (!outputs.length) throw fail("生成没有返回结果");
-    return { job, outputs };
+    const view = await toJobView(job);
+    // 文本任务的产出是 text 而不是文件，两者只会有一边有内容。
+    if (kind !== "text" && !view.outputs.length) throw fail("生成没有返回结果");
+    return { job, outputs: view.outputs, text: view.text };
+}
+
+/**
+ * 定这次生成用哪个模型。候选按「模型显式传的 → 用户偏好里配的 → 全站默认」的顺序给，
+ * 前面的候选必须是「已启用渠道里 capability 对得上」的才作数：
+ * 放行一个文本模型去生图，上游只会回一串看不懂的错，还会绕开按模型单价计费的口径。
+ * 不匹配时静默往下一层落而不是报错——不管是模型挑错了名字，还是用户偏好里的模型被管理员下线、改了能力，
+ * 换个能用的把活干完，都比中断整轮执行、让用户看见一条工具报错有用得多。
+ * 最后一个候选是全站默认，直接兜底不再校验：它由管理员保证，这里多挡一道只会把「管理员配错」变成更难查的静默失败。
+ */
+function resolveGenerationModel(settings: PublicSetting, capability: ModelCapability, ...candidates: string[]) {
+    const fallback = candidates.pop() || "";
+    const usable = candidates.map((item) => item.trim()).find((name) => name && settings.modelChannel.models.some((model) => model.name === name && model.capability === capability));
+    return usable || fallback;
 }
 
 /** 生成结果落到节点上的公共元数据，和前端生成完写回节点的字段保持一致。 */
@@ -382,17 +467,28 @@ async function generateImage(ctx: ToolContext, args: Record<string, unknown>) {
     const prompt = text(args, "prompt");
     if (!prompt) throw fail("缺少生图提示词");
     const settings = await publicSettings();
-    const model = settings.modelChannel.defaultImageModel;
+    const model = resolveGenerationModel(settings, "image", text(args, "model"), ctx.prefs.imageModel, settings.modelChannel.defaultImageModel);
     if (!model) throw fail("系统未配置生图模型");
 
-    const count = Math.max(1, Math.min(4, num(args, "count") || 1));
+    // 规格逐项回落：模型传了就按它的，没传就按用户偏好补齐，两边都没有才让上游用自己的默认。
+    // 逐项而不是整组回落，是因为模型往往只想得起其中一两项（例如只指定了尺寸），
+    // 整组切换的话，它一传尺寸就会把用户配好的画质、背景一起丢掉。
+    const count = Math.max(1, Math.min(4, num(args, "count") || ctx.prefs.imageCount || 1));
+    const size = text(args, "size") || ctx.prefs.imageSize;
+    const quality = text(args, "quality") || ctx.prefs.imageQuality;
+    const background = text(args, "background") || ctx.prefs.imageBackground;
     const references = await resolveFiles(ctx.userId, list(args, "referenceStorageKeys"));
     const { job, outputs } = await runGenerationJob(
         ctx,
         "image",
         model,
         prompt,
-        { count, ...(text(args, "size") ? { size: text(args, "size") } : {}) },
+        {
+            count,
+            ...(size ? { size } : {}),
+            ...(quality ? { quality } : {}),
+            ...(background ? { background } : {}),
+        },
         references.map((file) => file.id),
     );
 
@@ -412,7 +508,7 @@ async function generateVideo(ctx: ToolContext, args: Record<string, unknown>) {
     const prompt = text(args, "prompt");
     if (!prompt) throw fail("缺少视频提示词");
     const settings = await publicSettings();
-    const model = settings.modelChannel.defaultVideoModel;
+    const model = resolveGenerationModel(settings, "video", text(args, "model"), settings.modelChannel.defaultVideoModel);
     if (!model) throw fail("系统未配置视频模型");
 
     const references = await resolveFiles(ctx.userId, list(args, "referenceStorageKeys"));
@@ -425,6 +521,8 @@ async function generateVideo(ctx: ToolContext, args: Record<string, unknown>) {
             ...(text(args, "seconds") ? { seconds: text(args, "seconds") } : {}),
             ...(text(args, "ratio") ? { ratio: text(args, "ratio") } : {}),
             ...(text(args, "resolution") ? { resolution: text(args, "resolution") } : {}),
+            ...(bool(args, "generateAudio") === undefined ? {} : { generateAudio: bool(args, "generateAudio") }),
+            ...(bool(args, "watermark") === undefined ? {} : { watermark: bool(args, "watermark") }),
         },
         references.map((file) => file.id),
     );
@@ -440,19 +538,61 @@ async function generateAudio(ctx: ToolContext, args: Record<string, unknown>) {
     const prompt = text(args, "prompt");
     if (!prompt) throw fail("缺少要朗读的文字");
     const settings = await publicSettings();
-    const model = settings.modelChannel.defaultAudioModel;
+    const model = resolveGenerationModel(settings, "audio", text(args, "model"), settings.modelChannel.defaultAudioModel);
     if (!model) throw fail("系统未配置音频模型");
 
     const { job, outputs } = await runGenerationJob(ctx, "audio", model, prompt, {
         ...(text(args, "voice") ? { voice: text(args, "voice") } : {}),
         ...(text(args, "format") ? { format: text(args, "format") } : {}),
         ...(num(args, "speed") ? { speed: num(args, "speed") } : {}),
+        ...(text(args, "instructions") ? { instructions: text(args, "instructions") } : {}),
     }, []);
 
     return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
         const node = appendNode(data, "audio", args, outputMetadata(outputs[0], prompt, model));
         return { jobId: job.id, model, credits: job.credits, node: nodeSummary(node) };
     });
+}
+
+/**
+ * 让文本模型写一段内容再建成文本节点。走的是 jobs 里已有的 text 任务：
+ * 计费、幂等、流式落库、后台重启续跑都跟着那一套走，这里不重新实现一遍。
+ * 产出是 job.text 而不是文件，所以不能套 outputMetadata。
+ */
+async function generateTextNode(ctx: ToolContext, args: Record<string, unknown>) {
+    if (!ctx.access.text) throw fail("文本生成当前未开放");
+    const prompt = text(args, "prompt");
+    if (!prompt) throw fail("缺少文本生成提示词");
+    const settings = await publicSettings();
+    const model = resolveGenerationModel(settings, "text", text(args, "model"), ctx.prefs.textModel, settings.modelChannel.defaultTextModel);
+    if (!model) throw fail("系统未配置文本模型");
+
+    const { job, text: content } = await runGenerationJob(ctx, "text", model, prompt, { ...(text(args, "reasoningEffort") ? { reasoningEffort: text(args, "reasoningEffort") } : {}) }, []);
+    if (!content.trim()) throw fail("文本生成没有返回内容");
+
+    return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+        const node = appendNode(data, "text", args, { content, status: "success", prompt, model });
+        return { jobId: job.id, model, credits: job.credits, chars: content.length, node: nodeSummary(node) };
+    });
+}
+
+/**
+ * 改画布标题。画布还是系统默认标题、且这次会话还没主动改过时直接改，不打扰用户；
+ * 其余情况一律变成一条待确认请求交给用户点头——标题是用户自己的东西，模型不该替他改掉已经起好的名字。
+ * 「只能主动改一次」靠会话上的标记落库，不靠模型自觉：不落库的话它每一轮都可能重新起念再改一次。
+ */
+async function renameCanvas(ctx: ToolContext, args: Record<string, unknown>) {
+    const title = text(args, "title").slice(0, MAX_CANVAS_TITLE_CHARS);
+    if (!title) throw fail("画布标题不能为空");
+    const project = await readProjectCanvas(ctx.userId, ctx.projectId);
+    if (project.title === title) return { title, changed: false, note: "画布已经是这个标题了" };
+
+    if (DEFAULT_CANVAS_TITLE.test(project.title) && !ctx.state.autoRenamed) {
+        ctx.state.autoRenamed = true;
+        return { ...(await renameProjectCanvas(ctx.userId, ctx.projectId, title)), changed: true, note: "画布原来是默认标题，已直接改名；之后再要改标题都需要用户确认" };
+    }
+    ctx.state.action = { type: "rename_canvas", title, reason: text(args, "reason") };
+    return { title, changed: false, pending: true, note: "已请求用户确认这次改名，等他同意后才会生效；不要重复请求" };
 }
 
 /**
@@ -673,15 +813,12 @@ export async function runAgentTool(ctx: ToolContext, name: string, args: Record<
         });
     }
 
-    if (name === "rename_canvas") {
-        const title = text(args, "title");
-        if (!title) throw fail("画布标题不能为空");
-        return renameProjectCanvas(ctx.userId, ctx.projectId, title.slice(0, 60));
-    }
+    if (name === "rename_canvas") return renameCanvas(ctx, args);
 
     if (name === "generate_image") return generateImage(ctx, args);
     if (name === "generate_video") return generateVideo(ctx, args);
     if (name === "generate_audio") return generateAudio(ctx, args);
+    if (name === "generate_text") return generateTextNode(ctx, args);
     if (name === "view_image") return viewImage(ctx, args);
 
     if (name === "web_search") {

@@ -2,7 +2,7 @@ import { Router } from "express";
 
 import { handle, ok } from "../lib/response";
 import { requireUser, userAuth } from "../middleware/auth";
-import { abortAgentSession, createAgentSession, deleteAgentSession, getAgentSession, listAgentMessages, listAgentSessions, sendAgentMessage, subscribeAgentSession, type AgentEvent } from "../services/agent";
+import { abortAgentSession, createAgentSession, deleteAgentSession, getAgentSession, listAgentMessages, listAgentSessions, resolveAgentSession, sendAgentMessage, subscribeAgentSession, type AgentEvent } from "../services/agent";
 
 export const agentRouter = Router();
 
@@ -61,6 +61,13 @@ agentRouter.post(
 
 agentRouter.post("/v1/agent/sessions/:id/abort", userAuth, handle(async (req, res) => ok(res, await abortAgentSession(requireUser(req).id, String(req.params.id)))));
 
+/** 答复服务端发出的待确认请求（续跑、改画布标题）。批准就接着执行，拒绝就正常结束本次。 */
+agentRouter.post(
+    "/v1/agent/sessions/:id/resolve",
+    userAuth,
+    handle(async (req, res) => ok(res, await resolveAgentSession(requireUser(req).id, String(req.params.id), (req.body || {}).approved === true))),
+);
+
 /**
  * SSE 实时订阅。断开只是取消监听，服务端的推理循环照常跑完并落库，
  * 前端重连时先按 sinceSeq 补齐历史增量，再挂上流继续收。
@@ -80,7 +87,8 @@ agentRouter.get(
 
         // 先补齐订阅建立之前产生的增量，再收实时事件，中间不会漏消息。
         for (const message of await listAgentMessages(userId, sessionId, sinceSeq)) send({ type: "message", message });
-        send({ type: "status", status: session.status, error: session.error });
+        // 首帧带上当前标题与待确认请求：刷新或换设备重连时，靠这一帧就能把「正在等你确认」原样恢复出来。
+        send({ type: "status", status: session.status, error: session.error, title: session.title, pendingAction: session.pendingAction });
 
         const unsubscribe = subscribeAgentSession(userId, sessionId, send);
         // 反向代理常见的空闲超时是 60s，定期发注释帧保活。

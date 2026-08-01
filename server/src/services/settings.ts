@@ -76,10 +76,12 @@ export type PublicSetting = {
     capabilities: Record<ModelCapability, boolean>;
     /**
      * 画布 Agent。model 留空表示用 defaultTextModel；
+     * titleModel 是专门用来生成会话标题的模型，和 model 分开配：标题只有十来个字，
+     * 用主模型跑一次纯属浪费，留空则回落到「截断用户第一句话」，不影响发消息。
      * searchEnabled 由「开关 + 至少有一条可用的搜索服务」推导，前端据此决定要不要展示联网搜索能力，
      * 没有可用服务时后端也不会把 web_search、read_webpage 工具下发给模型。
      */
-    agent: { enabled: boolean; model: string; maxRounds: number; searchEnabled: boolean };
+    agent: { enabled: boolean; model: string; titleModel: string; maxRounds: number; searchEnabled: boolean };
 };
 
 export type PrivateSetting = {
@@ -218,6 +220,8 @@ function normalizePublic(setting: Partial<PublicSetting> | undefined, privateSet
             enabled: setting?.agent?.enabled !== false,
             // 只认 text 能力的模型，否则会把生图模型误当成 agent 主模型。
             model: models.some((model) => model.name === setting?.agent?.model && model.capability === "text") ? String(setting?.agent?.model).trim() : "",
+            // 标题模型同样只认 text；配了个已下线的模型时留空回落到截断，而不是让每次发消息都去撞一个不存在的渠道。
+            titleModel: models.some((model) => model.name === setting?.agent?.titleModel && model.capability === "text") ? String(setting?.agent?.titleModel).trim() : "",
             maxRounds: Math.min(50, Math.max(1, Number(setting?.agent?.maxRounds) || 25)),
             searchEnabled: privateSetting.search.enabled && privateSetting.search.services.some((service) => service.enabled && service.apiKey.trim()),
         },

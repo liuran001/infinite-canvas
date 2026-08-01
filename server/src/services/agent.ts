@@ -2,22 +2,36 @@ import { EventEmitter } from "node:events";
 import { MoreThan } from "typeorm";
 
 import { repo } from "../db/data-source";
-import { AgentMessage, AgentSession, type AgentMessageRole, type AgentSessionStatus } from "../db/entities";
+import { AgentMessage, AgentSession, type AgentMessageRole, type AgentPendingAction, type AgentSessionStatus } from "../db/entities";
 import { fail, newId, now, SafeError } from "../lib/errors";
 import { upstreamJson } from "../lib/upstream";
-import { fileIdOfStorageKey, listAgentTools, runAgentTool, storageKeyOf, type AgentTool, type AgentToolAccess } from "./agent-tools";
+import { fileIdOfStorageKey, listAgentTools, runAgentTool, storageKeyOf, type AgentTool, type AgentToolAccess, type ToolState } from "./agent-tools";
 import { consumeUserCredits, refundUserCredits } from "./auth";
 import { listFiles } from "./files";
 import { fileToBase64 } from "./generation";
+import { getAgentGenerationPreference } from "./preferences";
 import { searchConfig } from "./search";
 import { buildChannelUrl, modelCost, modelSupportsVision, publicSettings, selectModelChannel, type ModelChannel, type PublicSetting } from "./settings";
-import { readProjectCanvas } from "./sync";
+import { readProjectCanvas, renameProjectCanvas } from "./sync";
 
 /** 用户从画布拖进面板的节点引用。只带 ID / 类型 / 标题，内容让模型自己按需去取。 */
 export type AgentMessageReference = { nodeId: string; type: string; title: string; storageKey?: string };
-export type AgentSessionView = { id: string; projectId: string; title: string; status: AgentSessionStatus; model: string; error: string; lastSeq: number; createdAt: string; updatedAt: string };
+export type AgentSessionView = {
+    id: string;
+    projectId: string;
+    title: string;
+    status: AgentSessionStatus;
+    model: string;
+    error: string;
+    /** 待用户确认的请求，没有时为 null。前端据此弹确认框，刷新或换设备后照样能拿到同一个请求。 */
+    pendingAction: AgentPendingAction | null;
+    lastSeq: number;
+    createdAt: string;
+    updatedAt: string;
+};
 export type AgentMessageView = { seq: number; role: AgentMessageRole; content: string; toolName: string; toolArgs: string; toolResult: string; attachments: string[]; references: AgentMessageReference[]; createdAt: string };
-export type AgentEvent = { type: "message"; message: AgentMessageView } | { type: "status"; status: AgentSessionStatus; error: string };
+/** status 事件顺带把标题与待确认请求一起推出去：这两样都会在执行过程中变，而前端不该为它们再轮询一次会话。 */
+export type AgentEvent = { type: "message"; message: AgentMessageView } | { type: "status"; status: AgentSessionStatus; error: string; title: string; pendingAction: AgentPendingAction | null };
 
 type ToolCall = { name: string; args: Record<string, unknown> };
 type ModelReply = { content: string; toolCalls: ToolCall[] };
@@ -35,6 +49,13 @@ const MAX_REFERENCES = 10;
  * 所以只保留最近看过 / 最近上传的这几张，更早的图退化成纯文字记录。
  */
 const MAX_CONTEXT_IMAGES = 6;
+/**
+ * 会话标题的字数上限。标题只用来在会话列表里认出这是哪一次对话，列表宽度就那么点，
+ * 再长也会被省略号截掉；给模型一个明确的短上限，它才不会写成一句完整的话。
+ */
+const MAX_TITLE_CHARS = 16;
+/** 生成标题的超时。它只是个锦上添花的东西，卡住就该放手用截断兜底，不能拖着发消息这条主链路。 */
+const TITLE_TIMEOUT_MS = 20000;
 
 /**
  * 推理循环跑在服务端后台，不依赖前端连接：SSE 断了这里照样跑完并落库。
@@ -49,7 +70,18 @@ const messages = () => repo(AgentMessage);
 const busKey = (userId: string, sessionId: string) => `${userId}:${sessionId}`;
 
 function toSessionView(row: AgentSession): AgentSessionView {
-    return { id: row.sessionId, projectId: row.projectId, title: row.title, status: row.status, model: row.model, error: row.error || "", lastSeq: row.lastSeq, createdAt: row.createdAt, updatedAt: row.updatedAt };
+    return {
+        id: row.sessionId,
+        projectId: row.projectId,
+        title: row.title,
+        status: row.status,
+        model: row.model,
+        error: row.error || "",
+        pendingAction: row.pendingAction || null,
+        lastSeq: row.lastSeq,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+    };
 }
 
 function toMessageView(row: AgentMessage): AgentMessageView {
@@ -82,7 +114,10 @@ async function patchSession(session: AgentSession, patch: Partial<AgentSession>)
     Object.assign(session, patch, { updatedAt: now() });
     // 用 update 而不是 save：循环还在跑时会话可能已被删除，整行覆写会把软删除标记又抹回去。
     await sessions().update({ userId: session.userId, sessionId: session.sessionId }, { ...patch, updatedAt: session.updatedAt });
-    if (patch.status) bus.emit(busKey(session.userId, session.sessionId), { type: "status", status: session.status, error: session.error || "" } satisfies AgentEvent);
+    // 状态、标题、待确认请求都是前端要立刻看到的，任意一样变了就推一次；轮数这类内部计数不推。
+    if (patch.status || patch.title !== undefined || patch.pendingAction !== undefined) {
+        bus.emit(busKey(session.userId, session.sessionId), { type: "status", status: session.status, error: session.error || "", title: session.title, pendingAction: session.pendingAction || null } satisfies AgentEvent);
+    }
     return session;
 }
 
@@ -154,6 +189,9 @@ export async function createAgentSession(userId: string, input: { sessionId: str
         status: "idle",
         model,
         error: "",
+        pendingAction: null,
+        rounds: 0,
+        autoRenamed: false,
         lastSeq: 0,
         deleted: false,
         createdAt: saved?.createdAt || now(),
@@ -180,13 +218,21 @@ export async function listAgentMessages(userId: string, sessionId: string, since
     return rows.map(toMessageView);
 }
 
+/**
+ * 中止。running 时靠内存里的信号打断循环，awaiting 时循环早就退出了、内存里没有东西可打断，
+ * 只能直接把待确认请求清掉收尾——不处理的话这个会话会一直卡在等确认，中止按钮等于没用。
+ */
 export async function abortAgentSession(userId: string, sessionId: string) {
     const session = await loadSession(userId, sessionId);
     running.get(busKey(userId, sessionId))?.abort();
+    if (session.status === "awaiting") {
+        await appendMessage(session, "assistant", { content: "已中止本次执行。" });
+        await patchSession(session, { status: "idle", error: "", pendingAction: null });
+    }
     return toSessionView(session);
 }
 
-function systemPrompt(projectId: string, extra: string, access: AgentToolAccess) {
+function systemPrompt(projectId: string, extra: string, access: AgentToolAccess, remainingRounds: number, maxRounds: number) {
     const base = [
         "你是无限画布应用里的画布助手，可以直接读写用户当前打开的画布。",
         `当前画布项目 ID 是 ${projectId}。`,
@@ -197,6 +243,8 @@ function systemPrompt(projectId: string, extra: string, access: AgentToolAccess)
         // 拖进来的引用只有 ID：明确告诉模型要自己去取内容，否则它会以为自己已经看过了。
         "引用只是在指认对象，不带任何节点内容，也不代表你已经看过它；需要内容就自己去 read_canvas，需要看图再调用看图工具。",
         ...(access.vision ? ["read_canvas 只返回结构不返回图片，确实需要看图时才调用 view_image；图片会占用后续每一轮的上下文，不要无差别地把所有图都看一遍。"] : []),
+        // 轮数是硬预算，模型看得见才能规划：只剩两三轮时该先把最要紧的做完，而不是开一个做不完的新任务。
+        `本次执行最多 ${maxRounds} 轮，含这一轮还剩 ${remainingRounds} 轮。轮数用完会暂停下来向用户申请继续（要再花一次算力点），所以请按剩余轮数安排：先做最要紧的事，快用完时先收尾并说明进度，不要开一个明显做不完的新任务。`,
         "一次只做用户要求的事，做完用中文简要说明改了什么。",
         "工具调用失败时把失败原因如实转述给用户，不要假装成功。",
     ].join("\n");
@@ -393,30 +441,43 @@ async function toolAccess(settings: PublicSetting, model: string): Promise<Agent
         image: settings.capabilities.image && Boolean(settings.modelChannel.defaultImageModel),
         video: settings.capabilities.video && Boolean(settings.modelChannel.defaultVideoModel),
         audio: settings.capabilities.audio && Boolean(settings.modelChannel.defaultAudioModel),
+        text: settings.capabilities.text && Boolean(settings.modelChannel.defaultTextModel),
         vision: modelSupportsVision(settings, model),
     };
 }
 
+/**
+ * 推理循环。返回 true 表示「停下来等用户确认」，此时状态已经落成 awaiting，调用方不能再把它改回 idle。
+ * 轮数计数落在会话行上而不是局部变量里：等待确认可能持续很久甚至跨越好几次请求，
+ * 只记在内存里的话，用户点了同意之后轮数预算就对不上了。
+ */
 async function runLoop(session: AgentSession, signal: AbortSignal) {
     const settings = await publicSettings();
     const channel = await selectModelChannel(session.model);
     const access = await toolAccess(settings, session.model);
     const tools = listAgentTools(access);
-    const system = systemPrompt(session.projectId, settings.modelChannel.systemPrompt, access);
+    // 用户的「Agent 生成默认设置」整段执行只读一次库：一次执行里生成类工具可能被调很多次，
+    // 每次都查一遍纯属白花开销，而偏好在跑的过程中改了也不该半路换规格——改动下一条消息就会生效。
+    const prefs = await getAgentGenerationPreference(session.userId);
+    // 工具要读「主动改标题的额度还在不在」，也要能把待确认请求写出来，统一放在这份状态里由循环负责落库。
+    const state: ToolState = { autoRenamed: session.autoRenamed };
 
-    for (let round = 0; round < settings.agent.maxRounds; round += 1) {
+    while (session.rounds < settings.agent.maxRounds) {
         if (signal.aborted) throw fail("已中止");
+        const system = systemPrompt(session.projectId, settings.modelChannel.systemPrompt, access, settings.agent.maxRounds - session.rounds, settings.agent.maxRounds);
+        // 先把这一轮记账再调模型：中途崩了也不会白送一轮，恢复后剩余轮数仍然是对的。
+        await patchSession(session, { rounds: session.rounds + 1 });
         const history = await loadHistory(session.userId, session.sessionId);
         const images = await loadContextImages(session.userId, history, access.vision);
         const reply = await callModel(channel, session.model, system, history, images, tools, signal);
         if (reply.content) await appendMessage(session, "assistant", { content: reply.content });
-        if (!reply.toolCalls.length) return;
+        if (!reply.toolCalls.length) return false;
 
         for (const call of reply.toolCalls) {
             const args = JSON.stringify(call.args);
             // 先占好 seq 再执行：工具跑得慢时前端也能立刻看到「正在调用哪个工具」。
             const row = await appendMessage(session, "tool", { toolName: call.name, toolArgs: args });
-            const result = await runAgentTool({ userId: session.userId, projectId: session.projectId, sessionId: session.sessionId, seq: row.seq, access, signal }, call.name, call.args).then(
+            const result = await runAgentTool({ userId: session.userId, projectId: session.projectId, sessionId: session.sessionId, seq: row.seq, access, prefs, state, signal }, call.name, call.args).then(
                 (value) => JSON.stringify({ ok: true, data: value ?? null }),
                 // 工具报错不终止循环，把错误回灌给模型，让它自己换个做法或如实告诉用户。
                 (error: unknown) => JSON.stringify({ ok: false, error: error instanceof SafeError ? error.message : "工具执行失败" }),
@@ -424,9 +485,21 @@ async function runLoop(session: AgentSession, signal: AbortSignal) {
             row.toolResult = result;
             await messages().save(row);
             bus.emit(busKey(session.userId, session.sessionId), { type: "message", message: toMessageView(row) } satisfies AgentEvent);
+            // 主动改标题的额度一旦用掉就立刻落库，否则同一次执行里模型还能再改一次。
+            if (state.autoRenamed && !session.autoRenamed) await patchSession(session, { autoRenamed: true });
+            if (state.action) {
+                await appendMessage(session, "assistant", { content: `已请求把画布标题改成「${state.action.type === "rename_canvas" ? state.action.title : ""}」，等你确认后再改。` });
+                await patchSession(session, { status: "awaiting", error: "", pendingAction: state.action });
+                return true;
+            }
         }
     }
-    await appendMessage(session, "assistant", { content: `已达到最大执行轮数（${settings.agent.maxRounds}），本次执行到此为止。` });
+
+    // 轮数耗尽不再直接收工，而是把「要不要接着跑」交给用户：接着跑要按当前模型单价再扣一次点。
+    const credits = await modelCost(session.model);
+    await appendMessage(session, "assistant", { content: `已经用完本次的 ${settings.agent.maxRounds} 轮执行。继续会重置轮数并再消耗 ${credits} 算力点，需要我接着做吗？` });
+    await patchSession(session, { status: "awaiting", error: "", pendingAction: { type: "continue", roundsUsed: session.rounds, credits } });
+    return true;
 }
 
 /** 失败或中止时把这条消息扣的那一次点原路返还；跑了多少轮都只返还这一次。 */
@@ -435,18 +508,51 @@ async function runSession(session: AgentSession, model: string, credits: number)
     const controller = new AbortController();
     running.set(key, controller);
     try {
-        await runLoop(session, controller.signal);
-        await patchSession(session, { status: "idle", error: "" });
+        // 停下来等确认时状态已经是 awaiting，这里不能再覆写成 idle，否则前端刚弹出的确认框会立刻消失。
+        if (!(await runLoop(session, controller.signal))) await patchSession(session, { status: "idle", error: "" });
     } catch (error) {
         const aborted = controller.signal.aborted;
         if (!aborted) console.error(`agent session ${session.sessionId} failed:`, error);
         await refundUserCredits(session.userId, model, credits, "/agent").catch(() => undefined);
         const message = error instanceof SafeError ? error.message : "Agent 执行失败，请稍后重试";
         await appendMessage(session, "assistant", { content: aborted ? "已中止本次执行。" : message }).catch(() => undefined);
-        await patchSession(session, { status: aborted ? "idle" : "failed", error: aborted ? "" : message }).catch(() => undefined);
+        await patchSession(session, { status: aborted ? "idle" : "failed", error: aborted ? "" : message, pendingAction: null }).catch(() => undefined);
     } finally {
         running.delete(key);
     }
+}
+
+/**
+ * 处理用户对待确认请求的答复。批准就接着跑，拒绝就正常收尾。
+ * 两种请求共用这一个出口：它们的交互是同一套，分开写两个接口只会让前端各对接一遍。
+ */
+export async function resolveAgentSession(userId: string, sessionId: string, approved: boolean) {
+    const session = await loadSession(userId, sessionId);
+    const action = session.pendingAction;
+    if (session.status !== "awaiting" || !action) throw fail("当前没有待确认的请求");
+
+    if (!approved) {
+        await appendMessage(session, "assistant", { content: action.type === "continue" ? "好的，本次执行到此为止。" : "好的，画布标题保持不变。" });
+        await patchSession(session, { status: "idle", error: "", pendingAction: null });
+        return toSessionView(session);
+    }
+
+    if (action.type === "rename_canvas") {
+        await renameProjectCanvas(userId, session.projectId, action.title);
+        await appendMessage(session, "assistant", { content: `已把画布标题改成「${action.title}」。` });
+        // 轮数不重置：改个标题不该顺带送一整轮预算，接着用剩下的额度把原来的事做完。
+        await patchSession(session, { status: "running", error: "", pendingAction: null });
+        void runSession(session, session.model, 0);
+        return toSessionView(session);
+    }
+
+    // 续跑是用户明确要求的新一段执行，所以按当前模型单价重新扣一次点；余额不够就明确拒绝，不偷偷放行。
+    const credits = await modelCost(session.model);
+    await consumeUserCredits(userId, session.model, credits, "/agent");
+    await appendMessage(session, "assistant", { content: "好的，继续执行。" });
+    await patchSession(session, { status: "running", error: "", pendingAction: null, rounds: 0 });
+    void runSession(session, session.model, credits);
+    return toSessionView(session);
 }
 
 /**
@@ -502,6 +608,28 @@ async function resolveAttachments(userId: string, ids: string[]) {
 }
 
 /**
+ * 用模型给会话起一个短标题，只在会话的第一条用户消息时跑一次。
+ * 刻意不扣算力点：标题就十来个字，成本可以忽略，而且它有天然限流——必须真的发出一条消息才会触发，
+ * 而发消息本身已经按模型单价扣过一次了，再扣一次等于同一个动作收两遍钱。
+ * 整条链路的失败都只是静默放弃，标题保持发消息时写好的截断兜底：起标题失败绝不能让发消息也跟着失败。
+ */
+async function generateSessionTitle(session: AgentSession, content: string) {
+    const settings = await publicSettings();
+    const model = settings.agent.titleModel;
+    if (!model) return;
+    const channel = await selectModelChannel(model);
+    const system = `根据用户这句话给对话起一个标题，只输出标题本身：不超过 ${MAX_TITLE_CHARS} 个字，不要引号、不要句号、不要解释。标题只用来在会话列表里认人，长了会被截断。`;
+    // 借用同一套模型调用：临时拼一条用户消息喂进去，OpenAI 与 Gemini 两种请求格式就不用再各写一遍。
+    const row = messages().create({ role: "user", content, attachments: [], references: [] });
+    const reply = await callModel(channel, model, system, [row], new Map(), [], AbortSignal.timeout(TITLE_TIMEOUT_MS));
+    const title = reply.content
+        .replace(/^[“”"'「『]+|[“”"'」』。！？]+$/g, "")
+        .trim()
+        .slice(0, MAX_TITLE_CHARS);
+    if (title) await patchSession(session, { title });
+}
+
+/**
  * 发消息即触发后台执行，接口立刻返回，不等循环跑完。
  * clientMessageId 是幂等键：断网重发同一个键只会拿回已存在的那条消息，不会重复执行、重复扣费。
  * 计费口径是「按消息扣一次」：在真正开始执行之前按当前模型的单价扣一次，之后这条消息触发多少轮都不再扣。
@@ -519,6 +647,8 @@ export async function sendAgentMessage(userId: string, sessionId: string, input:
 
     const session = await loadSession(userId, sessionId);
     if (session.status === "running") throw fail("当前会话正在执行中，请等待完成或先中止");
+    // 等确认时也不能插新消息：那条待确认请求属于上一段执行，被顶掉之后用户点同意就没有东西可接着跑了。
+    if (session.status === "awaiting") throw fail("当前会话正在等待你确认，请先处理确认请求或中止");
     // 用户这次选了就按用户的来，没选就沿用会话上一轮用的模型，不再无条件按管理员配置对齐——
     // 那样会把用户在面板上的选择冲掉。模型被下线的情况由 resolveAgentModel 兜底回落到默认。
     // 模型只在这里定一次，跑到一半改选择也只对下一轮生效，当前这轮用的还是发消息时确定的那个。
@@ -533,10 +663,14 @@ export async function sendAgentMessage(userId: string, sessionId: string, input:
     // 扣费在真正开始执行之前：余额不足就直接拒绝，连循环都不启动。
     const credits = await modelCost(model);
     await consumeUserCredits(userId, model, credits, "/agent");
+    const first = !session.lastSeq;
     try {
-        await patchSession(session, { model, status: "running", error: "", title: session.lastSeq ? session.title : (content || "图片消息").slice(0, 30) });
+        // rounds 清零：轮数预算是按「一条用户消息」给的，不是按会话累计的。
+        await patchSession(session, { model, status: "running", error: "", rounds: 0, title: first ? (content || "图片消息").slice(0, 30) : session.title });
         const row = await appendMessage(session, "user", { content, clientMessageId, attachments, references });
         void runSession(session, model, credits);
+        // 起标题和执行并行跑，接口不等它：拿到了就通过 SSE 把新标题推出去，拿不到就一直用上面的截断兜底。
+        if (first) void generateSessionTitle(session, content).catch(() => undefined);
         return toMessageView(row);
     } catch (error) {
         // 还没开始跑就失败了，扣掉的那一次要还回去，否则用户白花一次钱。
@@ -545,7 +679,12 @@ export async function sendAgentMessage(userId: string, sessionId: string, input:
     }
 }
 
-/** 进程重启后内存里的循环已经没了，把残留的 running 标成失败，免得前端一直转圈等一个不存在的任务。 */
+/**
+ * 进程重启后内存里的循环已经没了，把残留的 running 标成失败，免得前端一直转圈等一个不存在的任务。
+ * awaiting 一并清掉：那条待确认请求属于上一次执行，而那次执行的轮数预算与已经扣掉的算力点都随进程一起没了，
+ * 留着让用户回来点同意，等于拿一份对不上账的上下文接着跑；不如直接失效，让他重新发一条消息。
+ */
 export async function resetRunningAgentSessions() {
-    await sessions().update({ status: "running" }, { status: "failed", error: "服务已重启，请重新发送消息", updatedAt: now() });
+    await sessions().update({ status: "running" }, { status: "failed", error: "服务已重启，请重新发送消息", pendingAction: null, updatedAt: now() });
+    await sessions().update({ status: "awaiting" }, { status: "failed", error: "服务已重启，待确认的请求已失效，请重新发送消息", pendingAction: null, updatedAt: now() });
 }
