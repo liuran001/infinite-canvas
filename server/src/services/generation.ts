@@ -51,6 +51,11 @@ export async function fileToDataUrl(file: StoredFile) {
     return `data:${file.mimeType};base64,${(await readFileBuffer(file)).toString("base64")}`;
 }
 
+/** Gemini 的 inlineData 要的是裸 base64 而不是 data url，单独给一个出口，免得调用方再去拆 data url 前缀。 */
+export async function fileToBase64(file: StoredFile) {
+    return (await readFileBuffer(file)).toString("base64");
+}
+
 function withSystemPrompt(systemPrompt: string, prompt: string) {
     return systemPrompt.trim() ? `${systemPrompt.trim()}\n\n${prompt}` : prompt;
 }

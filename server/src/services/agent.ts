@@ -5,21 +5,36 @@ import { repo } from "../db/data-source";
 import { AgentMessage, AgentSession, type AgentMessageRole, type AgentSessionStatus } from "../db/entities";
 import { fail, newId, now, SafeError } from "../lib/errors";
 import { upstreamJson } from "../lib/upstream";
-import { listAgentTools, runAgentTool, type AgentTool } from "./agent-tools";
+import { fileIdOfStorageKey, listAgentTools, runAgentTool, storageKeyOf, type AgentTool, type AgentToolAccess } from "./agent-tools";
 import { consumeUserCredits, refundUserCredits } from "./auth";
+import { listFiles } from "./files";
+import { fileToBase64 } from "./generation";
 import { searchConfig } from "./search";
-import { buildChannelUrl, modelCost, publicSettings, selectModelChannel, type ModelChannel, type PublicSetting } from "./settings";
+import { buildChannelUrl, modelCost, modelSupportsVision, publicSettings, selectModelChannel, type ModelChannel, type PublicSetting } from "./settings";
 import { readProjectCanvas } from "./sync";
 
+/** 用户从画布拖进面板的节点引用。只带 ID / 类型 / 标题，内容让模型自己按需去取。 */
+export type AgentMessageReference = { nodeId: string; type: string; title: string; storageKey?: string };
 export type AgentSessionView = { id: string; projectId: string; title: string; status: AgentSessionStatus; model: string; error: string; lastSeq: number; createdAt: string; updatedAt: string };
-export type AgentMessageView = { seq: number; role: AgentMessageRole; content: string; toolName: string; toolArgs: string; toolResult: string; createdAt: string };
+export type AgentMessageView = { seq: number; role: AgentMessageRole; content: string; toolName: string; toolArgs: string; toolResult: string; attachments: string[]; references: AgentMessageReference[]; createdAt: string };
 export type AgentEvent = { type: "message"; message: AgentMessageView } | { type: "status"; status: AgentSessionStatus; error: string };
 
 type ToolCall = { name: string; args: Record<string, unknown> };
 type ModelReply = { content: string; toolCalls: ToolCall[] };
+/** 进上下文的图片，一份数据同时喂给 OpenAI（data url）和 Gemini（inlineData 裸 base64）。 */
+type ContextImage = { mimeType: string; base64: string };
 
 const MAX_MESSAGES = 500;
 const MODEL_TIMEOUT_MS = 180000;
+/** 一条消息最多带几张图，再多既费钱也没什么用。 */
+const MAX_ATTACHMENTS = 6;
+/** 一条消息最多引用几个画布节点。 */
+const MAX_REFERENCES = 10;
+/**
+ * 上下文里最多保留几张图。图片进上下文后每一轮都要重算 token，一次对话可能跑到几十轮，
+ * 所以只保留最近看过 / 最近上传的这几张，更早的图退化成纯文字记录。
+ */
+const MAX_CONTEXT_IMAGES = 6;
 
 /**
  * 推理循环跑在服务端后台，不依赖前端连接：SSE 断了这里照样跑完并落库。
@@ -38,7 +53,17 @@ function toSessionView(row: AgentSession): AgentSessionView {
 }
 
 function toMessageView(row: AgentMessage): AgentMessageView {
-    return { seq: row.seq, role: row.role, content: row.content || "", toolName: row.toolName || "", toolArgs: row.toolArgs || "", toolResult: row.toolResult || "", createdAt: row.createdAt };
+    return {
+        seq: row.seq,
+        role: row.role,
+        content: row.content || "",
+        toolName: row.toolName || "",
+        toolArgs: row.toolArgs || "",
+        toolResult: row.toolResult || "",
+        attachments: row.attachments || [],
+        references: row.references || [],
+        createdAt: row.createdAt,
+    };
 }
 
 export function subscribeAgentSession(userId: string, sessionId: string, listener: (event: AgentEvent) => void) {
@@ -73,6 +98,8 @@ async function appendMessage(session: AgentSession, role: AgentMessageRole, patc
         toolName: "",
         toolArgs: "",
         toolResult: "",
+        attachments: [],
+        references: [],
         clientMessageId: "",
         createdAt: now(),
         ...patch,
@@ -159,11 +186,17 @@ export async function abortAgentSession(userId: string, sessionId: string) {
     return toSessionView(session);
 }
 
-function systemPrompt(projectId: string, extra: string) {
+function systemPrompt(projectId: string, extra: string, access: AgentToolAccess) {
     const base = [
         "你是无限画布应用里的画布助手，可以直接读写用户当前打开的画布。",
         `当前画布项目 ID 是 ${projectId}。`,
         "修改画布前先调用 read_canvas 拿到最新的节点 ID，不要凭记忆猜 ID。",
+        "画布上的图片、视频、音频统一用形如 server:xxx 的 storageKey 引用；用户上传的图片也会在消息里给出它的 storageKey，需要用到时照抄即可，不要自己编。",
+        // 引用标记的位置本身有语义（「把 A 放到 B 右边」），必须把格式讲清楚，模型才知道哪个引用对应句子里的哪个位置。
+        "用户消息里形如 @[标题](canvas-node:节点ID#节点类型) 的片段是他从画布拖进来的节点引用，出现在哪个位置就代表那句话的那个位置指的是这个节点，同一个节点可以在一句话里出现多次。",
+        // 拖进来的引用只有 ID：明确告诉模型要自己去取内容，否则它会以为自己已经看过了。
+        "引用只是在指认对象，不带任何节点内容，也不代表你已经看过它；需要内容就自己去 read_canvas，需要看图再调用看图工具。",
+        ...(access.vision ? ["read_canvas 只返回结构不返回图片，确实需要看图时才调用 view_image；图片会占用后续每一轮的上下文，不要无差别地把所有图都看一遍。"] : []),
         "一次只做用户要求的事，做完用中文简要说明改了什么。",
         "工具调用失败时把失败原因如实转述给用户，不要假装成功。",
     ].join("\n");
@@ -179,16 +212,67 @@ function parseArgs(value: string): Record<string, unknown> {
     }
 }
 
-function toOpenAiMessages(system: string, history: AgentMessage[]) {
+/** view_image 成功后把 storageKey 记在工具结果里，重建上下文时据此把那张图重新塞回去。只认这个工具，别的工具结果里也有 storageKey。 */
+function viewedFileId(row: AgentMessage) {
+    if (row.role !== "tool" || row.toolName !== "view_image") return "";
+    try {
+        const parsed = JSON.parse(row.toolResult || "{}") as { ok?: boolean; data?: { storageKey?: string } };
+        return parsed.ok && typeof parsed.data?.storageKey === "string" ? fileIdOfStorageKey(parsed.data.storageKey) : "";
+    } catch {
+        return "";
+    }
+}
+
+/**
+ * 要带进上下文的图片：只有「用户主动上传的附件」和「模型主动调 view_image 看过的图」两种来源。
+ * 画布结构、拖进来的节点引用一律不带图——图片进上下文后每一轮都要重算 token，一次对话可能几十轮。
+ * 同理只保留最近的几张，更早的图退化成纯文字记录。
+ */
+async function loadContextImages(userId: string, history: AgentMessage[], vision: boolean) {
+    const images = new Map<string, ContextImage>();
+    if (!vision) return images;
+    const ids: string[] = [];
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+        const row = history[index];
+        const rowIds = row.role === "user" ? row.attachments || [] : [viewedFileId(row)];
+        for (const id of rowIds) if (id && !ids.includes(id)) ids.push(id);
+    }
+    const wanted = ids.slice(0, MAX_CONTEXT_IMAGES);
+    if (!wanted.length) return images;
+    for (const file of await listFiles(userId, wanted)) images.set(file.id, { mimeType: file.mimeType, base64: await fileToBase64(file) });
+    return images;
+}
+
+/**
+ * 用户消息的纯文字部分。附件与画布引用各自在正文后面附一行：
+ * 附件给出 storageKey，模型可以直接拿去建节点或生图；引用只给节点 ID 与类型，内容让它自己 read_canvas / view_image 去取。
+ */
+function userText(row: AgentMessage) {
+    const lines = [row.content || ""];
+    const attachments = row.attachments || [];
+    if (attachments.length) lines.push(`[用户上传的图片] ${attachments.map(storageKeyOf).join(" ")}`);
+    const references = row.references || [];
+    if (references.length) lines.push(`[用户引用的画布节点] ${references.map((item) => `${item.nodeId}(${item.type}${item.title ? ` ${item.title}` : ""})`).join(" ")}`);
+    return lines.filter((line) => line.trim()).join("\n\n");
+}
+
+function toOpenAiMessages(system: string, history: AgentMessage[], images: Map<string, ContextImage>) {
+    // Chat Completions 的图片部分是 image_url + data url。generation.ts 里的 input_image 是 Responses 接口的写法，两个接口不能混用。
+    const imagePart = (image: ContextImage) => ({ type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.base64}` } });
     const list: Array<Record<string, unknown>> = [{ role: "system", content: system }];
     for (const row of history) {
-        if (row.role === "user") list.push({ role: "user", content: row.content || "" });
-        else if (row.role === "assistant") list.push({ role: "assistant", content: row.content || "" });
+        if (row.role === "user") {
+            const parts = (row.attachments || []).flatMap((id) => (images.has(id) ? [imagePart(images.get(id) as ContextImage)] : []));
+            list.push(parts.length ? { role: "user", content: [{ type: "text", text: userText(row) }, ...parts] } : { role: "user", content: userText(row) });
+        } else if (row.role === "assistant") list.push({ role: "assistant", content: row.content || "" });
         else {
             // 工具调用与结果按 seq 一一对应地还原，重连或重启后重建上下文不用额外存 tool_call_id。
             const id = `call_${row.seq}`;
             list.push({ role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: row.toolName, arguments: row.toolArgs || "{}" } }] });
             list.push({ role: "tool", tool_call_id: id, content: row.toolResult || "" });
+            // tool 消息只能放文本，看到的图只能作为紧随其后的用户消息补进去。
+            const viewed = images.get(viewedFileId(row));
+            if (viewed) list.push({ role: "user", content: [{ type: "text", text: "上一步查看的图片内容如下。" }, imagePart(viewed)] });
         }
     }
     return list;
@@ -196,13 +280,13 @@ function toOpenAiMessages(system: string, history: AgentMessage[]) {
 
 type OpenAiPayload = { choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ function?: { name?: string; arguments?: string } }> } }> };
 
-async function callOpenAi(channel: ModelChannel, model: string, system: string, history: AgentMessage[], tools: AgentTool[], signal: AbortSignal): Promise<ModelReply> {
+async function callOpenAi(channel: ModelChannel, model: string, system: string, history: AgentMessage[], images: Map<string, ContextImage>, tools: AgentTool[], signal: AbortSignal): Promise<ModelReply> {
     const payload = await upstreamJson<OpenAiPayload>(
         buildChannelUrl(channel, "/chat/completions"),
         {
             method: "POST",
             headers: { Authorization: `Bearer ${channel.apiKey}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ model, messages: toOpenAiMessages(system, history), ...(tools.length ? { tools: tools.map((tool) => ({ type: "function", function: tool })) } : {}) }),
+            body: JSON.stringify({ model, messages: toOpenAiMessages(system, history, images), ...(tools.length ? { tools: tools.map((tool) => ({ type: "function", function: tool })) } : {}) }),
             signal,
         },
         "Agent 模型调用失败",
@@ -224,14 +308,22 @@ function toGeminiSchema(schema: unknown): unknown {
 type GeminiPart = { text?: string; functionCall?: { name?: string; args?: Record<string, unknown> } };
 type GeminiPayload = { candidates?: Array<{ content?: { parts?: GeminiPart[] } }>; promptFeedback?: { blockReason?: string } };
 
-function toGeminiContents(history: AgentMessage[]) {
+function toGeminiContents(history: AgentMessage[], images: Map<string, ContextImage>) {
+    // Gemini 的图片部分是 inlineData + 裸 base64，和 OpenAI 的 data url 是两套写法。
+    const imagePart = (image: ContextImage) => ({ inlineData: { mimeType: image.mimeType, data: image.base64 } });
     const contents: Array<{ role: string; parts: unknown[] }> = [];
     for (const row of history) {
-        if (row.role === "user") contents.push({ role: "user", parts: [{ text: row.content || "" }] });
-        else if (row.role === "assistant") contents.push({ role: "model", parts: [{ text: row.content || "" }] });
+        if (row.role === "user") {
+            const parts = (row.attachments || []).flatMap((id) => (images.has(id) ? [imagePart(images.get(id) as ContextImage)] : []));
+            contents.push({ role: "user", parts: [{ text: userText(row) }, ...parts] });
+        } else if (row.role === "assistant") contents.push({ role: "model", parts: [{ text: row.content || "" }] });
         else {
             contents.push({ role: "model", parts: [{ functionCall: { name: row.toolName, args: parseArgs(row.toolArgs) } }] });
-            contents.push({ role: "user", parts: [{ functionResponse: { name: row.toolName, response: { result: row.toolResult || "" } } }] });
+            const viewed = images.get(viewedFileId(row));
+            contents.push({
+                role: "user",
+                parts: [{ functionResponse: { name: row.toolName, response: { result: row.toolResult || "" } } }, ...(viewed ? [imagePart(viewed)] : [])],
+            });
         }
     }
     return contents;
@@ -244,7 +336,7 @@ function geminiUrl(channel: ModelChannel, model: string) {
     return `${versioned}/models/${encodeURIComponent(model.replace(/^models\//, ""))}:generateContent`;
 }
 
-async function callGemini(channel: ModelChannel, model: string, system: string, history: AgentMessage[], tools: AgentTool[], signal: AbortSignal): Promise<ModelReply> {
+async function callGemini(channel: ModelChannel, model: string, system: string, history: AgentMessage[], images: Map<string, ContextImage>, tools: AgentTool[], signal: AbortSignal): Promise<ModelReply> {
     const declarations = tools.map((tool) => ({
         name: tool.name,
         description: tool.description,
@@ -257,7 +349,7 @@ async function callGemini(channel: ModelChannel, model: string, system: string, 
             method: "POST",
             headers: { "x-goog-api-key": channel.apiKey, "Content-Type": "application/json" },
             body: JSON.stringify({
-                contents: toGeminiContents(history),
+                contents: toGeminiContents(history, images),
                 systemInstruction: { parts: [{ text: system }] },
                 ...(declarations.length ? { tools: [{ functionDeclarations: declarations }] } : {}),
             }),
@@ -276,16 +368,13 @@ async function callGemini(channel: ModelChannel, model: string, system: string, 
     };
 }
 
-/** 扣点在调用上游之前，调用失败原路返还，和生成任务、AI 代理保持同一套计费口径。 */
-async function callModel(channel: ModelChannel, model: string, credits: number, userId: string, system: string, history: AgentMessage[], tools: AgentTool[], signal: AbortSignal) {
-    await consumeUserCredits(userId, model, credits, "/agent");
-    try {
-        const timeout = AbortSignal.any([signal, AbortSignal.timeout(MODEL_TIMEOUT_MS)]);
-        return channel.apiFormat === "gemini" ? await callGemini(channel, model, system, history, tools, timeout) : await callOpenAi(channel, model, system, history, tools, timeout);
-    } catch (error) {
-        await refundUserCredits(userId, model, credits, "/agent").catch(() => undefined);
-        throw error;
-    }
+/**
+ * 单次模型调用。计费不在这里：口径是「用户每发一条消息扣一次」，
+ * 一条消息触发的所有轮次共用那一次扣费，扣与返还都在 sendAgentMessage / runSession 里做。
+ */
+async function callModel(channel: ModelChannel, model: string, system: string, history: AgentMessage[], images: Map<string, ContextImage>, tools: AgentTool[], signal: AbortSignal) {
+    const timeout = AbortSignal.any([signal, AbortSignal.timeout(MODEL_TIMEOUT_MS)]);
+    return channel.apiFormat === "gemini" ? callGemini(channel, model, system, history, images, tools, timeout) : callOpenAi(channel, model, system, history, images, tools, timeout);
 }
 
 /** 超长会话只带最近的一批：倒序取再翻回来，丢掉的是最老的消息而不是刚发生的进度。 */
@@ -294,16 +383,32 @@ async function loadHistory(userId: string, sessionId: string) {
     return rows.reverse();
 }
 
+/**
+ * 工具门禁。搜索看有没有配 key，生成类看能力开关加默认模型，看图看模型有没有被标注支持视觉。
+ * 同一份开关既用来决定下发哪些工具，也在执行时再校验一次，前端和模型都绕不过去。
+ */
+async function toolAccess(settings: PublicSetting, model: string): Promise<AgentToolAccess> {
+    return {
+        search: Boolean(await searchConfig()),
+        image: settings.capabilities.image && Boolean(settings.modelChannel.defaultImageModel),
+        video: settings.capabilities.video && Boolean(settings.modelChannel.defaultVideoModel),
+        audio: settings.capabilities.audio && Boolean(settings.modelChannel.defaultAudioModel),
+        vision: modelSupportsVision(settings, model),
+    };
+}
+
 async function runLoop(session: AgentSession, signal: AbortSignal) {
     const settings = await publicSettings();
     const channel = await selectModelChannel(session.model);
-    const credits = await modelCost(session.model);
-    const tools = listAgentTools({ search: Boolean(await searchConfig()), image: settings.capabilities.image && Boolean(settings.modelChannel.defaultImageModel) });
-    const system = systemPrompt(session.projectId, settings.modelChannel.systemPrompt);
+    const access = await toolAccess(settings, session.model);
+    const tools = listAgentTools(access);
+    const system = systemPrompt(session.projectId, settings.modelChannel.systemPrompt, access);
 
     for (let round = 0; round < settings.agent.maxRounds; round += 1) {
         if (signal.aborted) throw fail("已中止");
-        const reply = await callModel(channel, session.model, credits, session.userId, system, await loadHistory(session.userId, session.sessionId), tools, signal);
+        const history = await loadHistory(session.userId, session.sessionId);
+        const images = await loadContextImages(session.userId, history, access.vision);
+        const reply = await callModel(channel, session.model, system, history, images, tools, signal);
         if (reply.content) await appendMessage(session, "assistant", { content: reply.content });
         if (!reply.toolCalls.length) return;
 
@@ -311,7 +416,7 @@ async function runLoop(session: AgentSession, signal: AbortSignal) {
             const args = JSON.stringify(call.args);
             // 先占好 seq 再执行：工具跑得慢时前端也能立刻看到「正在调用哪个工具」。
             const row = await appendMessage(session, "tool", { toolName: call.name, toolArgs: args });
-            const result = await runAgentTool({ userId: session.userId, projectId: session.projectId, sessionId: session.sessionId, seq: row.seq, signal }, call.name, call.args).then(
+            const result = await runAgentTool({ userId: session.userId, projectId: session.projectId, sessionId: session.sessionId, seq: row.seq, access, signal }, call.name, call.args).then(
                 (value) => JSON.stringify({ ok: true, data: value ?? null }),
                 // 工具报错不终止循环，把错误回灌给模型，让它自己换个做法或如实告诉用户。
                 (error: unknown) => JSON.stringify({ ok: false, error: error instanceof SafeError ? error.message : "工具执行失败" }),
@@ -324,7 +429,8 @@ async function runLoop(session: AgentSession, signal: AbortSignal) {
     await appendMessage(session, "assistant", { content: `已达到最大执行轮数（${settings.agent.maxRounds}），本次执行到此为止。` });
 }
 
-async function runSession(session: AgentSession) {
+/** 失败或中止时把这条消息扣的那一次点原路返还；跑了多少轮都只返还这一次。 */
+async function runSession(session: AgentSession, model: string, credits: number) {
     const key = busKey(session.userId, session.sessionId);
     const controller = new AbortController();
     running.set(key, controller);
@@ -334,6 +440,7 @@ async function runSession(session: AgentSession) {
     } catch (error) {
         const aborted = controller.signal.aborted;
         if (!aborted) console.error(`agent session ${session.sessionId} failed:`, error);
+        await refundUserCredits(session.userId, model, credits, "/agent").catch(() => undefined);
         const message = error instanceof SafeError ? error.message : "Agent 执行失败，请稍后重试";
         await appendMessage(session, "assistant", { content: aborted ? "已中止本次执行。" : message }).catch(() => undefined);
         await patchSession(session, { status: aborted ? "idle" : "failed", error: aborted ? "" : message }).catch(() => undefined);
@@ -343,14 +450,67 @@ async function runSession(session: AgentSession) {
 }
 
 /**
+ * 消息里的画布节点引用标记。用户把节点拖进输入框时插在光标处，位置本身有语义：
+ * 「把 @[图片1](canvas-node:image-1#image) 放到 @[图片2](canvas-node:image-2#image) 右边」里两个引用指的是句中不同位置。
+ * 标记只带 ID 与类型，不带任何内容，更不带图片。
+ */
+const REFERENCE_PATTERN = /@\[([^\]]*)\]\(canvas-node:([^)]+)\)/g;
+
+function referenceMarker(nodeId: string, type: string, title: string) {
+    return `@[${title || type}](canvas-node:${nodeId}#${type})`;
+}
+
+/**
+ * 校验并归一化正文里的节点引用：客户端传来的标题与类型一律不信，按当前画布重写一遍。
+ * 客户端也可以只给 references 不在正文里插标记（例如整条消息统一附上几个节点），
+ * 这类引用在句子里没有位置，按顺序补到正文末尾，模型看到的始终是同一种标记格式。
+ * 引用的节点已经被删掉时直接报错，比让模型拿着一个不存在的 ID 反复试要清楚得多。
+ */
+async function resolveReferences(userId: string, projectId: string, content: string, declared: AgentMessageReference[]) {
+    const markers = [...content.matchAll(REFERENCE_PATTERN)];
+    const declaredIds = [...new Set(declared.map((item) => String(item.nodeId || "").trim()).filter(Boolean))];
+    if (!markers.length && !declaredIds.length) return { content, references: [] as AgentMessageReference[] };
+    if (markers.length + declaredIds.length > MAX_REFERENCES) throw fail(`一条消息最多引用 ${MAX_REFERENCES} 个画布节点`);
+
+    const project = await readProjectCanvas(userId, projectId);
+    const references: AgentMessageReference[] = [];
+    const resolve = (nodeId: string) => {
+        const node = project.data.nodes.find((item) => item.id === nodeId);
+        if (!node) throw fail(`引用的画布节点已不存在：${nodeId}`);
+        const storageKey = typeof node.metadata?.storageKey === "string" ? node.metadata.storageKey : "";
+        // 同一个节点可以在一句话里被引用多次，展示用的引用列表按节点去重即可。
+        if (!references.some((item) => item.nodeId === node.id)) references.push({ nodeId: node.id, type: node.type, title: node.title || "", ...(storageKey ? { storageKey } : {}) });
+        return referenceMarker(node.id, node.type, node.title || "");
+    };
+    const next = content.replace(REFERENCE_PATTERN, (_match, _label: string, payload: string) => {
+        const cut = payload.lastIndexOf("#");
+        return resolve(payload.slice(0, cut < 0 ? payload.length : cut));
+    });
+    const tail = declaredIds.filter((nodeId) => !references.some((item) => item.nodeId === nodeId)).map(resolve);
+    return { content: [next, tail.join(" ")].filter((line) => line.trim()).join("\n\n"), references };
+}
+
+/** 附件必须是当前用户自己的图片文件：模型和前端都可能传别人的 ID 过来，这里是最后一道防线。 */
+async function resolveAttachments(userId: string, ids: string[]) {
+    const wanted = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+    if (!wanted.length) return [];
+    if (wanted.length > MAX_ATTACHMENTS) throw fail(`一条消息最多上传 ${MAX_ATTACHMENTS} 张图片`);
+    const files = await listFiles(userId, wanted);
+    if (files.length !== wanted.length) throw fail("图片附件不存在或已被删除");
+    if (files.some((file) => file.kind !== "image")) throw fail("只能给 Agent 发送图片");
+    return wanted;
+}
+
+/**
  * 发消息即触发后台执行，接口立刻返回，不等循环跑完。
  * clientMessageId 是幂等键：断网重发同一个键只会拿回已存在的那条消息，不会重复执行、重复扣费。
+ * 计费口径是「按消息扣一次」：在真正开始执行之前按当前模型的单价扣一次，之后这条消息触发多少轮都不再扣。
  */
-export async function sendAgentMessage(userId: string, sessionId: string, input: { clientMessageId: string; content: string; model: string }) {
+export async function sendAgentMessage(userId: string, sessionId: string, input: { clientMessageId: string; content: string; model: string; attachmentIds: string[]; references: AgentMessageReference[] }) {
     const clientMessageId = input.clientMessageId.trim();
     if (!clientMessageId) throw fail("缺少消息幂等键");
-    const content = input.content.trim();
-    if (!content) throw fail("消息内容不能为空");
+    const rawContent = input.content.trim();
+    if (!rawContent && !input.attachmentIds.length && !input.references.length) throw fail("消息内容不能为空");
     const settings = await publicSettings();
     if (!settings.agent.enabled || !settings.capabilities.text) throw fail("画布 Agent 未开放");
 
@@ -365,10 +525,24 @@ export async function sendAgentMessage(userId: string, sessionId: string, input:
     const model = resolveAgentModel(settings, input.model || session.model);
     if (!model) throw fail("系统未配置 Agent 使用的文本模型");
 
-    await patchSession(session, { model, status: "running", error: "", title: session.lastSeq ? session.title : content.slice(0, 30) });
-    const row = await appendMessage(session, "user", { content, clientMessageId });
-    void runSession(session);
-    return toMessageView(row);
+    const attachments = await resolveAttachments(userId, input.attachmentIds);
+    // 图片附件必须配视觉模型，否则上游会直接报一串看不懂的错；宁可在这里明确拒绝，也不要静默把图丢掉。
+    if (attachments.length && !modelSupportsVision(settings, model)) throw fail("当前模型不支持识别图片，请换一个标注了「支持视觉」的模型再发图");
+    const { content, references } = await resolveReferences(userId, session.projectId, rawContent, input.references);
+
+    // 扣费在真正开始执行之前：余额不足就直接拒绝，连循环都不启动。
+    const credits = await modelCost(model);
+    await consumeUserCredits(userId, model, credits, "/agent");
+    try {
+        await patchSession(session, { model, status: "running", error: "", title: session.lastSeq ? session.title : (content || "图片消息").slice(0, 30) });
+        const row = await appendMessage(session, "user", { content, clientMessageId, attachments, references });
+        void runSession(session, model, credits);
+        return toMessageView(row);
+    } catch (error) {
+        // 还没开始跑就失败了，扣掉的那一次要还回去，否则用户白花一次钱。
+        await refundUserCredits(userId, model, credits, "/agent").catch(() => undefined);
+        throw error;
+    }
 }
 
 /** 进程重启后内存里的循环已经没了，把残留的 running 标成失败，免得前端一直转圈等一个不存在的任务。 */

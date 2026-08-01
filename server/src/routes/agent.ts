@@ -44,7 +44,18 @@ agentRouter.post(
     userAuth,
     handle(async (req, res) => {
         const body = req.body || {};
-        ok(res, await sendAgentMessage(requireUser(req).id, String(req.params.id), { clientMessageId: String(body.clientMessageId || ""), content: String(body.content || ""), model: String(body.model || "") }));
+        ok(
+            res,
+            await sendAgentMessage(requireUser(req).id, String(req.params.id), {
+                clientMessageId: String(body.clientMessageId || ""),
+                content: String(body.content || ""),
+                model: String(body.model || ""),
+                // 上传的图片只传文件 ID，服务端再按归属与类型校验一遍。
+                attachmentIds: Array.isArray(body.attachmentIds) ? body.attachmentIds.map((item: unknown) => String(item || "")) : [],
+                // 画布节点引用只收 nodeId，类型与标题一律以服务端当前画布为准，不信客户端传的。
+                references: Array.isArray(body.references) ? body.references.map((item: Record<string, unknown>) => ({ nodeId: String(item?.nodeId || ""), type: "", title: "" })) : [],
+            }),
+        );
     }),
 );
 

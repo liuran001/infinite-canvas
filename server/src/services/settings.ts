@@ -11,6 +11,11 @@ export type ChannelModel = {
     /** 前端展示名，留空时用 name。用来把 gemini-3.1-flash-image 这类内部名展示成 Nano Banana 2。 */
     label?: string;
     capability: ModelCapability;
+    /**
+     * 是否支持视觉输入（能直接读图）。模型名看不出来这件事，只能由管理员标注。
+     * 没标注的模型收到图片会直接报错，所以 Agent 的看图工具与图片附件都以这个标注为准。
+     */
+    vision?: boolean;
 };
 
 /**
@@ -32,9 +37,25 @@ export type ModelChannel = {
 
 
 /** 前端在服务器模式下靠 apiFormat 决定文本请求走哪条代理，靠 capability 过滤模型选择器。 */
-export type PublicModel = { name: string; label: string; apiFormat: ApiFormat; capability: ModelCapability };
+export type PublicModel = { name: string; label: string; apiFormat: ApiFormat; capability: ModelCapability; vision: boolean };
 
-export type SearchProviderName = "exa";
+export type SearchProviderName = "exa" | "tavily";
+
+/**
+ * 一条联网搜索服务。刻意做成和模型渠道同构：多条 + enabled + weight + 留空用默认地址，
+ * 管理员的心智模型和后台交互都不用再学一套。
+ * baseUrl 留空表示用服务商官方地址，填了就走自建代理或镜像。
+ */
+export type SearchService = {
+    provider: SearchProviderName;
+    /** 后台列表里的显示名，同一家配多把 key 时用来区分。 */
+    name: string;
+    baseUrl: string;
+    apiKey: string;
+    /** 优先级，数字大的先用。搜索要的是「这家挂了换下一家」，不是按权重分流，所以是排序而不是随机。 */
+    weight: number;
+    enabled: boolean;
+};
 
 export type PublicSetting = {
     modelChannel: {
@@ -55,8 +76,8 @@ export type PublicSetting = {
     capabilities: Record<ModelCapability, boolean>;
     /**
      * 画布 Agent。model 留空表示用 defaultTextModel；
-     * searchEnabled 由「开关 + 是否配了 key」推导，前端据此决定要不要展示联网搜索能力，
-     * 没配 key 时后端也不会把 web_search 工具下发给模型。
+     * searchEnabled 由「开关 + 至少有一条可用的搜索服务」推导，前端据此决定要不要展示联网搜索能力，
+     * 没有可用服务时后端也不会把 web_search、read_webpage 工具下发给模型。
      */
     agent: { enabled: boolean; model: string; maxRounds: number; searchEnabled: boolean };
 };
@@ -65,8 +86,8 @@ export type PrivateSetting = {
     channels: ModelChannel[];
     promptSync: { enabled: boolean; cron: string };
     auth: { linuxDo: { clientId: string; clientSecret: string } };
-    /** 联网搜索配置，只有管理员能看，apiKey 与渠道密钥一样读取时脱敏、留空表示保持不变。 */
-    search: { enabled: boolean; provider: SearchProviderName; apiKey: string; maxResults: number };
+    /** 联网搜索配置，只有管理员能看；services 里的 apiKey 与渠道密钥一样读取时脱敏、留空表示保持不变。 */
+    search: { enabled: boolean; maxResults: number; services: SearchService[] };
 };
 
 export type Settings = { public: PublicSetting; private: PrivateSetting };
@@ -100,7 +121,8 @@ function normalizeChannelModels(models: Array<string | Partial<ChannelModel>> | 
         seen.add(name);
         const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
         const label = typeof item === "string" ? "" : (item.label || "").trim();
-        result.push({ name, capability, ...(label ? { label } : {}) });
+        const vision = typeof item === "string" ? false : item.vision === true;
+        result.push({ name, capability, ...(label ? { label } : {}), ...(vision ? { vision: true } : {}) });
     }
     return result;
 }
@@ -125,6 +147,17 @@ function repairDefaultModel(current: string, models: PublicModel[], capability: 
     return models.find((model) => model.capability === capability)?.name || models[0]?.name || "";
 }
 
+function normalizeSearchService(service: Partial<SearchService>): SearchService {
+    return {
+        provider: service.provider === "tavily" ? "tavily" : "exa",
+        name: (service.name || "").trim(),
+        baseUrl: (service.baseUrl || "").trim().replace(/\/+$/, ""),
+        apiKey: service.apiKey || "",
+        weight: service.weight && service.weight > 0 ? service.weight : 1,
+        enabled: service.enabled !== false,
+    };
+}
+
 function normalizePrivate(setting: Partial<PrivateSetting> | undefined): PrivateSetting {
     return {
         channels: (setting?.channels || []).map(normalizeChannel),
@@ -132,9 +165,8 @@ function normalizePrivate(setting: Partial<PrivateSetting> | undefined): Private
         auth: { linuxDo: { clientId: setting?.auth?.linuxDo?.clientId?.trim() || "", clientSecret: setting?.auth?.linuxDo?.clientSecret || "" } },
         search: {
             enabled: setting?.search?.enabled !== false,
-            provider: "exa",
-            apiKey: setting?.search?.apiKey || "",
             maxResults: Math.min(20, Math.max(1, Number(setting?.search?.maxResults) || 5)),
+            services: (setting?.search?.services || []).map(normalizeSearchService),
         },
     };
 }
@@ -147,7 +179,7 @@ function normalizePublic(setting: Partial<PublicSetting> | undefined, privateSet
         for (const model of item.models) {
             if (seen.has(model.name)) continue;
             seen.add(model.name);
-            models.push({ name: model.name, label: model.label || model.name, apiFormat: item.apiFormat, capability: model.capability });
+            models.push({ name: model.name, label: model.label || model.name, apiFormat: item.apiFormat, capability: model.capability, vision: model.vision === true });
         }
     }
     return {
@@ -187,7 +219,7 @@ function normalizePublic(setting: Partial<PublicSetting> | undefined, privateSet
             // 只认 text 能力的模型，否则会把生图模型误当成 agent 主模型。
             model: models.some((model) => model.name === setting?.agent?.model && model.capability === "text") ? String(setting?.agent?.model).trim() : "",
             maxRounds: Math.min(50, Math.max(1, Number(setting?.agent?.maxRounds) || 25)),
-            searchEnabled: privateSetting.search.enabled && Boolean(privateSetting.search.apiKey.trim()),
+            searchEnabled: privateSetting.search.enabled && privateSetting.search.services.some((service) => service.enabled && service.apiKey.trim()),
         },
     };
 }
@@ -227,7 +259,7 @@ function hideSecrets(settings: Settings): Settings {
             ...settings.private,
             channels: settings.private.channels.map((channel) => ({ ...channel, apiKey: "" })),
             auth: { linuxDo: { ...settings.private.auth.linuxDo, clientSecret: "" } },
-            search: { ...settings.private.search, apiKey: "" },
+            search: { ...settings.private.search, services: settings.private.search.services.map((service) => ({ ...service, apiKey: "" })) },
         },
     };
 }
@@ -244,10 +276,15 @@ function keepSecrets(next: Settings, saved: Settings): Settings {
         return { ...channel, apiKey: matched?.apiKey || "" };
     });
     const clientSecret = next.private.auth.linuxDo.clientSecret.trim() || saved.private.auth.linuxDo.clientSecret;
-    const searchApiKey = next.private.search.apiKey.trim() || saved.private.search.apiKey;
+    // 多条搜索服务要按条目对应补密钥：先按「服务商+显示名」认人，认不出来再退回同一位置，否则调整顺序就会把 key 串到别人身上。
+    const services = next.private.search.services.map((service, index) => {
+        if (service.apiKey.trim()) return service;
+        const matched = saved.private.search.services.find((item) => item.provider === service.provider && item.name === service.name) || saved.private.search.services[index];
+        return { ...service, apiKey: matched?.apiKey || "" };
+    });
     return {
         public: next.public,
-        private: { ...next.private, channels, auth: { linuxDo: { ...next.private.auth.linuxDo, clientSecret } }, search: { ...next.private.search, apiKey: searchApiKey } },
+        private: { ...next.private, channels, auth: { linuxDo: { ...next.private.auth.linuxDo, clientSecret } }, search: { ...next.private.search, services } },
     };
 }
 
@@ -273,6 +310,16 @@ export async function modelCost(model: string, quality?: string) {
     const cost = settings.modelChannel.modelCosts.find((item) => item.model === model.trim());
     if (!cost) return 0;
     return cost.credits + (quality ? cost.qualityCredits?.[quality.trim()] || 0 : 0);
+}
+
+/**
+ * 该模型是否被管理员标注为「支持视觉」。
+ * 服务端所有和图片进上下文相关的门禁都以它为准：没标注的模型既拿不到看图工具，也不允许接收图片附件，
+ * 否则一发图上游就直接报错，用户看到的是一串看不懂的上游错误。
+ */
+export function modelSupportsVision(settings: PublicSetting, model: string) {
+    const name = model.trim();
+    return settings.modelChannel.models.some((item) => item.name === name && item.vision);
 }
 
 /** 按权重随机挑一个支持该模型的可用渠道。 */

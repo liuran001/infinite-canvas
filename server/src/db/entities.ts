@@ -264,6 +264,17 @@ export class AgentMessage {
     @Column(short) toolName!: string;
     @Column({ type: LONG_TEXT, nullable: true }) toolArgs!: string;
     @Column({ type: LONG_TEXT, nullable: true }) toolResult!: string;
+    /**
+     * 用户消息带的图片附件（服务端文件 ID）。图片走的是和素材同一套文件对象，占用户云空间配额。
+     * 落库而不是只放进内存：重连、重启后重建上下文时要按各家格式把这些图重新还原给模型。
+     */
+    @Column({ type: "simple-json", nullable: true }) attachments!: string[];
+    /**
+     * 用户从画布拖进面板的节点引用。只存 ID、类型与标题，绝不把节点内容（尤其是图片）带进上下文：
+     * 拖拽表达的是「我指的是这个」，不是「现在就看这张图」；真要看图、要改内容，模型自己去调 view_image / read_canvas。
+     * storageKey 只给前端画缩略图用，不进模型上下文。
+     */
+    @Column({ type: "simple-json", nullable: true }) references!: Array<{ nodeId: string; type: string; title: string; storageKey?: string }>;
     @Index() @Column(short) clientMessageId!: string;
     @Column(short) createdAt!: string;
 }

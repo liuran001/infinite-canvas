@@ -107,6 +107,15 @@ export async function updateProjectCanvas<T>(userId: string, id: string, mutate:
     return result;
 }
 
+/** Agent 重命名画布：只改标题，revision 照常递增，前端现有的增量同步才能拉到这次变更。 */
+export async function renameProjectCanvas(userId: string, id: string, title: string) {
+    const projects = repo(Project);
+    const saved = await projects.findOneBy({ userId, projectId: id });
+    if (!saved || saved.deleted) throw fail("画布项目不存在");
+    await projects.save({ ...saved, title, revision: saved.revision + 1, updatedAt: now() });
+    return { projectId: id, title, revision: saved.revision + 1 };
+}
+
 export async function listUserAssets(userId: string, since: string) {
     const rows = await repo(UserAsset).find({
         where: since ? { userId, updatedAt: MoreThan(since) } : { userId },

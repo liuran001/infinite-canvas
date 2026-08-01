@@ -155,7 +155,12 @@ const AGENT_DELAY_MS = 1200;
 // 文本流按片慢慢吐，冒烟脚本才有机会在生成中途读到半截内容、把连接掐掉再续上。
 const TEXT_CHUNKS = ["无限画布", "把生成任务", "放在服务端，", "刷新页面", "也不会丢，", "内容会接着写完。"];
 const TEXT_DELAY_MS = 800;
+// 读网页用的长正文，必须超过服务端 8000 字符的上限，才能验到「截断并告诉模型没读完」。
+const LONG_TEXT = "无限画布把超长网页正文截断后再交给模型。".repeat(600);
 let lastTools = [];
+// 最后一次 agent 请求的原始请求体。冒烟脚本据此断言上下文里到底带了什么，
+// 尤其是「引用只带 ID、绝不带图片数据」这条核心约定。
+let lastChat = null;
 
 function streamText(res, toEvent) {
     res.setHeader("Content-Type", "text/event-stream");
@@ -173,12 +178,24 @@ function streamText(res, toEvent) {
     setTimeout(push, TEXT_DELAY_MS);
 }
 
+// 附件与引用会把用户消息变成 [{type:"text"},{type:"image_url"}] 这种数组，取文字要摊平一次。
+function messageText(item) {
+    const content = item && item.content;
+    if (typeof content === "string") return content;
+    return (content || []).map((part) => part.text || "").join(" ");
+}
+
 function toolCall(messages) {
-    const lastUser = [...messages].reverse().find((item) => item.role === "user");
-    const wantsImage = String(lastUser && lastUser.content || "").includes("生成图片");
-    return wantsImage
-        ? { name: "generate_image", args: { prompt: "一只猫" } }
-        : { name: "create_node", args: { type: "text", title: "冒烟节点", content: "由 agent 创建" } };
+    const text = messageText([...messages].reverse().find((item) => item.role === "user"));
+    if (text.includes("生成图片")) return { name: "generate_image", args: { prompt: "一只猫" } };
+    // 读网页：内网地址用来验证服务端会直接拒绝，普通地址会被搜索服务的 mock 接住返回长正文。
+    if (text.includes("读取内网")) return { name: "read_webpage", args: { url: "http://127.0.0.1:9/admin" } };
+    if (text.includes("读取网页")) return { name: "read_webpage", args: { url: "https://example.com/long-article" } };
+    if (text.includes("联网搜索")) return { name: "web_search", args: { query: "无限画布" } };
+    // 把消息里出现的 storageKey 原样带进工具参数：用来验证用户上传的附件真的能被工具引用到。
+    const storageKey = (text.match(/server:[A-Za-z0-9_-]+/) || [])[0];
+    if (text.includes("用这张图建节点") && storageKey) return { name: "create_node", args: { type: "image", title: "附件节点", storageKey } };
+    return { name: "create_node", args: { type: "text", title: "冒烟节点", content: "由 agent 创建" } };
 }
 
 require("http").createServer((req, res) => {
@@ -187,6 +204,7 @@ require("http").createServer((req, res) => {
     req.on("end", () => {
         res.setHeader("Content-Type", "application/json");
         if (req.url === "/_tools") return res.end(JSON.stringify({ tools: lastTools }));
+        if (req.url === "/_last") return res.end(JSON.stringify(lastChat || {}));
         // 假的 Linux.do：换 token 与拉用户资料，用来验证关闭注册时第三方登录会被挡住。
         if (req.url.startsWith("/oauth2/token")) return res.end(JSON.stringify({ access_token: "linuxdo-access-token" }));
         if (req.url.startsWith("/api/user")) return res.end(JSON.stringify({ id: 424242, username: "smoke-linuxdo", name: "冒烟测试" }));
@@ -195,8 +213,35 @@ require("http").createServer((req, res) => {
         if (req.url.includes("streamGenerateContent")) return streamText(res, (text) => ({ candidates: [{ content: { parts: [{ text }] } }] }));
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 
+        // 假的搜索服务商。两家的请求路径与字段名都按各自官方 spec 来，用来验证 provider 抽象真的各解析各的：
+        // Exa 是 /search + /contents、正文在 text 且认 maxCharacters；Tavily 是 /search + /extract、摘要在 content、全文在 raw_content。
+        // 挂掉的搜索服务：一律 500，用来验证优先级高的那家失败后会自动换下一家。必须放在两家的分支之前，
+        // 否则 /broken/exa/search 会先被 Exa 的分支接住，降级路径根本没被跑到。
+        if (req.url.includes("/broken/")) {
+            res.statusCode = 500;
+            return res.end(JSON.stringify({ error: "搜索服务挂了" }));
+        }
+        if (req.url.includes("/exa/contents")) {
+            const url = (body.urls || [])[0] || "";
+            // 和真实 Exa 一样按 maxCharacters 截断后再返回。
+            const max = (body.text || {}).maxCharacters || LONG_TEXT.length;
+            return res.end(JSON.stringify({ requestId: "smoke", results: [{ id: url, url, title: "冒烟长文Exa", publishedDate: "2026-01-01T00:00:00.000Z", text: LONG_TEXT.slice(0, max) }], statuses: [{ id: url, status: "success" }] }));
+        }
+        if (req.url.includes("/exa/search")) {
+            return res.end(JSON.stringify({ results: [{ title: "冒烟搜索结果", url: "https://example.com/exa", publishedDate: "2026-01-01T00:00:00.000Z", text: "来自 Exa 的正文" }] }));
+        }
+        if (req.url.includes("/tavily/extract")) {
+            const url = (body.urls || [])[0] || "";
+            // Tavily 没有长度参数，整篇原文都回来，用来验证截断是服务端自己做的。
+            return res.end(JSON.stringify({ results: [{ url, title: "冒烟长文Tavily", raw_content: LONG_TEXT }], failed_results: [] }));
+        }
+        if (req.url.includes("/tavily/search")) {
+            return res.end(JSON.stringify({ results: [{ title: "冒烟搜索结果", url: "https://example.com/tavily", content: "来自 Tavily 的摘要" }] }));
+        }
+
         if (req.url.includes("/chat/completions")) {
             lastTools = (body.tools || []).map((item) => item.function.name);
+            lastChat = body;
             const messages = body.messages || [];
             const done = messages[messages.length - 1].role === "tool";
             const call = toolCall(messages);
@@ -444,16 +489,26 @@ check "删除后列表为空" "$(curl -s "$BASE/auth/passkeys" -H "Authorization
 
 echo "画布 Agent"
 AGENT_CHANNELS='[
-  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-text", "capability": "text" }], "weight": 1, "enabled": true },
+  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-text", "capability": "text" }, { "name": "mock-text-vision", "capability": "text", "vision": true }], "weight": 1, "enabled": true },
   { "apiFormat": "gemini", "name": "本地假 Gemini", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-gemini-text", "capability": "text" }], "weight": 1, "enabled": true }
 ]'
 # 把 Gemini 渠道停用，用来验证「用户选的模型被管理员下线」这条路径。
 AGENT_CHANNELS_NO_GEMINI='[
-  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-text", "capability": "text" }], "weight": 1, "enabled": true },
+  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-text", "capability": "text" }, { "name": "mock-text-vision", "capability": "text", "vision": true }], "weight": 1, "enabled": true },
   { "apiFormat": "gemini", "name": "本地假 Gemini", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-gemini-text", "capability": "text" }], "weight": 1, "enabled": false }
 ]'
-# 两个文本模型故意定不同单价：agent 按轮计费，换模型必须换单价，只有价差才验得出「计费真的按所选模型走」。
-AGENT_COSTS='[{ "model": "mock-text", "credits": 1 }, { "model": "mock-gemini-text", "credits": 3 }, { "model": "mock-image", "credits": 1 }]'
+# 三个文本模型故意定不同单价：agent 按消息计费，换模型必须换单价，只有价差才验得出「计费真的按所选模型走」。
+AGENT_COSTS='[{ "model": "mock-text", "credits": 1 }, { "model": "mock-gemini-text", "credits": 3 }, { "model": "mock-text-vision", "credits": 2 }, { "model": "mock-image", "credits": 1 }]'
+# 搜索服务全部指向本地 mock 上游：baseUrl 留空才走官方地址，填了就能在冒烟里把搜索与读网页整条链路真跑一遍。
+SEARCH_EMPTY='{ "enabled": true, "maxResults": 5, "services": [] }'
+search_service() { echo '{ "provider": "'"$1"'", "name": "冒烟'"$1"'", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'/'"${3:-$1}"'", "apiKey": "'"$2"'", "weight": '"${4:-10}"', "enabled": true }'; }
+SEARCH_EXA='{ "enabled": true, "maxResults": 3, "services": ['"$(search_service exa exa-test-key)"'] }'
+# 同一条服务但密钥留空，用来验证「留空表示保持不变」按条目对应补回，不会把已配好的 key 洗掉。
+SEARCH_EXA_KEEP='{ "enabled": true, "maxResults": 3, "services": ['"$(search_service exa "")"'] }'
+SEARCH_DISABLED='{ "enabled": false, "maxResults": 3, "services": ['"$(search_service exa "")"'] }'
+SEARCH_TAVILY='{ "enabled": true, "maxResults": 3, "services": ['"$(search_service tavily tavily-test-key)"'] }'
+# 权重高的那条指向必定 500 的路径，验证会自动降级到后面那条。
+SEARCH_FAILOVER='{ "enabled": true, "maxResults": 3, "services": ['"$(search_service exa exa-test-key broken/exa 20)"', '"$(search_service tavily tavily-test-key tavily 5)"'] }'
 # 第三个参数是渠道配置，默认两条渠道都开着。
 agent_settings() {
     curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{
@@ -474,14 +529,14 @@ wait_agent_idle() {
     done
 }
 new_agent_session() { curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "$1" | jq -r .data.id; }
-agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '""'
+agent_settings "$SEARCH_EMPTY" '""'
 curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
 
 check "Agent 开关下发给前端" "$(curl -s "$BASE/settings" | jq -r .data.agent.enabled)" "true"
 check "最大轮数下发给前端" "$(curl -s "$BASE/settings" | jq -r .data.agent.maxRounds)" "5"
 check "没配搜索密钥时联网搜索关闭" "$(curl -s "$BASE/settings" | jq -r .data.agent.searchEnabled)" "false"
 check "搜索密钥不会下发给前端" "$(curl -s "$BASE/settings" | jq -r '.data.agent.apiKey // "none"')" "none"
-check "后台读取时搜索密钥被脱敏" "$(curl -s "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.private.search.apiKey')" ""
+check "后台读取时没配服务就是空列表" "$(curl -s "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.private.search.services | length')" "0"
 check "未登录访问会话列表返回 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/agent/sessions")" "401"
 
 curl -s -X PUT "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"Agent 画布","data":{"nodes":[],"connections":[]}}' >/dev/null
@@ -510,6 +565,7 @@ check "工具调用被真正执行" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[
 check "工具结果落库" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[] | select(.role=="tool")][0].toolResult | fromjson | .ok')" "true"
 check "模型最终回复落库" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[] | select(.role=="assistant")][-1].content')" "已经按你的要求改好画布了。"
 check "工具列表里没有 web_search" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="web_search")] | length')" "0"
+check "工具列表里没有 read_webpage" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_webpage")] | length')" "0"
 check "工具列表里有画布读写工具" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_canvas" or .=="create_node" or .=="connect_nodes")] | length')" "3"
 
 # 工具直接改的是服务端画布，revision 递增后前端现有的增量同步就能拉到。
@@ -517,7 +573,7 @@ AGENT_PROJECT=$(curl -s "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $
 check "工具真的改到了服务端画布" "$(echo "$AGENT_PROJECT" | jq -r '.data.data.nodes | length')" "1"
 check "画布 revision 递增可被前端拉到" "$([ "$(echo "$AGENT_PROJECT" | jq -r .data.revision)" -gt 1 ] && echo yes || echo no)" "yes"
 check "节点结构与前端约定一致" "$(echo "$AGENT_PROJECT" | jq -r '.data.data.nodes[0] | "\(.type)/\(.title)/\(.position.x)/\(.width)/\(.metadata.content)"')" "text/冒烟节点/80/340/由 agent 创建"
-check "每轮模型调用都扣算力点" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="调用模型 mock-text")] | length')" "2"
+check "一条消息只扣一次算力点" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="调用模型 mock-text")] | length')" "1"
 
 # 断线增量拉取：带上最后看到的 seq 只返回后续消息。
 LAST_SEQ=$(echo "$AGENT_MSGS" | jq -r '.data.items[-1].seq')
@@ -556,7 +612,7 @@ check "生图走的是现有任务队列" "$(curl -s "$BASE/v1/jobs" -H "Authori
 check "生图照常计费" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="调用模型 mock-image")] | length')" "3"
 
 # 换 Gemini 格式的渠道，同一套工具循环要照样跑通。
-agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '"mock-gemini-text"'
+agent_settings "$SEARCH_EMPTY" '"mock-gemini-text"'
 GEMINI_SESSION=$(curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"projectId":"agent-p1","title":"Gemini 会话"}' | jq -r .data.id)
 curl -s -X POST "$BASE/v1/agent/sessions/$GEMINI_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"gemini-m1","content":"在画布上加一个文本节点"}' >/dev/null
 for _ in $(seq 1 40); do
@@ -569,41 +625,43 @@ check "Gemini 格式的工具调用也能跑通" "$(echo "$GEMINI_MSGS" | jq -r 
 check "Gemini 格式能拿到最终回复" "$(echo "$GEMINI_MSGS" | jq -r '[.data.items[] | select(.role=="assistant")][-1].content')" "已经按你的要求改好画布了。"
 
 # 用户自选模型：选了就按选的跑、按选的单价计费；生图模型和没配过的模型一律挡下来回落到管理员默认。
-agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '""'
+agent_settings "$SEARCH_EMPTY" '""'
 PICK_SESSION=$(new_agent_session '{"projectId":"agent-p1","title":"选模型会话","model":"mock-gemini-text"}')
 check "用户指定的文本模型能生效" "$(agent_model "$PICK_SESSION")" "mock-gemini-text"
 check "不指定模型时用管理员配置的默认" "$(agent_model "$(new_agent_session '{"projectId":"agent-p1","title":"默认模型会话"}')")" "mock-text"
 check "生图模型不能拿来跑 agent" "$(agent_model "$(new_agent_session '{"projectId":"agent-p1","title":"生图模型会话","model":"mock-image"}')")" "mock-text"
 check "没配过的模型不能拿来跑 agent" "$(agent_model "$(new_agent_session '{"projectId":"agent-p1","title":"野模型会话","model":"不存在的模型"}')")" "mock-text"
 
-# 计费按会话实际用的模型算：mock-gemini-text 每轮 3 点，两轮就是 6 点，换成 mock-text 只会扣 2 点。
+# 计费按会话实际用的模型算，且一条消息只扣一次：mock-gemini-text 每条消息 3 点，换成 mock-text 只会扣 1 点。
 PICK_BEFORE=$(credits_now)
 curl -s -X POST "$BASE/v1/agent/sessions/$PICK_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"pick-m1","content":"在画布上加一个文本节点","model":"mock-gemini-text"}' >/dev/null
 wait_agent_idle "$PICK_SESSION"
 check "用户选的模型真的跑起来了" "$(agent_status "$PICK_SESSION")" "idle"
-check "按用户选的模型计费" "$((PICK_BEFORE - $(credits_now)))" "6"
+check "按用户选的模型计费" "$((PICK_BEFORE - $(credits_now)))" "3"
 
 # 关键回归：管理员改了全站默认，也不能把用户已经选好的模型冲掉。
-agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '"mock-text"'
+agent_settings "$SEARCH_EMPTY" '"mock-text"'
 KEEP_BEFORE=$(credits_now)
 curl -s -X POST "$BASE/v1/agent/sessions/$PICK_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"pick-m2","content":"再加一个文本节点"}' >/dev/null
 wait_agent_idle "$PICK_SESSION"
 check "用户选的模型不会被管理员配置冲掉" "$(agent_model "$PICK_SESSION")" "mock-gemini-text"
-check "沿用会话模型时也按该模型计费" "$((KEEP_BEFORE - $(credits_now)))" "6"
+check "沿用会话模型时也按该模型计费" "$((KEEP_BEFORE - $(credits_now)))" "3"
 
 # 管理员把用户选的模型下线：不该报错卡死，要静默回落到默认模型继续跑完。
-agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '""' "$AGENT_CHANNELS_NO_GEMINI"
+agent_settings "$SEARCH_EMPTY" '""' "$AGENT_CHANNELS_NO_GEMINI"
 check "下线的模型不再下发给前端" "$(curl -s "$BASE/settings" | jq -r '[.data.modelChannel.models[] | select(.name=="mock-gemini-text")] | length')" "0"
 FALLBACK_BEFORE=$(credits_now)
 curl -s -X POST "$BASE/v1/agent/sessions/$PICK_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"pick-m3","content":"再加一个文本节点","model":"mock-gemini-text"}' >/dev/null
 wait_agent_idle "$PICK_SESSION"
 check "选的模型被下线后回落到默认模型" "$(agent_model "$PICK_SESSION")" "mock-text"
 check "回落之后照样跑完，不会卡死" "$(agent_status "$PICK_SESSION")" "idle"
-check "回落之后按默认模型计费" "$((FALLBACK_BEFORE - $(credits_now)))" "2"
+check "回落之后按默认模型计费" "$((FALLBACK_BEFORE - $(credits_now)))" "1"
 
 # 配上搜索密钥后才把 web_search 交给模型，没配时既不报错也不下发。
-agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "exa-test-key", "maxResults": 3 }' '""'
+agent_settings "$SEARCH_EXA" '""'
 check "配了密钥后联网搜索开启" "$(curl -s "$BASE/settings" | jq -r .data.agent.searchEnabled)" "true"
+check "后台读取时搜索密钥被脱敏" "$(curl -s "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.private.search.services[0].apiKey')" ""
+check "脱敏不会连服务商配置一起抹掉" "$(curl -s "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.private.search.services[0].provider')" "exa"
 SEARCH_SESSION=$(curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"projectId":"agent-p1","title":"搜索会话"}' | jq -r .data.id)
 curl -s -X POST "$BASE/v1/agent/sessions/$SEARCH_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"search-m1","content":"在画布上加一个文本节点"}' >/dev/null
 for _ in $(seq 1 40); do
@@ -611,13 +669,107 @@ for _ in $(seq 1 40); do
     sleep 1
 done
 check "配了密钥后才把 web_search 下发给模型" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="web_search")] | length')" "1"
+check "配了密钥后才把 read_webpage 下发给模型" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_webpage")] | length')" "1"
+
+# 读网页真的把上游正文取回来，并按服务端上限截断后告诉模型「没读完」。
+agent_message() {
+    curl -s -X POST "$BASE/v1/agent/sessions/$1/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"'"$2"'","content":"'"$3"'"}' >/dev/null
+    wait_agent_idle "$1"
+}
+last_tool_result() { curl -s "$BASE/v1/agent/sessions/$1/messages" -H "Authorization: Bearer $USER_TOKEN" | jq -r "[.data.items[] | select(.toolName==\"$2\")][-1].toolResult"; }
+
+agent_message "$SEARCH_SESSION" "read-m1" "帮我读取网页"
+EXA_PAGE=$(last_tool_result "$SEARCH_SESSION" "read_webpage" | jq -r '.data')
+check "读网页拿到 Exa 的正文" "$(echo "$EXA_PAGE" | jq -r '.title')" "冒烟长文Exa"
+check "读网页回填原始网址" "$(echo "$EXA_PAGE" | jq -r '.url')" "https://example.com/long-article"
+check "超长正文按 8000 字符截断" "$(echo "$EXA_PAGE" | jq -r '.text | length')" "8000"
+check "截断时明确告诉模型没读完" "$(echo "$EXA_PAGE" | jq -r '.truncated')" "true"
+check "截断时附带中文说明" "$(echo "$EXA_PAGE" | jq -r '.note | contains("只有开头部分")')" "true"
+
+# 换一家服务商：Tavily 的字段名完全不同（raw_content 且没有长度参数），provider 抽象要能各解析各的。
+agent_settings "$SEARCH_TAVILY" '""'
+agent_message "$SEARCH_SESSION" "read-m2" "帮我读取网页"
+TAVILY_PAGE=$(last_tool_result "$SEARCH_SESSION" "read_webpage" | jq -r '.data')
+check "换成 Tavily 也能读到正文" "$(echo "$TAVILY_PAGE" | jq -r '.title')" "冒烟长文Tavily"
+check "Tavily 的整篇原文同样被截断" "$(echo "$TAVILY_PAGE" | jq -r '.text | length')" "8000"
+agent_message "$SEARCH_SESSION" "search-m2" "帮我联网搜索"
+check "换成 Tavily 也能搜到结果" "$(last_tool_result "$SEARCH_SESSION" "web_search" | jq -r '.data.results[0].url')" "https://example.com/tavily"
+
+# 多服务自动切换：权重高的那家必定 500，整条链路仍要成功。
+agent_settings "$SEARCH_FAILOVER" '""'
+agent_message "$SEARCH_SESSION" "read-m3" "帮我读取网页"
+FAILOVER_PAGE=$(last_tool_result "$SEARCH_SESSION" "read_webpage" | jq -r '.data')
+check "优先级高的搜索服务挂了会自动换下一家" "$(echo "$FAILOVER_PAGE" | jq -r '.title')" "冒烟长文Tavily"
+check "自动换服务商后正文照样截断" "$(echo "$FAILOVER_PAGE" | jq -r '.text | length')" "8000"
+agent_message "$SEARCH_SESSION" "search-m3" "帮我联网搜索"
+check "搜索同样会自动换到可用的服务商" "$(last_tool_result "$SEARCH_SESSION" "web_search" | jq -r '.data.results[0].url')" "https://example.com/tavily"
+
+# 内网地址必须挡住：模型可能被网页内容诱导去探测部署环境。
+agent_settings "$SEARCH_EXA" '""'
+agent_message "$SEARCH_SESSION" "read-m4" "帮我读取内网地址"
+INTERNAL=$(last_tool_result "$SEARCH_SESSION" "read_webpage")
+check "读网页拒绝内网地址" "$(echo "$INTERNAL" | jq -r '.ok')" "false"
+check "拒绝内网地址给出中文原因" "$(echo "$INTERNAL" | jq -r '.error')" "不能读取本机或内网地址"
+
 # 留空表示保持不变，别把已配好的密钥洗掉。
-agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 3 }' '""'
+agent_settings "$SEARCH_EXA_KEEP" '""'
 check "留空保存不会清掉搜索密钥" "$(curl -s "$BASE/settings" | jq -r .data.agent.searchEnabled)" "true"
-agent_settings '{ "enabled": false, "provider": "exa", "apiKey": "", "maxResults": 3 }' '""'
+agent_settings "$SEARCH_DISABLED" '""'
 check "关掉开关后联网搜索不可用" "$(curl -s "$BASE/settings" | jq -r .data.agent.searchEnabled)" "false"
 
-# 中止正在跑的会话：循环停下，状态回到 idle，不留下卡住的 running。
+# 画布节点引用与图片附件：引用只把 ID / 类型 / 标题交给模型，附件才真的进上下文。
+# 这两条路径故意都用支持视觉的模型跑，才能证明「不带图」是设计如此，不是因为模型不认图。
+agent_settings "$SEARCH_EMPTY" '""'
+curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
+REF_FILE=$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $USER_TOKEN" -F "file=@$WORK/tiny.png;type=image/png" | jq -r .data.id)
+curl -s -X PUT "$BASE/v1/projects/agent-ref" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"引用画布","data":{"nodes":[
+  {"id":"ref-a","type":"image","title":"图A","position":{"x":0,"y":0},"width":200,"height":200,"metadata":{"storageKey":"server:'"$REF_FILE"'"}},
+  {"id":"ref-b","type":"image","title":"图B","position":{"x":300,"y":0},"width":200,"height":200,"metadata":{"storageKey":"server:'"$REF_FILE"'"}},
+  {"id":"ref-c","type":"text","title":"说明","position":{"x":600,"y":0},"width":200,"height":120,"metadata":{"content":"一段文字"}}
+],"connections":[]}}' >/dev/null
+REF_SESSION=$(new_agent_session '{"projectId":"agent-ref","title":"引用会话","model":"mock-text-vision"}')
+
+check "引用不存在的节点直接报错" "$(curl -s -X POST "$BASE/v1/agent/sessions/$REF_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"ref-bad","content":"看看 @[没了](canvas-node:ref-x#image)","model":"mock-text-vision"}' | jq -r .msg)" "引用的画布节点已不存在：ref-x"
+
+# 标记插在句子中间，位置本身有语义；客户端给的标题与类型一律不信，按当前画布重写。
+REF_BEFORE=$(credits_now)
+REF_MSG=$(curl -s -X POST "$BASE/v1/agent/sessions/$REF_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"ref-m1","content":"我需要对 @[假标题](canvas-node:ref-a#text) 和 @[图B](canvas-node:ref-b#image) 的图片作为参考，再改一下 @[说明](canvas-node:ref-c#text)","model":"mock-text-vision"}')
+check "引用按出现顺序落库" "$(echo "$REF_MSG" | jq -r '[.data.references[].nodeId] | join(",")')" "ref-a,ref-b,ref-c"
+check "引用只带 ID、类型、标题和缩略图键" "$(echo "$REF_MSG" | jq -r '.data.references[0] | keys | join(",")')" "nodeId,storageKey,title,type"
+check "客户端传的类型不作数" "$(echo "$REF_MSG" | jq -r '.data.references[0].type')" "image"
+check "客户端传的标题不作数" "$(echo "$REF_MSG" | jq -r '.data.references[0].title')" "图A"
+check "文本节点也能被引用" "$(echo "$REF_MSG" | jq -r '.data.references[2].type')" "text"
+check "标记留在正文原来的位置上" "$(echo "$REF_MSG" | jq -r '.data.content')" "我需要对 @[图A](canvas-node:ref-a#image) 和 @[图B](canvas-node:ref-b#image) 的图片作为参考，再改一下 @[说明](canvas-node:ref-c#text)"
+wait_agent_idle "$REF_SESSION"
+REF_CONTEXT=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_last")
+check "引用标记原样进了模型上下文" "$(echo "$REF_CONTEXT" | jq -r '[.messages[] | select(.role=="user") | tostring | select(test("canvas-node:ref-a"))] | length')" "1"
+check "系统提示里说明了引用格式" "$(echo "$REF_CONTEXT" | jq -r '[.messages[] | select(.role=="system") | select(.content | test("canvas-node:节点ID#节点类型"))] | length')" "1"
+check "引用不会把图片数据塞进上下文" "$(echo "$REF_CONTEXT" | jq -r 'tostring | test("data:image")')" "false"
+check "引用不会带上任何图片部件" "$(echo "$REF_CONTEXT" | jq -r '[.. | objects | select(.type=="image_url")] | length')" "0"
+check "一条消息只按所选模型扣一次" "$((REF_BEFORE - $(credits_now)))" "2"
+
+# 只给 references 不在正文里插标记：这类引用在句子里没有位置，统一补到正文末尾。
+TAIL_MSG=$(curl -s -X POST "$BASE/v1/agent/sessions/$REF_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"ref-m2","content":"帮我看看这个","references":[{"nodeId":"ref-b"}],"model":"mock-text-vision"}')
+check "单独给的引用也会落库" "$(echo "$TAIL_MSG" | jq -r '[.data.references[].nodeId] | join(",")')" "ref-b"
+check "单独给的引用补到正文末尾" "$(echo "$TAIL_MSG" | jq -r '.data.content')" "帮我看看这个
+
+@[图B](canvas-node:ref-b#image)"
+wait_agent_idle "$REF_SESSION"
+
+# 附件走的是另一条路：图片要真的进上下文，还要能被工具按 storageKey 引用到。
+ATT_SESSION=$(new_agent_session '{"projectId":"agent-ref","title":"附件会话","model":"mock-text"}')
+check "不支持视觉的模型不能收图" "$(curl -s -X POST "$BASE/v1/agent/sessions/$ATT_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"att-bad","content":"看这张图","attachmentIds":["'"$REF_FILE"'"],"model":"mock-text"}' | jq -r .msg)" "当前模型不支持识别图片，请换一个标注了「支持视觉」的模型再发图"
+check "别人的文件不能当附件" "$(curl -s -X POST "$BASE/v1/agent/sessions/$ATT_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"att-bad2","content":"看这张图","attachmentIds":["不存在的文件"],"model":"mock-text-vision"}' | jq -r .msg)" "图片附件不存在或已被删除"
+ATT_MSG=$(curl -s -X POST "$BASE/v1/agent/sessions/$ATT_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"att-m1","content":"用这张图建节点","attachmentIds":["'"$REF_FILE"'"],"model":"mock-text-vision"}')
+check "附件落库" "$(echo "$ATT_MSG" | jq -r '.data.attachments | join(",")')" "$REF_FILE"
+wait_agent_idle "$ATT_SESSION"
+ATT_CONTEXT=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_last")
+check "附件真的进了模型上下文" "$(echo "$ATT_CONTEXT" | jq -r '[.. | objects | select(.type=="image_url")] | length >= 1')" "true"
+check "附件是按 data url 传的" "$(echo "$ATT_CONTEXT" | jq -r 'tostring | test("data:image/png;base64,")')" "true"
+check "附件的 storageKey 也给了模型" "$(echo "$ATT_CONTEXT" | jq -r 'tostring | test("server:'"$REF_FILE"'")')" "true"
+check "工具能按 storageKey 引用到附件" "$(curl -s "$BASE/v1/projects/agent-ref" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.data.nodes[] | select(.metadata.storageKey=="server:'"$REF_FILE"'" and .title=="附件节点")] | length')" "1"
+
+
 curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m4","content":"再加一个文本节点"}' >/dev/null
 check "执行中不允许并发发消息" "$(curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m5","content":"插队"}' | jq -r .msg)" "当前会话正在执行中，请等待完成或先中止"
 curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/abort" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
