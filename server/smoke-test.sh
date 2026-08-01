@@ -447,16 +447,33 @@ AGENT_CHANNELS='[
   { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-text", "capability": "text" }], "weight": 1, "enabled": true },
   { "apiFormat": "gemini", "name": "本地假 Gemini", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-gemini-text", "capability": "text" }], "weight": 1, "enabled": true }
 ]'
-AGENT_COSTS='[{ "model": "mock-text", "credits": 1 }, { "model": "mock-gemini-text", "credits": 1 }, { "model": "mock-image", "credits": 1 }]'
+# 把 Gemini 渠道停用，用来验证「用户选的模型被管理员下线」这条路径。
+AGENT_CHANNELS_NO_GEMINI='[
+  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-text", "capability": "text" }], "weight": 1, "enabled": true },
+  { "apiFormat": "gemini", "name": "本地假 Gemini", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-gemini-text", "capability": "text" }], "weight": 1, "enabled": false }
+]'
+# 两个文本模型故意定不同单价：agent 按轮计费，换模型必须换单价，只有价差才验得出「计费真的按所选模型走」。
+AGENT_COSTS='[{ "model": "mock-text", "credits": 1 }, { "model": "mock-gemini-text", "credits": 3 }, { "model": "mock-image", "credits": 1 }]'
+# 第三个参数是渠道配置，默认两条渠道都开着。
 agent_settings() {
     curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{
-      "private": { "channels": '"$AGENT_CHANNELS"', "search": '"$1"' },
+      "private": { "channels": '"${3:-$AGENT_CHANNELS}"', "search": '"$1"' },
       "public": {
         "modelChannel": { "defaultTextModel": "mock-text", "defaultImageModel": "mock-image", "modelCosts": '"$AGENT_COSTS"' },
         "agent": { "enabled": true, "model": '"$2"', "maxRounds": 5 }
       }
     }' >/dev/null
 }
+credits_now() { curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits; }
+agent_model() { curl -s "$BASE/v1/agent/sessions/$1" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.model; }
+agent_status() { curl -s "$BASE/v1/agent/sessions/$1" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status; }
+wait_agent_idle() {
+    for _ in $(seq 1 40); do
+        [ "$(agent_status "$1")" != "running" ] && break
+        sleep 1
+    done
+}
+new_agent_session() { curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "$1" | jq -r .data.id; }
 agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '""'
 curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
 
@@ -550,6 +567,39 @@ GEMINI_MSGS=$(curl -s "$BASE/v1/agent/sessions/$GEMINI_SESSION/messages" -H "Aut
 check "管理员指定的 Agent 专用模型生效" "$(curl -s "$BASE/v1/agent/sessions/$GEMINI_SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.model)" "mock-gemini-text"
 check "Gemini 格式的工具调用也能跑通" "$(echo "$GEMINI_MSGS" | jq -r '[.data.items[] | select(.role=="tool")][0].toolName')" "create_node"
 check "Gemini 格式能拿到最终回复" "$(echo "$GEMINI_MSGS" | jq -r '[.data.items[] | select(.role=="assistant")][-1].content')" "已经按你的要求改好画布了。"
+
+# 用户自选模型：选了就按选的跑、按选的单价计费；生图模型和没配过的模型一律挡下来回落到管理员默认。
+agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '""'
+PICK_SESSION=$(new_agent_session '{"projectId":"agent-p1","title":"选模型会话","model":"mock-gemini-text"}')
+check "用户指定的文本模型能生效" "$(agent_model "$PICK_SESSION")" "mock-gemini-text"
+check "不指定模型时用管理员配置的默认" "$(agent_model "$(new_agent_session '{"projectId":"agent-p1","title":"默认模型会话"}')")" "mock-text"
+check "生图模型不能拿来跑 agent" "$(agent_model "$(new_agent_session '{"projectId":"agent-p1","title":"生图模型会话","model":"mock-image"}')")" "mock-text"
+check "没配过的模型不能拿来跑 agent" "$(agent_model "$(new_agent_session '{"projectId":"agent-p1","title":"野模型会话","model":"不存在的模型"}')")" "mock-text"
+
+# 计费按会话实际用的模型算：mock-gemini-text 每轮 3 点，两轮就是 6 点，换成 mock-text 只会扣 2 点。
+PICK_BEFORE=$(credits_now)
+curl -s -X POST "$BASE/v1/agent/sessions/$PICK_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"pick-m1","content":"在画布上加一个文本节点","model":"mock-gemini-text"}' >/dev/null
+wait_agent_idle "$PICK_SESSION"
+check "用户选的模型真的跑起来了" "$(agent_status "$PICK_SESSION")" "idle"
+check "按用户选的模型计费" "$((PICK_BEFORE - $(credits_now)))" "6"
+
+# 关键回归：管理员改了全站默认，也不能把用户已经选好的模型冲掉。
+agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '"mock-text"'
+KEEP_BEFORE=$(credits_now)
+curl -s -X POST "$BASE/v1/agent/sessions/$PICK_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"pick-m2","content":"再加一个文本节点"}' >/dev/null
+wait_agent_idle "$PICK_SESSION"
+check "用户选的模型不会被管理员配置冲掉" "$(agent_model "$PICK_SESSION")" "mock-gemini-text"
+check "沿用会话模型时也按该模型计费" "$((KEEP_BEFORE - $(credits_now)))" "6"
+
+# 管理员把用户选的模型下线：不该报错卡死，要静默回落到默认模型继续跑完。
+agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '""' "$AGENT_CHANNELS_NO_GEMINI"
+check "下线的模型不再下发给前端" "$(curl -s "$BASE/settings" | jq -r '[.data.modelChannel.models[] | select(.name=="mock-gemini-text")] | length')" "0"
+FALLBACK_BEFORE=$(credits_now)
+curl -s -X POST "$BASE/v1/agent/sessions/$PICK_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"pick-m3","content":"再加一个文本节点","model":"mock-gemini-text"}' >/dev/null
+wait_agent_idle "$PICK_SESSION"
+check "选的模型被下线后回落到默认模型" "$(agent_model "$PICK_SESSION")" "mock-text"
+check "回落之后照样跑完，不会卡死" "$(agent_status "$PICK_SESSION")" "idle"
+check "回落之后按默认模型计费" "$((FALLBACK_BEFORE - $(credits_now)))" "2"
 
 # 配上搜索密钥后才把 web_search 交给模型，没配时既不报错也不下发。
 agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "exa-test-key", "maxResults": 3 }' '""'

@@ -14,10 +14,13 @@ type ModelPickerProps = {
     className?: string;
     fullWidth?: boolean;
     placeholder?: string;
+    /** 会话执行中等场景不允许改模型，禁用但仍然显示当前用的是哪个。 */
+    disabled?: boolean;
+    ariaLabel?: string;
     onMissingConfig?: () => void;
 };
 
-export function ModelPicker({ config, value, onChange, capability, className, fullWidth = false, placeholder = "选择模型", onMissingConfig }: ModelPickerProps) {
+export function ModelPicker({ config, value, onChange, capability, className, fullWidth = false, placeholder = "选择模型", disabled, ariaLabel, onMissingConfig }: ModelPickerProps) {
     const pickerId = useId();
     const [open, setOpen] = useState(false);
     // 服务器模式下模型来自服务端，订阅它才能在配置拉回来后重新计算选项。
@@ -37,6 +40,7 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
         <Select
             open={open}
             value={current}
+            disabled={disabled}
             onOpenChange={(nextOpen) => {
                 // 服务器模式的模型由管理员在后台配置，这里不该把用户引到本地渠道设置。
                 if (nextOpen && !options.length) onMissingConfig?.();
@@ -54,6 +58,7 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
                 )}
                 onMouseDown={(event) => event.stopPropagation()}
                 onPointerDown={(event) => event.stopPropagation()}
+                aria-label={ariaLabel}
                 title={current ? modelOptionLabel(config, current) : placeholder}
             >
                 <ModelIcon model={current} />

@@ -8,7 +8,7 @@ import { upstreamJson } from "../lib/upstream";
 import { listAgentTools, runAgentTool, type AgentTool } from "./agent-tools";
 import { consumeUserCredits, refundUserCredits } from "./auth";
 import { searchConfig } from "./search";
-import { buildChannelUrl, modelCost, publicSettings, selectModelChannel, type ModelChannel } from "./settings";
+import { buildChannelUrl, modelCost, publicSettings, selectModelChannel, type ModelChannel, type PublicSetting } from "./settings";
 import { readProjectCanvas } from "./sync";
 
 export type AgentSessionView = { id: string; projectId: string; title: string; status: AgentSessionStatus; model: string; error: string; lastSeq: number; createdAt: string; updatedAt: string };
@@ -91,15 +91,27 @@ export async function getAgentSession(userId: string, sessionId: string) {
     return toSessionView(await loadSession(userId, sessionId));
 }
 
+/**
+ * 定这个会话该用哪个模型。用户选的优先，但必须是「已启用渠道里 capability 为 text」的模型：
+ * 放行生图模型或没配过的模型，既会在上游直接报错，也会绕开按模型单价计费的口径。
+ * 校验不通过时静默回落到管理员配置的默认，而不是报错——管理员随时可能下线某个模型，
+ * 用户偏好里存着的旧选择会跟着失效，这时候把会话卡死比换个模型跑完更糟。
+ */
+function resolveAgentModel(settings: PublicSetting, preferred: string) {
+    const name = preferred.trim();
+    if (name && settings.modelChannel.models.some((model) => model.name === name && model.capability === "text")) return name;
+    return settings.agent.model || settings.modelChannel.defaultTextModel;
+}
+
 /** 会话必须绑定一个存在的画布，否则工具改不到任何东西。 */
-export async function createAgentSession(userId: string, input: { sessionId: string; projectId: string; title: string }) {
+export async function createAgentSession(userId: string, input: { sessionId: string; projectId: string; title: string; model: string }) {
     const settings = await publicSettings();
     if (!settings.agent.enabled || !settings.capabilities.text) throw fail("画布 Agent 未开放");
     const projectId = input.projectId.trim();
     if (!projectId) throw fail("缺少画布项目 ID");
     await readProjectCanvas(userId, projectId);
 
-    const model = settings.agent.model || settings.modelChannel.defaultTextModel;
+    const model = resolveAgentModel(settings, input.model);
     if (!model) throw fail("系统未配置 Agent 使用的文本模型");
     const sessionId = input.sessionId.trim() || newId("agent");
     const saved = await sessions().findOneBy({ userId, sessionId });
@@ -334,7 +346,7 @@ async function runSession(session: AgentSession) {
  * 发消息即触发后台执行，接口立刻返回，不等循环跑完。
  * clientMessageId 是幂等键：断网重发同一个键只会拿回已存在的那条消息，不会重复执行、重复扣费。
  */
-export async function sendAgentMessage(userId: string, sessionId: string, input: { clientMessageId: string; content: string }) {
+export async function sendAgentMessage(userId: string, sessionId: string, input: { clientMessageId: string; content: string; model: string }) {
     const clientMessageId = input.clientMessageId.trim();
     if (!clientMessageId) throw fail("缺少消息幂等键");
     const content = input.content.trim();
@@ -347,8 +359,10 @@ export async function sendAgentMessage(userId: string, sessionId: string, input:
 
     const session = await loadSession(userId, sessionId);
     if (session.status === "running") throw fail("当前会话正在执行中，请等待完成或先中止");
-    // 模型可能在会话创建后被管理员改掉，每次发消息都按最新配置对齐。
-    const model = settings.agent.model || settings.modelChannel.defaultTextModel;
+    // 用户这次选了就按用户的来，没选就沿用会话上一轮用的模型，不再无条件按管理员配置对齐——
+    // 那样会把用户在面板上的选择冲掉。模型被下线的情况由 resolveAgentModel 兜底回落到默认。
+    // 模型只在这里定一次，跑到一半改选择也只对下一轮生效，当前这轮用的还是发消息时确定的那个。
+    const model = resolveAgentModel(settings, input.model || session.model);
     if (!model) throw fail("系统未配置 Agent 使用的文本模型");
 
     await patchSession(session, { model, status: "running", error: "", title: session.lastSeq ? session.title : content.slice(0, 30) });

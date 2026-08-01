@@ -2,6 +2,7 @@ import { nanoid } from "nanoid";
 import { create } from "zustand";
 
 import { serverAgentStream, serverApi, type ServerAgentEvent, type ServerAgentMessage, type ServerAgentSession, type ServerAgentSessionStatus } from "@/services/api/server";
+import { resolveAgentModel, useConfigStore } from "@/stores/use-config-store";
 import { isServerMode, useServerStore } from "@/stores/use-server-store";
 
 /** 记住上次打开的会话，刷新页面或换设备回来能接回原来那条对话；只是一个会话 ID，放 localStorage 足够。 */
@@ -48,6 +49,8 @@ type CloudAgentStore = {
     projectId: string;
     sessions: ServerAgentSession[];
     sessionId: string;
+    /** 当前会话正在用的模型。空表示还没有会话，面板按用户偏好 / 管理员默认展示。 */
+    model: string;
     messages: ServerAgentMessage[];
     status: ServerAgentSessionStatus;
     error: string;
@@ -58,6 +61,7 @@ type CloudAgentStore = {
     canvasReload: number;
     requestCanvasReload: () => void;
     setPrompt: (prompt: string) => void;
+    setModel: (model: string) => void;
     bindProject: (projectId: string) => void;
     refreshSessions: () => Promise<void>;
     openSession: (sessionId: string) => Promise<void>;
@@ -130,6 +134,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         projectId: "",
         sessions: [],
         sessionId: "",
+        model: "",
         messages: [],
         status: "idle",
         error: "",
@@ -141,6 +146,15 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         setPrompt: (prompt) => set({ prompt }),
 
         /**
+         * 面板上换模型：既改当前会话下一轮要用的模型，也写进用户偏好当作以后新会话的默认。
+         * 偏好走 updateConfig，跟着账号云端同步，换设备、换会话回来还是这个选择。
+         */
+        setModel: (model) => {
+            set({ model });
+            useConfigStore.getState().updateConfig("agentModel", model);
+        },
+
+        /**
          * 由画布页在挂载、切换项目以及登录态就绪时调用。绑定即拉一次会话与增量，
          * 面板没打开也照常挂流，这样 agent 在后台改画布时画面能实时刷新。
          * 首次调用时服务端配置可能还没拉到，这里不算绑定成功，等就绪后的下一次调用补上。
@@ -149,7 +163,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (get().projectId !== projectId) {
                 detach();
                 loadedProjectId = "";
-                set({ projectId, sessions: [], sessionId: "", messages: [], status: "idle", error: "", prompt: "", sending: false });
+                set({ projectId, sessions: [], sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", sending: false });
             }
             if (!projectId || loadedProjectId === projectId || !isServerMode() || !useServerStore.getState().settings?.agent.enabled) return;
             loadedProjectId = projectId;
@@ -162,12 +176,13 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (!sessionId) return;
             detach();
             localStorage.setItem(SESSION_KEY, sessionId);
-            set({ sessionId, messages: [], status: "idle", error: "", loading: true });
+            set({ sessionId, model: "", messages: [], status: "idle", error: "", loading: true });
             try {
                 // 先补齐历史再挂流：服务端循环不依赖前端连接，断线期间跑完的结果都已经落库。
                 const [session, { items }] = await Promise.all([serverApi.agentSession(sessionId), serverApi.agentMessages(sessionId, 0)]);
                 if (get().sessionId !== sessionId) return;
-                set({ messages: items, status: session.status, error: session.error, loading: false });
+                // 每个会话记着自己用的模型，切回来还是当初那个，不会被别的会话的选择带跑。
+                set({ model: session.model, messages: items, status: session.status, error: session.error, loading: false });
                 if (session.status === "running") void attach(sessionId);
             } catch (error) {
                 if (get().sessionId !== sessionId) return;
@@ -179,7 +194,8 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         newSession: () => {
             detach();
             localStorage.removeItem(SESSION_KEY);
-            set({ sessionId: "", messages: [], status: "idle", error: "", prompt: "" });
+            // 模型清空，新会话按用户偏好（没设过就按管理员默认）起头。
+            set({ sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "" });
         },
 
         deleteSession: async (sessionId) => {
@@ -191,7 +207,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (get().sessionId === sessionId) {
                 detach();
                 localStorage.removeItem(SESSION_KEY);
-                set({ sessionId: "", messages: [], status: "idle", error: "" });
+                set({ sessionId: "", model: "", messages: [], status: "idle", error: "" });
             }
             set((state) => ({ sessions: state.sessions.filter((item) => item.id !== sessionId) }));
         },
@@ -202,17 +218,23 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             set({ sending: true, error: "", prompt: "" });
             const clientMessageId = pendingSend?.content === content ? pendingSend.clientMessageId : nanoid();
             pendingSend = { clientMessageId, content };
+            // 模型在发送这一刻定下来：会话已选的优先，其次用户偏好，最后回落管理员默认。
+            const model = resolveAgentModel(get().model);
             try {
-                const sessionId = get().sessionId || (await serverApi.createAgentSession({ sessionId: "", projectId: get().projectId, title: content.slice(0, 30) })).id;
+                const sessionId = get().sessionId || (await serverApi.createAgentSession({ sessionId: "", projectId: get().projectId, title: content.slice(0, 30), model })).id;
                 if (sessionId !== get().sessionId) {
                     localStorage.setItem(SESSION_KEY, sessionId);
                     set({ sessionId, messages: [] });
                 }
-                const message = await serverApi.sendAgentMessage(sessionId, { clientMessageId, content });
+                const message = await serverApi.sendAgentMessage(sessionId, { clientMessageId, content, model });
                 pendingSend = null;
                 set((state) => ({ sending: false, status: "running", messages: mergeMessages(state.messages, [message]) }));
                 void attach(sessionId);
-                void loadSessions(false);
+                // 服务端可能因为模型被下线而回落到别的模型，按服务端记录回填，面板显示的就是真正在跑、真正计费的那个。
+                void loadSessions(false).then(() => {
+                    const current = get().sessions.find((item) => item.id === sessionId);
+                    if (current && get().sessionId === sessionId) set({ model: current.model });
+                });
             } catch (error) {
                 // 发送失败把草稿还回输入框，用户可以直接重发；幂等键留着复用。
                 set((state) => ({ sending: false, error: errorText(error), prompt: state.prompt || content }));

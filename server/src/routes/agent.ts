@@ -14,7 +14,7 @@ agentRouter.post(
     userAuth,
     handle(async (req, res) => {
         const body = req.body || {};
-        ok(res, await createAgentSession(requireUser(req).id, { sessionId: String(body.sessionId || ""), projectId: String(body.projectId || ""), title: String(body.title || "") }));
+        ok(res, await createAgentSession(requireUser(req).id, { sessionId: String(body.sessionId || ""), projectId: String(body.projectId || ""), title: String(body.title || ""), model: String(body.model || "") }));
     }),
 );
 
@@ -44,7 +44,7 @@ agentRouter.post(
     userAuth,
     handle(async (req, res) => {
         const body = req.body || {};
-        ok(res, await sendAgentMessage(requireUser(req).id, String(req.params.id), { clientMessageId: String(body.clientMessageId || ""), content: String(body.content || "") }));
+        ok(res, await sendAgentMessage(requireUser(req).id, String(req.params.id), { clientMessageId: String(body.clientMessageId || ""), content: String(body.content || ""), model: String(body.model || "") }));
     }),
 );
 

@@ -3,6 +3,7 @@ import { App, Button, Form, Input, Modal, Select } from "antd";
 import { ModelPicker } from "@/components/model-picker";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
 import { useConfigStore, useEnabledCapabilities, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
+import { useServerStore } from "@/stores/use-server-store";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -27,6 +28,8 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
     const setConfigDialogOpen = useConfigStore((state) => state.setConfigDialogOpen);
     const capabilities = useEnabledCapabilities();
     const visibleGroups = modelGroups.filter((group) => capabilities[group.capability]);
+    // 画布 Agent 没开放时不显示它的默认模型，免得给出一个点了也用不上的设置。
+    const agentEnabled = useServerStore((state) => state.settings?.agent.enabled !== false) && capabilities.text;
 
     return (
         <>
@@ -41,6 +44,12 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
                                     <ModelPicker config={config} value={config[group.modelKey]} onChange={(model) => updateConfig(group.modelKey, model)} capability={group.capability} fullWidth />
                                 </Form.Item>
                             ))}
+                            {/* 画布 Agent 的默认模型单列一项：它决定新会话起手用哪个模型，也决定按轮计费的单价，和一次性生成的默认模型不是一回事。 */}
+                            {agentEnabled ? (
+                                <Form.Item label="Agent 默认模型" extra="画布右侧「系统模型」新建会话时使用，留空跟随管理员配置。" className="mb-0">
+                                    <ModelPicker config={config} value={config.agentModel} onChange={(model) => updateConfig("agentModel", model)} capability="text" ariaLabel="选择 Agent 默认模型" fullWidth />
+                                </Form.Item>
+                            ) : null}
                         </div>
                     </>
                 ) : (

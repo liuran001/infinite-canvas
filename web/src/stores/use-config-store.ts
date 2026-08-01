@@ -17,6 +17,8 @@ export type AiConfig = {
     videoModel: string;
     textModel: string;
     audioModel: string;
+    /** 云端 Agent 的默认模型，新会话用它；留空表示跟随管理员配置的全站默认。 */
+    agentModel: string;
     audioVoice: string;
     audioFormat: string;
     audioSpeed: string;
@@ -44,6 +46,7 @@ export const defaultConfig: AiConfig = {
     videoModel: "",
     textModel: "",
     audioModel: "",
+    agentModel: "",
     audioVoice: "alloy",
     audioFormat: "mp3",
     audioSpeed: "1",
@@ -152,6 +155,21 @@ export function resolveModelForCapability(config: AiConfig, currentModel: string
 
 export const modelCapabilities: ModelCapability[] = ["image", "text", "video", "audio"];
 
+/**
+ * 云端 Agent 该显示 / 使用哪个模型，三层依次回落：
+ * 当前会话已经在用的 → 用户自己的「Agent 默认模型」偏好 → 管理员配的全站默认。
+ * 每层都要求模型仍在服务端下发的 text 模型列表里，管理员下线某个模型后旧选择会自动跳到下一层，
+ * 与服务端 resolveAgentModel() 保持同一套口径，面板上显示的模型才和实际计费的一致。
+ */
+export function resolveAgentModel(currentModel?: string) {
+    const settings = useServerStore.getState().settings;
+    const isText = (value: string) => Boolean(value) && Boolean(settings?.modelChannel.models.some((model) => model.name === value && model.capability === "text"));
+    const current = modelOptionName(currentModel || "");
+    if (isText(current)) return current;
+    const preferred = modelOptionName(useConfigStore.getState().config.agentModel);
+    if (isText(preferred)) return preferred;
+    return settings?.agent.model || settings?.modelChannel.defaultTextModel || "";
+}
 /** 功能入口是否显示，由管理员在后台统一控制；没配对应模型时也自动隐藏。 */
 export function isCapabilityEnabled(capability: ModelCapability) {
     const settings = useServerStore.getState().settings;

@@ -63,6 +63,17 @@ export function toCloudChatItem(message: ServerAgentMessage): AgentChatMessageIt
 }
 
 /**
+ * 等待提示按当前实际进度说话：正在跑工具就说在跑哪个工具，其余情况一律用中性的「正在思考」。
+ * 不能一概说成「正在操作画布」——模型多数时间是在思考、写回复或联网搜索，压根没碰画布。
+ */
+export function cloudAgentActivity(messages: ServerAgentMessage[]) {
+    const last = messages[messages.length - 1];
+    // 工具消息先落一条没有结果的占位，拿到结果后用同一个 seq 再推一次；没有结果才代表这个工具还在跑。
+    if (last?.role === "tool" && !last.toolResult) return `正在${TOOL_LABELS[last.toolName] || "执行工具"}`;
+    return "正在思考";
+}
+
+/**
  * 已消耗算力点的下界。服务端每轮模型调用扣一次点，但消息记录里
  * 相邻两轮「只返回工具调用」的回复会连成一片，无法反推出准确轮数，
  * 所以只按「每条 assistant 回复算一轮 + 不跟在回复后面的工具段各算一轮」给严格下界。

@@ -174,12 +174,12 @@ export const serverApi = {
     aiModels: (model: string) => serverRequest<string[]>(`/v1/ai/models?model=${encodeURIComponent(model)}`, {}, "读取模型失败"),
 
     agentSessions: (projectId: string) => serverRequest<{ items: ServerAgentSession[] }>(`/v1/agent/sessions?projectId=${encodeURIComponent(projectId)}`, {}, "读取 Agent 会话失败"),
-    createAgentSession: (body: { sessionId: string; projectId: string; title: string }) => serverRequest<ServerAgentSession>("/v1/agent/sessions", { method: "POST", ...jsonBody(body) }, "新建 Agent 会话失败"),
+    createAgentSession: (body: { sessionId: string; projectId: string; title: string; model: string }) => serverRequest<ServerAgentSession>("/v1/agent/sessions", { method: "POST", ...jsonBody(body) }, "新建 Agent 会话失败"),
     agentSession: (id: string) => serverRequest<ServerAgentSession>(`/v1/agent/sessions/${id}`, {}, "读取 Agent 会话失败"),
     deleteAgentSession: (id: string) => serverRequest<boolean>(`/v1/agent/sessions/${id}`, { method: "DELETE" }, "删除 Agent 会话失败"),
     agentMessages: (id: string, sinceSeq: number) => serverRequest<{ items: ServerAgentMessage[] }>(`/v1/agent/sessions/${id}/messages?sinceSeq=${sinceSeq}`, {}, "读取 Agent 消息失败"),
-    /** clientMessageId 是幂等键：断网重发同一个键只会拿回已存在的那条消息，不会重复执行也不会重复扣点。 */
-    sendAgentMessage: (id: string, body: { clientMessageId: string; content: string }) => serverRequest<ServerAgentMessage>(`/v1/agent/sessions/${id}/messages`, { method: "POST", ...jsonBody(body) }, "发送消息失败"),
+    /** clientMessageId 是幂等键：断网重发同一个键只会拿回已存在的那条消息，不会重复执行也不会重复扣点。model 是用户在面板上选的模型，留空表示按服务端默认。 */
+    sendAgentMessage: (id: string, body: { clientMessageId: string; content: string; model: string }) => serverRequest<ServerAgentMessage>(`/v1/agent/sessions/${id}/messages`, { method: "POST", ...jsonBody(body) }, "发送消息失败"),
     abortAgentSession: (id: string) => serverRequest<ServerAgentSession>(`/v1/agent/sessions/${id}/abort`, { method: "POST" }, "中止 Agent 执行失败"),
 };
 

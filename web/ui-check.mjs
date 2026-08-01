@@ -94,6 +94,18 @@ async function main() {
         check(`${label}可打开且无运行时报错`, realErrors().length === 0, realErrors().join("\n       "));
     }
 
+    // 系统模型模式由后台开关控制，关掉时面板只剩本地 Agent，下面的断言都要跟着实际配置走。
+    const cloudAgentEnabled = await page.evaluate(async (api) => {
+        const response = await fetch(`${api}/api/settings`);
+        return Boolean((await response.json()).data?.agent?.enabled);
+    }, API);
+    if (cloudAgentEnabled) {
+        // 「Agent 默认模型」是独立的偏好项：面板里的即时切换只管当前会话，新建会话起手用的是这里，且跟随账号云端同步。
+        await visit("/config");
+        check("偏好设置里有 Agent 默认模型", (await page.getByText("Agent 默认模型").count()) > 0);
+        check("偏好设置无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+    }
+
     console.log("画布详情");
     await visit("/canvas");
     const created = await page
@@ -108,11 +120,6 @@ async function main() {
     await page.screenshot({ path: "ui-check-canvas.png" }).catch(() => {});
 
     console.log("画布 Agent 面板");
-    // 系统模型模式由后台开关控制，关掉时面板只剩本地 Agent，断言要跟着实际配置走。
-    const cloudAgentEnabled = await page.evaluate(async (api) => {
-        const response = await fetch(`${api}/api/settings`);
-        return Boolean((await response.json()).data?.agent?.enabled);
-    }, API);
     await page.getByRole("button", { name: "Agent", exact: true }).last().click();
     await page.waitForTimeout(1200);
     const panelOpened = (await page.getByRole("tablist", { name: "Agent 面板" }).count()) > 0;
@@ -121,6 +128,11 @@ async function main() {
     if (cloudAgentEnabled) {
         check("默认进入系统模型模式", (await modeSwitch.count()) > 0 && (await modeSwitch.first().innerText()).includes("系统模型"));
         check("系统模型面板说明按轮计费", (await page.getByText(/按轮计费/).count()) > 0);
+        // 模型现在由用户自己选：选择器要在输入框里，并且显示当前这个会话实际在用的模型（不是「选择模型」占位）。
+        const modelPicker = page.getByRole("combobox", { name: "选择系统模型" });
+        check("系统模型面板能选模型", (await modelPicker.count()) > 0);
+        const pickedModel = (await modelPicker.count()) ? (await modelPicker.first().innerText()).trim() : "";
+        check("模型选择器显示当前在用的模型", Boolean(pickedModel) && !pickedModel.includes("选择模型"), `当前显示「${pickedModel}」`);
         // 切到本地再切回来，确认两种模式都能挂载，本地 Agent 没有被云端模式挤坏。
         await modeSwitch.first().click();
         await page.getByRole("menuitem", { name: /本地 Agent/ }).click();
@@ -130,6 +142,7 @@ async function main() {
         await page.getByRole("menuitem", { name: /系统模型/ }).click();
         await page.waitForTimeout(800);
         check("可切回系统模型模式", (await page.getByText(/按轮计费/).count()) > 0);
+        check("切回来后模型选择器还在", (await page.getByRole("combobox", { name: "选择系统模型" }).count()) > 0);
     } else {
         check("未开放系统模型时只保留本地 Agent", (await modeSwitch.count()) === 0);
     }

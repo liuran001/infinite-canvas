@@ -4,7 +4,8 @@ import { CircleAlert, MessageSquare, PanelRightClose, Plus, RefreshCw, Sparkles,
 import { useShallow } from "zustand/react/shallow";
 
 import { canvasThemes } from "@/lib/canvas-theme";
-import { modelCreditCost, modelOptionLabel, useEffectiveConfig } from "@/stores/use-config-store";
+import { ModelPicker } from "@/components/model-picker";
+import { modelCreditCost, modelOptionLabel, resolveAgentModel, useEffectiveConfig } from "@/stores/use-config-store";
 import { useAgentStore } from "@/stores/use-agent-store";
 import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
 import { useIsServerMode, useServerStore } from "@/stores/use-server-store";
@@ -14,7 +15,7 @@ import { AgentChatMessage, AgentWorkingMessage } from "./agent-chat-message";
 import { AgentModeSwitch } from "./agent-mode-switch";
 import { AgentPanelTabs } from "./agent-panel-tabs";
 import { AgentScrollToBottom } from "./agent-scroll-to-bottom";
-import { minModelRounds, toCloudChatItem } from "./cloud-agent-format";
+import { cloudAgentActivity, minModelRounds, toCloudChatItem } from "./cloud-agent-format";
 
 const SCROLL_BOTTOM_THRESHOLD = 48;
 type CloudAgentTab = "chat" | "sessions";
@@ -32,11 +33,12 @@ export function CloudAgentPanel() {
     const closePanel = useAgentStore((state) => state.closePanel);
     const [tab, setTab] = useState<CloudAgentTab>("chat");
 
-    const { projectId, sessions, sessionId, messages, status, error, loading, sending, prompt } = useCloudAgentStore(
+    const { projectId, sessions, sessionId, sessionModel, messages, status, error, loading, sending, prompt } = useCloudAgentStore(
         useShallow((state) => ({
             projectId: state.projectId,
             sessions: state.sessions,
             sessionId: state.sessionId,
+            sessionModel: state.model,
             messages: state.messages,
             status: state.status,
             error: state.error,
@@ -46,6 +48,7 @@ export function CloudAgentPanel() {
         })),
     );
     const setPrompt = useCloudAgentStore((state) => state.setPrompt);
+    const setModel = useCloudAgentStore((state) => state.setModel);
     const send = useCloudAgentStore((state) => state.send);
     const abort = useCloudAgentStore((state) => state.abort);
     const newSession = useCloudAgentStore((state) => state.newSession);
@@ -54,11 +57,15 @@ export function CloudAgentPanel() {
     const refreshSessions = useCloudAgentStore((state) => state.refreshSessions);
 
     const running = status === "running";
-    const model = settings?.agent.model || settings?.modelChannel.defaultTextModel || "";
+    const config = useEffectiveConfig();
+    // 会话已经在用的模型优先，其次用户偏好，最后回落管理员默认；settings 与 config 都订阅了，配置变了会重算。
+    const model = useMemo(() => resolveAgentModel(sessionModel), [config.agentModel, sessionModel, settings]);
     const roundCost = modelCreditCost(model);
     const maxRounds = settings?.agent.maxRounds || 0;
     const usedCredits = useMemo(() => minModelRounds(messages) * roundCost, [messages, roundCost]);
     const items = useMemo(() => messages.map(toCloudChatItem), [messages]);
+    // 等待提示按实际进度说话：在跑工具就报工具名，其余情况说「正在思考」。
+    const activity = useMemo(() => cloudAgentActivity(messages), [messages]);
     // 服务端执行失败时会把同一句中文既写进对话又放进 session.error，对话里已经有了就不再重复弹一条。
     const showError = Boolean(error) && !messages.some((item) => item.role === "assistant" && item.content === error);
 
@@ -178,8 +185,8 @@ export function CloudAgentPanel() {
                 <>
                     <div className="relative min-h-0 flex-1">
                         <div ref={listRef} className="thin-scrollbar h-full select-text space-y-4 overflow-y-auto px-4 pt-4" onScroll={updateScrollState}>
-                            {items.length ? items.map((item) => <AgentChatMessage key={item.id} item={item} theme={theme} />) : <CloudAgentIntro theme={theme} ready={isServerMode && Boolean(projectId)} />}
-                            {running || sending ? <AgentWorkingMessage text="系统模型正在操作画布" activityKey={`${sessionId}-${messages.length}`} theme={theme} /> : null}
+                            {items.length ? items.map((item) => <AgentChatMessage key={item.id} item={item} theme={theme} />) : <CloudAgentIntro theme={theme} model={model} ready={isServerMode && Boolean(projectId)} />}
+                            {running || sending ? <AgentWorkingMessage text={activity} activityKey={`${sessionId}-${messages.length}-${activity}`} theme={theme} /> : null}
                         </div>
                         {showScrollToBottom ? <AgentScrollToBottom theme={theme} title="查看最新消息" onClick={() => scrollToBottom()} /> : null}
                     </div>
@@ -208,6 +215,18 @@ export function CloudAgentPanel() {
                         onPromptChange={setPrompt}
                         onSubmit={() => void send()}
                         onStop={() => void abort()}
+                        left={
+                            // 执行中不让改：这一轮用哪个模型在发消息时就定死了，改了也只会误导用户以为当前这轮换了模型。
+                            <ModelPicker
+                                config={config}
+                                value={model}
+                                capability="text"
+                                disabled={running || sending}
+                                ariaLabel="选择系统模型"
+                                className="h-9 max-w-44 rounded-full border-0 bg-transparent px-2.5 text-xs font-medium shadow-none hover:bg-black/5 dark:hover:bg-white/10"
+                                onChange={setModel}
+                            />
+                        }
                     />
                 </>
             )}
@@ -216,10 +235,9 @@ export function CloudAgentPanel() {
 }
 
 /** 空会话时说明这个模式能做什么：能力按服务端实际开关展示，没配搜索密钥就不要宣称能联网。 */
-function CloudAgentIntro({ theme, ready }: { theme: (typeof canvasThemes)[keyof typeof canvasThemes]; ready: boolean }) {
+function CloudAgentIntro({ theme, model, ready }: { theme: (typeof canvasThemes)[keyof typeof canvasThemes]; model: string; ready: boolean }) {
     const settings = useServerStore((state) => state.settings);
     const config = useEffectiveConfig();
-    const model = settings?.agent.model || settings?.modelChannel.defaultTextModel || "";
     const roundCost = modelCreditCost(model);
     const abilities = [
         "读取画布结构、新建 / 修改 / 删除节点、连接与断开连线",
