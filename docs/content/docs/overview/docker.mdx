@@ -7,12 +7,12 @@ description: 使用 Docker Compose 部署无限画布
 
 如果你希望在自己的机器或服务器上运行项目，可以直接使用 Docker Compose。镜像内包含前端与后端：nginx 托管前端并把 `/api` 反代到容器内的 Node 后端，数据库文件与上传文件都落在 `/app/data`，通过挂卷持久化。
 
-前端默认仍以本地模式运行，需要多设备同步和服务端生成时再开启[服务器模式](/docs/overview/server-mode)。可配置的环境变量见仓库根目录的 `.env.example`。
+首次部署请先改掉 `ADMIN_PASSWORD` 与 `JWT_SECRET`，并用管理员账号在管理后台配置模型渠道，详见[部署与使用](/docs/overview/server-mode)。可配置的环境变量见仓库根目录的 `.env.example`。
 
 ## 使用发布镜像
 
 ```bash
-git clone git@github.com:basketikun/infinite-canvas.git
+git clone git@github.com:liuran001/infinite-canvas.git
 cd infinite-canvas
 docker compose up -d
 ```
@@ -51,7 +51,7 @@ docker compose -f docker-compose.local.yml up -d --build
 
 ## 数据说明
 
-当前主应用镜像只启动 Next.js。画布、我的素材、生成记录和 AI API Key 默认保存在浏览器本地；第三方提示词由浏览器前端直连拉取，不需要额外挂载数据目录。
+主应用镜像同时运行 nginx 与 Node 服务端。画布、我的素材、生成记录、上传文件与数据库都在 `/app/data`，已通过命名卷持久化；模型渠道与密钥只保存在服务端。
 
 ## 统计分析（可选）
 
@@ -69,7 +69,7 @@ docker compose -f docker-compose.local.yml up -d --build
 ```yaml
 services:
   app:
-    image: ghcr.io/basketikun/infinite-canvas:latest
+    image: ghcr.io/liuran001/infinite-canvas:latest
     ports:
       - "3000:3000"
     environment:
@@ -83,7 +83,7 @@ services:
 docker run -d -p 3000:3000 \
   -e ANALYTICS_GA4_ID=G-XXXXXXXXXX \
   -e ANALYTICS_BAIDU_ID=e8263761cc5c32f5f7a855b8203b965a \
-  ghcr.io/basketikun/infinite-canvas:latest
+  ghcr.io/liuran001/infinite-canvas:latest
 ```
 
 单页应用的路由切换会自动向所有已启用的统计上报 pageview。

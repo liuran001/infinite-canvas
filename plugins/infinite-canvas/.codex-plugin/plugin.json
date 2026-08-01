@@ -7,7 +7,7 @@
     "url": "https://canvas.best/"
   },
   "homepage": "https://canvas.best/",
-  "repository": "https://github.com/basketikun/infinite-canvas",
+  "repository": "https://github.com/liuran001/infinite-canvas",
   "license": "AGPL-3.0",
   "keywords": ["infinite-canvas", "canvas", "mcp", "agent"],
   "skills": "./skills/",

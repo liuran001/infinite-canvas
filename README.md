@@ -6,9 +6,9 @@
 
 <p align="center">
   <a href="https://linux.do/"><img src="https://img.shields.io/badge/Linux.do-Community-2b6de8?style=flat-square" alt="Linux.do"></a>
-  <a href="https://render.com/deploy?repo=https://github.com/basketikun/infinite-canvas"><img src="https://img.shields.io/badge/Render-Deploy-46e3b7?style=flat-square&logo=render&logoColor=111111" alt="Deploy to Render"></a>
-  <a href="https://github.com/basketikun/infinite-canvas"><img src="https://img.shields.io/github/stars/basketikun/infinite-canvas?style=flat-square&logo=github" alt="GitHub stars"></a>
-  <a href="https://github.com/basketikun/infinite-canvas/tags"><img src="https://img.shields.io/github/v/tag/basketikun/infinite-canvas?style=flat-square&label=version" alt="Version"></a>
+  <a href="https://render.com/deploy?repo=https://github.com/liuran001/infinite-canvas"><img src="https://img.shields.io/badge/Render-Deploy-46e3b7?style=flat-square&logo=render&logoColor=111111" alt="Deploy to Render"></a>
+  <a href="https://github.com/liuran001/infinite-canvas"><img src="https://img.shields.io/github/stars/liuran001/infinite-canvas?style=flat-square&logo=github" alt="GitHub stars"></a>
+  <a href="https://github.com/liuran001/infinite-canvas/tags"><img src="https://img.shields.io/github/v/tag/liuran001/infinite-canvas?style=flat-square&label=version" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-f97316?style=flat-square" alt="License"></a>
   <a href="https://vite.dev/"><img src="https://img.shields.io/badge/Vite-7-646cff?style=flat-square&logo=vite&logoColor=white" alt="Vite"></a>
   <a href="https://reactrouter.com/"><img src="https://img.shields.io/badge/React_Router-7-ca4245?style=flat-square&logo=reactrouter&logoColor=white" alt="React Router"></a>
@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/content/docs/overview/quick-start.mdx">快速开始</a> · <a href="docs/content/docs/overview/features.mdx">功能介绍</a> · <a href="docs/content/docs/overview/server-mode.mdx">服务器模式</a> · <a href="docs/content/docs/overview/render.mdx">Render 部署</a> · <a href="docs/content/docs/overview/docker.mdx">Docker 部署</a> · <a href="docs/content/docs/canvas/canvas-node-manual.mdx">画布节点操作手册</a> · <a href="docs/content/docs/canvas/canvas-shortcuts.mdx">画布快捷键</a> · <a href="CLA.md">贡献者协议</a> · <a href="SECURITY.md">漏洞提交</a> · <a href="docs/content/docs/progress/todo.mdx">待办事项</a> · <a href="canvas-agent/README.md">本地 Canvas Agent</a> · <a href="plugins/infinite-canvas">Codex app 插件</a>
+  <a href="docs/content/docs/overview/quick-start.mdx">快速开始</a> · <a href="docs/content/docs/overview/features.mdx">功能介绍</a> · <a href="docs/content/docs/overview/server-mode.mdx">部署与使用</a> · <a href="docs/content/docs/overview/render.mdx">Render 部署</a> · <a href="docs/content/docs/overview/docker.mdx">Docker 部署</a> · <a href="docs/content/docs/canvas/canvas-node-manual.mdx">画布节点操作手册</a> · <a href="docs/content/docs/canvas/canvas-shortcuts.mdx">画布快捷键</a> · <a href="CLA.md">贡献者协议</a> · <a href="SECURITY.md">漏洞提交</a> · <a href="docs/content/docs/progress/todo.mdx">待办事项</a> · <a href="canvas-agent/README.md">本地 Canvas Agent</a> · <a href="plugins/infinite-canvas">Codex app 插件</a>
 </p>
 
 无限画布是一款面向图片创作的开源工作台。它把画布编排、AI 图片生成、参考图编辑、对话助手、提示词库和素材沉淀放在同一个界面里，适合用来探索视觉方案并连续迭代图片结果。
@@ -45,8 +45,10 @@
 ## 核心功能
 
 - 无限画布：多画布项目、节点拖拽缩放、连线、小地图、撤销重做、导入导出。
-- AI 创作：浏览器前台直连你配置的 OpenAI 兼容接口，支持文生图、图生图、参考图编辑、文本问答、音频和视频生成。
-- 服务器模式：可选部署自建后端，把画布、素材、图片存到服务器并多设备同步；生成任务在服务端执行，断网或换设备重新进入即可恢复，不会重复生成。
+- AI 创作：支持文生图、图生图、参考图编辑、文本问答、音频和视频生成，模型渠道由管理员在服务端统一配置。
+- 云端同步：画布、素材、图片与节点插件都存在自建服务端，登录同一账号即可多设备同步，并有云空间配额管理。
+- 可靠生成：生成任务在服务端执行，断网、刷新或换设备重新进入都能恢复进度，不会重复生成或重复扣费。
+- 账号体系：账号密码、Linux.do 授权与 Passkey 三种登录方式，管理后台可管理用户、算力点、模型渠道与内容审查。
 - 画布助手：围绕选中节点和上游节点对话、生图，并把结果插回画布。
 - 本地 Agent：通过本机 Canvas Agent 连接 Codex / Claude Code，让 Agent 通过 MCP 操作当前画布；
 - Codex App 插件：提供 Codex app 插件，安装后会自动注册 MCP 并尝试拉起本地 Agent。
@@ -60,14 +62,12 @@
 
 ## 快速开始
 
-默认是本地模式：AI API Key、Base URL、画布、素材和生成记录都保存在浏览器本地，不需要任何后端。
-
-如果需要多设备同步和更可靠的生成，可以部署自带的后端并开启服务器模式，详见[服务器模式](docs/content/docs/overview/server-mode.mdx)。
+项目由前端和自带的服务端组成，需要一起部署。模型渠道与密钥由管理员在服务端配置，用户登录后即可使用，数据在多设备之间自动同步。完整说明见[部署与使用](docs/content/docs/overview/server-mode.mdx)。
 
 ### 本地开发
 
 ```bash
-git clone git@github.com:basketikun/infinite-canvas.git
+git clone git@github.com:liuran001/infinite-canvas.git
 cd infinite-canvas
 cd web
 bun install
@@ -85,16 +85,14 @@ npm run dev
 ### Docker 运行
 
 ```bash
-git clone git@github.com:basketikun/infinite-canvas.git
+git clone git@github.com:liuran001/infinite-canvas.git
 cd infinite-canvas
 docker compose up -d
 ```
 
-运行后默认端口3000，可访问 `http://localhost:3000`。镜像内已经包含前端和后端，前端默认仍以本地模式运行。
+运行后默认端口 3000，可访问 `http://localhost:3000`。
 
-首次打开后进入右上角配置，填入自己的 OpenAI 兼容 `Base URL` 和 `API Key`。
-
-如果默认的OpenAI接口调用方式与您的API不同，可自定义生图/视频脚本调用。
+首次部署请先修改 `docker-compose.yml` 里的 `ADMIN_PASSWORD` 与 `JWT_SECRET`，启动后用管理员账号登录 `/admin`，在系统设置里添加模型渠道，用户才能选到模型。
 
 ## 效果展示
 
@@ -145,10 +143,10 @@ docker compose up -d
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=basketikun%2Finfinite-canvas&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=liuran001%2Finfinite-canvas&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=basketikun/infinite-canvas&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=basketikun/infinite-canvas&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=basketikun/infinite-canvas&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=liuran001/infinite-canvas&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=liuran001/infinite-canvas&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=liuran001/infinite-canvas&type=date&legend=top-left" />
  </picture>
 </a>

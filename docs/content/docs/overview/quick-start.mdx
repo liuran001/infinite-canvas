@@ -7,14 +7,24 @@ description: 用最少步骤把无限画布跑起来
 
 如果你只是想先把项目跑起来，优先部署或启动 `web/` 前端。
 
-## Vercel 部署
+## Docker 部署（推荐）
 
-在 Vercel 中导入仓库即可，根目录 `vercel.json` 会构建 `web/`。这种方式部署的是纯前端，AI 请求由浏览器前台直连用户自己的 OpenAI 兼容地址，不需要额外配置服务端；如果需要服务端能力，请改用 Docker 部署。
+项目由前端与自带的服务端组成，两者需要一起部署，用 Docker 最省事：
+
+```bash
+git clone git@github.com:liuran001/infinite-canvas.git
+cd infinite-canvas
+docker compose up -d
+```
+
+首次部署请先改掉 `docker-compose.yml` 里的 `ADMIN_PASSWORD` 与 `JWT_SECRET`，详见[部署与使用](/docs/overview/server-mode)。
+
+如果只把 `web/` 部署到 Vercel 这类静态托管，需要另外部署服务端，并让前端能访问到它的 `/api`。
 
 ## 本地启动
 
 ```bash
-git clone git@github.com:basketikun/infinite-canvas.git
+git clone git@github.com:liuran001/infinite-canvas.git
 cd infinite-canvas
 cd web
 bun install
@@ -38,11 +48,11 @@ docker run --rm -p 3000:3000 infinite-canvas
 
 ## 首次使用建议
 
-- 先打开右上角配置弹窗，填入自己的 `Base URL`、`API Key` 和模型名。
-- 如果需要提示词仓库内容，打开 `/prompts` 会由浏览器前端直连拉取并缓存到 IndexedDB。
-- 如果需要跨设备同步画布、素材和生成记录，可在配置弹窗中填写 WebDAV，或部署自建后端后开启[服务器模式](/docs/overview/server-mode)。
+- 用管理员账号登录 `/admin`，在系统设置里添加模型渠道并为每个模型指定能力，用户才能选到模型。
+- 普通用户注册登录后即可使用，画布、素材与生成记录会自动在多设备之间同步。
+- 需要免密登录可以在账号设置里添加 Passkey（要求 HTTPS 环境）。
 
 ## 说明
 
-- 默认的本地模式下，画布项目和“我的素材”保存在浏览器本地，WebDAV 同步需要用户自行配置；开启服务器模式后改为保存在服务器并自动多设备同步。
-- 本地模式的 AI API Key 保存在浏览器本地，并由前端直接请求 OpenAI 兼容接口；服务器模式的渠道密钥只保存在服务端，由管理员在管理后台配置。
+- 画布项目、“我的素材”、图片与节点插件都保存在服务端，本地只作缓存。
+- 模型渠道与密钥只存在服务端，由管理员在管理后台配置，前端不持有密钥。

@@ -5,7 +5,7 @@ description: 前端与后端的本地开发方式
 
 # 本地开发
 
-主应用由 `web/` 前端和 `server/` 后端组成。默认的本地模式不需要后端，AI 请求由浏览器前台直连用户自己的 OpenAI 兼容接口；只有开发服务器模式相关功能时才需要启动后端。
+主应用由 `web/` 前端和 `server/` 后端组成，前端的数据读写与 AI 调用都经过后端，**开发时两个都要起**。
 
 ## 1. 启动前端
 
@@ -23,11 +23,11 @@ http://localhost:3000
 
 ## 2. 配置模型
 
-打开右上角配置弹窗，填写自己的 `Base URL`、`API Key` 和模型名。第三方提示词和 WebDAV 都由浏览器前端直连。
+用管理员账号登录 `/admin`，在系统设置里添加模型渠道并为每个模型指定能力。前端的模型列表来自服务端，不配置就选不到模型。
 
-## 3. 启动后端（可选）
+## 3. 启动后端
 
-开发服务器模式相关功能时另开一个终端：
+另开一个终端：
 
 ```bash
 cd server
@@ -37,12 +37,20 @@ npm run dev
 
 后端默认监听 `8080`，用 SQLite 存数据。可以复制根目录 `.env.example` 成 `server/.env` 调整配置。首次启动会用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 创建管理员。
 
-前端连接时在「配置与用户偏好 - 服务器」里把服务器地址填成 `http://localhost:8080`，开启开关后登录即可。
+前端默认连同源 `/api`。用 vite dev server 时可以在 `web/vite.config.ts` 里加一条到 `http://localhost:8080` 的代理，或者直接访问后端端口。
 
-跑一遍后端主链路的冒烟测试：
+跑一遍后端主链路的冒烟测试（脚本用随机端口，可以并发跑）：
 
 ```bash
 bash server/smoke-test.sh
+```
+
+改完前端可以跑真机 UI 验证，它会用无头浏览器走一遍登录、主要页面与管理后台，并捕获运行时报错：
+
+```bash
+cd web
+npm i --no-save playwright && npx playwright install chromium
+UI_WEB=http://127.0.0.1:3000 UI_API=http://127.0.0.1:8080 node ui-check.mjs
 ```
 
 ## 4. 启动文档站
@@ -57,6 +65,6 @@ bun run dev
 
 - 改画布、页面和交互：主要看 `web/`
 - 改提示词缓存：主要看 `web/src/services/api/prompts.ts`
-- 改服务器模式的前端接入：主要看 `web/src/stores/use-server-store.ts` 和 `web/src/services/api/server.ts`
+- 改前后端契约：主要看 `web/src/stores/use-server-store.ts` 和 `web/src/services/api/server.ts`
 - 改后端接口：路由看 `server/src/routes/`，业务逻辑看 `server/src/services/`，数据表看 `server/src/db/entities.ts`
 - 改文档站内容：主要看 `docs/content/docs/`
