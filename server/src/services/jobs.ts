@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { In } from "typeorm";
+import { In, MoreThan } from "typeorm";
 
 import { config } from "../config";
 import { repo } from "../db/data-source";
@@ -37,8 +37,13 @@ export type JobView = {
     finishedAt: string;
 };
 
-/** 事件里带的是「到目前为止的完整文本」而不是单次增量：订阅方按已收到的长度截尾，重复收到或漏收都不会错位。 */
-export type JobTextEvent = { text: string; status: JobStatus; error: string };
+/**
+ * 推给订阅方的任务事件。
+ * `job` 是任务的完整快照，带上分配到的 seq；状态是「最新值即真相」，所以补齐时只发最新快照就够，
+ * 不用把中间每一次进度变化都补一遍。
+ * `text` 带的是「到目前为止的完整文本」而不是单次增量：订阅方按已收到的长度截尾，重复收到或漏收都不会错位。
+ */
+export type JobEvent = { type: "job"; seq: number; job: JobView } | { type: "text"; id: string; text: string };
 
 const VIDEO_POLL_INTERVAL_MS = 5000;
 const VIDEO_POLL_LIMIT = 240;
@@ -50,14 +55,27 @@ const TEXT_TIMEOUT_MS = 600000;
  */
 const TEXT_FLUSH_INTERVAL_MS = 1000;
 const TEXT_FLUSH_CHARS = 400;
+/** 补齐时一次最多回放多少个任务，和 listJobs 保持同一个上限。 */
+const CATCH_UP_LIMIT = 200;
 const runningJobs = new Map<string, AbortController>();
 /** 正在生成的文本任务的最新累积内容。内存里的这份比库里新，订阅时优先用它，避免刚订上就少一段。 */
 const runningTexts = new Map<string, string>();
-const textBus = new EventEmitter();
-textBus.setMaxListeners(0);
+/** 按用户分发的任务事件。没人订阅时事件直接丢弃也不影响正确性：任务本身照常跑完并落库。 */
+const jobBus = new EventEmitter();
+jobBus.setMaxListeners(0);
+/** 每个用户已分配到的最大 seq。存 Promise 而不是数字：同一用户的并发任务同时申请时只会去库里取一次基准值，不会各取各的取出重号。 */
+const jobSeqs = new Map<string, Promise<number>>();
 let ticking = false;
 
 const jobs = () => repo(Job);
+
+function nextJobSeq(userId: string) {
+    // 进程重启后内存计数没了，从库里已分配的最大值续上，保证序号只增不减，老游标不会突然「跑到未来」。
+    const base = jobSeqs.get(userId) ?? jobs().findOne({ where: { userId }, order: { seq: "DESC" } }).then((row) => row?.seq || 0, () => 0);
+    const next = base.then((value) => value + 1);
+    jobSeqs.set(userId, next);
+    return next;
+}
 
 export async function toJobView(job: Job): Promise<JobView> {
     const outputs = job.outputFileIds?.length ? await repo(StoredFile).findBy({ id: In(job.outputFileIds) }) : [];
@@ -74,7 +92,7 @@ export async function toJobView(job: Job): Promise<JobView> {
             .map((id) => byId.get(id))
             .filter((file): file is StoredFile => Boolean(file))
             .map((file) => ({ id: file.id, kind: file.kind, mimeType: file.mimeType, bytes: Number(file.bytes), width: file.width, height: file.height, durationMs: file.durationMs })),
-        text: job.text || "",
+        text: currentJobText(job),
         context: job.context || {},
         createdAt: job.createdAt,
         updatedAt: job.updatedAt,
@@ -113,11 +131,14 @@ export async function createJob(userId: string, input: JobInput) {
         error: "",
         credits: 0,
         progress: 0,
+        seq: await nextJobSeq(userId),
         upstreamTaskId: "",
         createdAt: now(),
         updatedAt: now(),
         finishedAt: "",
     } as Job);
+    // 新任务本身也是一次变化，先广播再排队：已经挂着流的页面能立刻看到「pending」，不用等第一次状态变更。
+    jobBus.emit(job.userId, { type: "job", seq: job.seq, job: await toJobView(job) } satisfies JobEvent);
     void tick();
     return job;
 }
@@ -144,27 +165,41 @@ export async function cancelJob(userId: string, id: string) {
     return patchJob(job, { status: "canceled", text: currentJobText(job), finishedAt: now() });
 }
 
-export function isJobFinished(status: JobStatus) {
-    return status === "succeeded" || status === "failed" || status === "canceled";
-}
-
 /** 文本任务已经生成出来的内容。内存里那份比库里新，正在跑的任务优先取它。 */
-export function currentJobText(job: Job) {
+function currentJobText(job: Job) {
     return runningTexts.get(job.id) ?? job.text ?? "";
 }
 
 /**
- * 订阅文本任务的实时增量。断开只是取消订阅，任务照常跑完并落库，
- * 重新订阅时按已收到的字符数续上即可，不用把整段重来。
+ * 订阅当前用户所有任务的事件。断开只是取消监听，任务照常在服务端跑完并落库。
+ * 只开一条按用户订阅的流而不是每个任务一条：浏览器对同源只给 6 个并发连接，
+ * 同时跑几个生成就会把连接池占满，页面其它请求都会被卡住。
  */
-export function subscribeJobText(jobId: string, listener: (event: JobTextEvent) => void) {
-    textBus.on(jobId, listener);
-    return () => void textBus.off(jobId, listener);
+export function subscribeJobs(userId: string, listener: (event: JobEvent) => void) {
+    jobBus.on(userId, listener);
+    return () => void jobBus.off(userId, listener);
+}
+
+/**
+ * 断线重连要补齐的任务集合：seq 大于游标的（断线期间状态变过的）加上所有还没结束的。
+ * 后一半不能省——文本任务边写内容边推增量并不改 seq，只按 seq 过滤会把「一直在跑、只是内容在长」的任务漏掉。
+ * 未结束的任务数量受并发与队列限制，始终是个小集合，无条件带上不会把这次补齐撑爆。
+ */
+export function listJobsSince(userId: string, sinceSeq: number) {
+    const active = { userId, status: In(["pending", "running"] satisfies JobStatus[]) };
+    return jobs().find({
+        where: sinceSeq > 0 ? [{ userId, seq: MoreThan(sinceSeq) }, active] : [active],
+        order: { seq: "ASC" },
+        take: CATCH_UP_LIMIT,
+    });
 }
 
 async function patchJob(job: Job, patch: Partial<Job>) {
-    Object.assign(job, patch, { updatedAt: now() });
-    return jobs().save(job);
+    Object.assign(job, patch, { updatedAt: now(), seq: await nextJobSeq(job.userId) });
+    await jobs().save(job);
+    // 先落库再广播：订阅方收到的快照一定已经能从库里读到，断线重连按 seq 补齐时不会出现「推过但库里没有」的空档。
+    jobBus.emit(job.userId, { type: "job", seq: job.seq, job: await toJobView(job) } satisfies JobEvent);
+    return job;
 }
 
 function delay(ms: number, signal: AbortSignal) {
@@ -254,7 +289,7 @@ async function runTextJob(job: Job, signal: AbortSignal) {
     const onDelta = (delta: string) => {
         text += delta;
         runningTexts.set(job.id, text);
-        textBus.emit(job.id, { text, status: "running", error: "" } satisfies JobTextEvent);
+        jobBus.emit(job.userId, { type: "text", id: job.id, text } satisfies JobEvent);
         if (Date.now() - flushedAt < TEXT_FLUSH_INTERVAL_MS && text.length - flushedLength < TEXT_FLUSH_CHARS) return;
         flushedAt = Date.now();
         flushedLength = text.length;
@@ -296,8 +331,8 @@ async function runJob(job: Job) {
         if (!canceled) console.error(`job ${job.id} failed:`, error);
         await patchJob(job, { status: canceled ? "canceled" : "failed", credits: 0, text: runningTexts.get(job.id) ?? job.text ?? "", error: canceled ? "任务已取消" : message, finishedAt: now() });
     } finally {
-        // 广播终态后再清内存：订阅方据此结束等待，之后新来的订阅直接读库里的最终内容。
-        textBus.emit(job.id, { text: job.text || "", status: job.status, error: job.error || "" } satisfies JobTextEvent);
+        // 终态由上面的 patchJob 广播（快照里带着最终文本），这里只清内存；
+        // 清在广播之后，之后新来的订阅直接读库里的最终内容。
         runningTexts.delete(job.id);
         runningJobs.delete(job.id);
     }

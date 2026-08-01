@@ -9,7 +9,8 @@ import { modelOptionName, type AiConfig } from "@/stores/use-config-store";
 import { useJobStore, type JobContext, type TrackedJob } from "@/stores/use-job-store";
 import { serverModelFormat, useServerStore, type ServerCapability } from "@/stores/use-server-store";
 import { normalizeBackground, normalizeQuality, resolveRequestSize } from "./image";
-import { serverApi, serverFileUrl, serverJobTextStream, type ServerFile, type ServerJobKind } from "./server";
+import { waitJobFinished } from "./job-stream";
+import { serverApi, serverFileUrl, type ServerFile, type ServerJobKind } from "./server";
 import { normalizeVideoResolution, normalizeVideoSeconds, normalizeVideoSize } from "./video";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -22,16 +23,7 @@ export type ImageGenerationOptions = GenerationOptions & { mask?: ReferenceImage
 export type GeneratedImage = { id: string; dataUrl: string; file: ServerFile };
 
 export type VideoTask = { id: string; model: string; clientJobId: string };
-export type VideoTaskState = { status: "pending" } | { status: "completed"; file: ServerFile } | { status: "failed"; error: string };
-
-const IMAGE_POLL_MS = 2000;
-const AUDIO_POLL_MS = 2000;
-/** 文本事件流断了就带着已收到的字符数重连；重试几次仍连不上才算失败，服务端任务本身不受影响。 */
-const TEXT_STREAM_RETRIES = 3;
-const TEXT_STREAM_RETRY_MS = 1500;
-/** 视频任务偏慢，轮询间隔更长；服务端自己保活，客户端也多等一会儿避免提前判超时丢结果。 */
-export const VIDEO_POLL_MS = 5000;
-export const VIDEO_POLL_LIMIT = 300;
+export type VideoTaskState = { status: "completed"; file: ServerFile } | { status: "failed"; error: string };
 
 function serverSettings() {
     return useServerStore.getState().settings;
@@ -69,21 +61,6 @@ async function mediaFileId(media: { name?: string; url?: string; storageKey?: st
     return (await serverApi.uploadFile(blob, { filename: media.name, durationMs: media.durationMs })).id;
 }
 
-function delay(ms: number, signal?: AbortSignal) {
-    return new Promise<void>((resolve, reject) => {
-        if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
-        const timer = setTimeout(resolve, ms);
-        signal?.addEventListener(
-            "abort",
-            () => {
-                clearTimeout(timer);
-                reject(new DOMException("Aborted", "AbortError"));
-            },
-            { once: true },
-        );
-    });
-}
-
 /** 提交任务：clientJobId 交给服务端做幂等去重，同一个键只会生成一次。 */
 async function submitJob(kind: ServerJobKind, model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], clientJobId: string, context?: JobContext) {
     const job = await serverApi.createJob({ clientJobId, kind, model, prompt, params, inputFileIds, context });
@@ -91,18 +68,23 @@ async function submitJob(kind: ServerJobKind, model: string, prompt: string, par
     return job;
 }
 
-async function waitJob(jobId: string, clientJobId: string, intervalMs: number, options?: GenerationOptions) {
+/**
+ * 等任务跑到终态。进度与结果都来自共用的那条事件流，不再逐个任务轮询。
+ * 主动取消才顺带把服务端任务也取消掉；页面刷新走不到这里，任务因此能继续跑完。
+ */
+async function waitJob(jobId: string, clientJobId: string, options?: GenerationOptions) {
     const store = useJobStore.getState();
     try {
-        for (;;) {
-            const job = await serverApi.job(jobId);
-            store.trackJob(clientJobId, job);
-            options?.onProgress?.(job.progress);
-            if (job.status === "succeeded") return job.outputs;
-            if (job.status === "failed") throw new Error(job.error || "生成失败");
-            if (job.status === "canceled") throw new DOMException("Aborted", "AbortError");
-            await delay(intervalMs, options?.signal);
-        }
+        const job = await waitJobFinished(jobId, {
+            signal: options?.signal,
+            onJob: (item) => {
+                store.trackJob(clientJobId, item);
+                options?.onProgress?.(item.progress);
+            },
+        });
+        if (job.status === "failed") throw new Error(job.error || "生成失败");
+        if (job.status === "canceled") throw new DOMException("Aborted", "AbortError");
+        return job.outputs;
     } catch (error) {
         if (options?.signal?.aborted) void serverApi.cancelJob(jobId).catch(() => undefined);
         throw error;
@@ -117,10 +99,10 @@ function withUserSystemPrompt(config: AiConfig, prompt: string) {
     return systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
 }
 
-async function runJob(kind: ServerJobKind, model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], intervalMs: number, options?: GenerationOptions) {
+async function runJob(kind: ServerJobKind, model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], options?: GenerationOptions) {
     const clientJobId = options?.clientJobId || nanoid();
     const job = await submitJob(kind, model, prompt, params, inputFileIds, clientJobId, options?.context);
-    return waitJob(job.id, clientJobId, intervalMs, options);
+    return waitJob(job.id, clientJobId, options);
 }
 
 function toGeneratedImages(outputs: ServerFile[]): GeneratedImage[] {
@@ -129,14 +111,14 @@ function toGeneratedImages(outputs: ServerFile[]): GeneratedImage[] {
 
 /** 续查一个已经存在的服务端任务，不会重新提交，用于刷新或断线重连后恢复进度。 */
 export async function resumeImages(job: TrackedJob, options?: GenerationOptions): Promise<GeneratedImage[]> {
-    const outputs = await waitJob(job.jobId, job.clientJobId, IMAGE_POLL_MS, options);
+    const outputs = await waitJob(job.jobId, job.clientJobId, options);
     if (!outputs.length) throw new Error("接口没有返回图片");
     return toGeneratedImages(outputs);
 }
 
 /** 续查视频或音频任务，产物已经在服务端，直接登记引用。 */
 export async function resumeMedia(job: TrackedJob, options?: GenerationOptions): Promise<UploadedFile> {
-    const outputs = await waitJob(job.jobId, job.clientJobId, job.kind === "video" ? VIDEO_POLL_MS : AUDIO_POLL_MS, options);
+    const outputs = await waitJob(job.jobId, job.clientJobId, options);
     if (!outputs[0]) throw new Error(`任务成功但没有返回${job.kind === "video" ? "视频" : "音频"}`);
     return adoptServerMedia(outputs[0]);
 }
@@ -189,7 +171,7 @@ export async function generateImages(config: AiConfig, prompt: string, reference
     const model = serverModel(config, "image");
     const count = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const inputFileIds = await Promise.all(references.map(imageFileId));
-    const outputs = await runJob("image", model, withUserSystemPrompt(config, buildImageReferencePromptText(prompt, references)), imageParams(config, count), inputFileIds, IMAGE_POLL_MS, options);
+    const outputs = await runJob("image", model, withUserSystemPrompt(config, buildImageReferencePromptText(prompt, references)), imageParams(config, count), inputFileIds, options);
     if (!outputs.length) throw new Error("接口没有返回图片");
     return toGeneratedImages(outputs);
 }
@@ -209,17 +191,24 @@ export async function createVideoTask(config: AiConfig, prompt: string, referenc
     return { id: job.id, model, clientJobId };
 }
 
-export async function pollVideoTask(task: VideoTask, options?: GenerationOptions): Promise<VideoTaskState> {
-    const job = await serverApi.job(task.id);
-    useJobStore.getState().trackJob(task.clientJobId, job);
-    options?.onProgress?.(job.progress);
-    if (job.status === "failed") return { status: "failed", error: job.error || "生成失败" };
-    if (job.status === "canceled") return { status: "failed", error: "任务已取消" };
-    if (job.status !== "succeeded") return { status: "pending" };
-    useJobStore.getState().untrackJob(task.clientJobId);
-    const file = job.outputs[0];
-    if (!file) return { status: "failed", error: "任务成功但没有返回视频" };
-    return { status: "completed", file };
+/** 等一个已存在的视频任务跑完。事件流推状态，不再轮询；超时判定由服务端负责。 */
+export async function awaitVideoTask(task: VideoTask, options?: GenerationOptions): Promise<VideoTaskState> {
+    const store = useJobStore.getState();
+    try {
+        const job = await waitJobFinished(task.id, {
+            signal: options?.signal,
+            onJob: (item) => {
+                store.trackJob(task.clientJobId, item);
+                options?.onProgress?.(item.progress);
+            },
+        });
+        if (job.status === "failed") return { status: "failed", error: job.error || "生成失败" };
+        if (job.status === "canceled") return { status: "failed", error: "任务已取消" };
+        const file = job.outputs[0];
+        return file ? { status: "completed", file } : { status: "failed", error: "任务成功但没有返回视频" };
+    } finally {
+        store.untrackJob(task.clientJobId);
+    }
 }
 
 /** 生成视频（创建 + 轮询一次做完），画布与插件用这个入口。 */
@@ -227,7 +216,7 @@ export async function generateVideo(config: AiConfig, prompt: string, references
     const model = serverModel(config, "video");
     const inputFileIds = [...(await Promise.all(references.map(imageFileId))), ...(await Promise.all([...videoReferences, ...audioReferences].map(mediaFileId)))];
     const requestPrompt = isServerSeedanceModel(model) ? buildSeedancePromptText(prompt, references, videoReferences, audioReferences) : prompt;
-    const outputs = await runJob("video", model, requestPrompt, videoParams(config, model), inputFileIds, VIDEO_POLL_MS, options);
+    const outputs = await runJob("video", model, requestPrompt, videoParams(config, model), inputFileIds, options);
     if (!outputs[0]) throw new Error("任务成功但没有返回视频");
     return adoptServerMedia(outputs[0]);
 }
@@ -235,41 +224,30 @@ export async function generateVideo(config: AiConfig, prompt: string, references
 /** 生成音频：走服务端任务队列。 */
 export async function generateAudio(config: AiConfig, prompt: string, options?: GenerationOptions): Promise<UploadedFile> {
     const model = serverModel(config, "audio");
-    const outputs = await runJob("audio", model, prompt, audioParams(config), [], AUDIO_POLL_MS, options);
+    const outputs = await runJob("audio", model, prompt, audioParams(config), [], options);
     if (!outputs[0]) throw new Error("任务成功但没有返回音频");
     return adoptServerMedia(outputs[0]);
 }
 
 /**
  * 订阅文本任务并把增量喂给调用方，返回完整文本。
- * 连接断了只是订阅断了，服务端照常跑完并落库，这里带上已收到的字符数重连即可续上；
+ * 走的是全应用共用的那条事件流：断线重连、补齐都由它统一处理，这里只关心内容和终态。
  * 主动取消才顺带把服务端任务也取消掉，页面刷新不会走到这里，任务因此能继续跑完。
  */
 async function streamJobText(jobId: string, clientJobId: string, onDelta: (text: string) => void, options?: GenerationOptions): Promise<string> {
     let text = "";
     try {
-        for (let attempt = 0; ; attempt += 1) {
-            const final = await serverJobTextStream(
-                jobId,
-                text.length,
-                (offset, delta) => {
-                    // 按 offset 覆盖写入：重连补发、任务重跑导致的整段重发都能落到正确位置。
-                    text = text.slice(0, offset) + delta;
-                    onDelta(text);
-                },
-                options?.signal,
-            ).catch((error: unknown) => {
-                if (options?.signal?.aborted || attempt >= TEXT_STREAM_RETRIES) throw error;
-                return null;
-            });
-            if (!final) {
-                await delay(TEXT_STREAM_RETRY_MS, options?.signal);
-                continue;
-            }
-            if (final.status === "succeeded") return text;
-            if (final.status === "canceled") throw new DOMException("Aborted", "AbortError");
-            throw new Error(final.error || "生成失败");
-        }
+        const job = await waitJobFinished(jobId, {
+            signal: options?.signal,
+            onJob: (item) => useJobStore.getState().trackJob(clientJobId, item),
+            onText: (value) => {
+                text = value;
+                onDelta(value);
+            },
+        });
+        if (job.status === "canceled") throw new DOMException("Aborted", "AbortError");
+        if (job.status !== "succeeded") throw new Error(job.error || "生成失败");
+        return text;
     } catch (error) {
         if (options?.signal?.aborted) void serverApi.cancelJob(jobId).catch(() => undefined);
         throw error;

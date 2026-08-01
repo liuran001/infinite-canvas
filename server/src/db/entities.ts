@@ -217,6 +217,12 @@ export class Job {
     @Column({ type: "text", nullable: true }) error!: string;
     @Column({ type: "int", default: 0 }) credits!: number;
     @Column({ type: "int", default: 0 }) progress!: number;
+    /**
+     * 用户内单调递增的变更序号，每次任务状态变化都会重新分配一个。
+     * 订阅方断线重连时带上最后收到的序号，服务端据此把断线期间变化过的任务补回来。
+     * 用序号而不是 updatedAt：同一毫秒内落多次变更时，时间戳游标会漏掉其中几条。
+     */
+    @Index() @Column({ type: "int", default: 0 }) seq!: number;
     @Column({ type: "varchar", length: 512, default: "" }) upstreamTaskId!: string;
     @Column(short) createdAt!: string;
     @Index() @Column(short) updatedAt!: string;

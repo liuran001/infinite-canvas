@@ -44,8 +44,13 @@ export type ServerAgentSession = { id: string; projectId: string; title: string;
 /** seq 是会话内自增游标，断线重连按它拉增量；工具消息会先后推「已调用」和「有结果」两次，seq 相同。 */
 export type ServerAgentMessage = { seq: number; role: ServerAgentMessageRole; content: string; toolName: string; toolArgs: string; toolResult: string; createdAt: string };
 export type ServerAgentEvent = { type: "message"; message: ServerAgentMessage } | { type: "status"; status: ServerAgentSessionStatus; error: string };
-/** 文本任务的增量事件。offset 是这段内容在完整文本里的起点，前端按它覆盖写入，重连或重跑都不会错位。 */
-export type ServerJobTextEvent = { type: "delta"; offset: number; text: string } | { type: "status"; status: ServerJobStatus; error: string };
+/**
+ * 生成任务事件流的事件形状。
+ * `job` 是任务快照，seq 是该用户内单调递增的变更序号，断线重连带上最后收到的 seq 就能补齐；
+ * `text` 是文本增量，offset 是这段内容在完整文本里的起点，按它覆盖写入，重连或重跑都不会错位；
+ * `ready` 表示补齐结束，后面都是实时事件。
+ */
+export type ServerJobEvent = { type: "job"; seq: number; job: ServerJob } | { type: "text"; id: string; offset: number; text: string } | { type: "ready"; seq: number };
 
 export type ServerProject = { id: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerUserAsset = { id: string; kind: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
@@ -219,28 +224,22 @@ async function readServerSse(response: Response, onData: (data: string) => void,
 }
 
 /**
- * 文本任务事件流。断开只是取消订阅，服务端任务照常跑完并落库，
- * 重连时带上已经收到的字符数就能补齐断线期间的内容；返回值是任务的终态。
- * 连接本身出问题时抛错，调用方据此决定是否重连续传。
+ * 生成任务事件流：一条连接订阅当前用户所有任务的状态、进度与文本增量。
+ * 鉴权靠请求头带令牌，EventSource 不支持自定义头，只能自己 fetch + 读流解析 SSE。
+ * 不做成每个任务一条：浏览器对同源只允许 6 个并发连接，同时跑几个生成就会把连接池占满。
+ * 断开只是取消订阅，服务端任务照常跑完并落库，重连时带上 sinceSeq 就能补齐断线期间的变化。
  */
-export async function serverJobTextStream(jobId: string, since: number, onDelta: (offset: number, text: string) => void, signal?: AbortSignal) {
-    const response = await fetch(serverApiUrl(`/v1/jobs/${jobId}/text?since=${since}`), { headers: authHeaders({ Accept: "text/event-stream" }), signal }).catch(() => {
-        throw new Error("文本任务事件流连接失败：无法连接服务端，请检查网络");
+export async function serverJobStream(sinceSeq: number, onEvent: (event: ServerJobEvent) => void, signal: AbortSignal) {
+    const response = await fetch(serverApiUrl(`/v1/jobs/stream?sinceSeq=${sinceSeq}`), { headers: authHeaders({ Accept: "text/event-stream" }), signal }).catch(() => {
+        throw new Error("生成任务事件流连接失败：无法连接服务端，请检查网络");
     });
     if (response.status === 401) {
         useServerStore.getState().clearSession();
         useServerStore.getState().setLoginOpen(true);
         throw new Error("登录状态已失效，请重新登录");
     }
-    if (!response.ok) throw new Error(`文本任务事件流连接失败（HTTP ${response.status}）`);
-    let final: { status: ServerJobStatus; error: string } | null = null;
-    await readServerSse(response, (data) => {
-        const event = JSON.parse(data) as ServerJobTextEvent;
-        if (event.type === "delta") onDelta(event.offset, event.text);
-        else final = { status: event.status, error: event.error };
-    }, "文本任务事件流没有返回内容");
-    if (!final) throw new Error("文本任务事件流意外中断");
-    return final as { status: ServerJobStatus; error: string };
+    if (!response.ok) throw new Error(`生成任务事件流连接失败（HTTP ${response.status}）`);
+    await readServerSse(response, (data) => onEvent(JSON.parse(data) as ServerJobEvent), "生成任务事件流没有返回内容");
 }
 
 /** 文本类调用需要流式读取，单独走 fetch 拿原始 Response。 */

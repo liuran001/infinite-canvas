@@ -585,9 +585,11 @@ check "删除后拉消息被拒绝" "$(curl -s "$BASE/v1/agent/sessions/$SESSION
 echo "文本任务"
 # 文本生成和生图走同一套任务队列：服务端边收上游流边落库，前端断开也不影响任务继续跑完。
 TEXT_FULL="无限画布把生成任务放在服务端，刷新页面也不会丢，内容会接着写完。"
-# 把 SSE 里的 delta 拼回完整文本 / 数出它有多少个字，用来验证断线续传接得上。
-sse_text() { grep '^data: ' "$1" | sed 's/^data: //' | jq -rs '[.[] | select(.type=="delta") | .text] | add // ""'; }
-sse_status() { grep '^data: ' "$1" | sed 's/^data: //' | jq -rs '[.[] | select(.type=="status") | .status] | last // ""'; }
+# 任务事件流是一条连接推当前用户所有任务的状态与文本增量，下面三个函数从抓下来的流里取某个任务的内容、终态和游标。
+stream_text() { grep '^data: ' "$1" | sed 's/^data: //' | jq -rs --arg id "$2" '[.[] | select(.type=="text" and .id==$id) | .text] | add // ""'; }
+stream_status() { grep '^data: ' "$1" | sed 's/^data: //' | jq -rs --arg id "$2" '[.[] | select(.type=="job" and .job.id==$id) | .job.status] | last // ""'; }
+stream_seq() { grep '^data: ' "$1" | sed 's/^data: //' | jq -rs '[.[] | select(.seq != null) | .seq] | max // 0'; }
+job_stream() { curl -s -N --max-time "$2" "$BASE/v1/jobs/stream?sinceSeq=$3" -H "Authorization: Bearer ${4:-$USER_TOKEN}" >"$1"; }
 text_job() { curl -s "$BASE/v1/jobs/$1" -H "Authorization: Bearer $USER_TOKEN"; }
 
 curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":50}' >/dev/null
@@ -611,29 +613,30 @@ check "完成后拿到完整内容" "$(text_job "$TEXT_JOB" | jq -r .data.text)"
 check "文本任务不产出文件" "$(text_job "$TEXT_JOB" | jq -r '.data.outputs | length')" "0"
 check "文本任务照常扣算力点" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)" "49"
 
-# 已结束的任务照样能订阅：一次性把完整内容和终态推回来，换设备打开画布靠的就是这条路径。
-curl -s -N --max-time 5 "$BASE/v1/jobs/$TEXT_JOB/text" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/text-done.txt"
-check "订阅已完成的任务能拿回完整内容" "$(sse_text "$WORK/text-done.txt")" "$TEXT_FULL"
-check "订阅已完成的任务会推终态" "$(sse_status "$WORK/text-done.txt")" "succeeded"
-curl -s -N --max-time 5 "$BASE/v1/jobs/$TEXT_JOB/text?since=$(printf '%s' "$TEXT_FULL" | jq -Rs 'length')" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/text-caught-up.txt"
-check "游标追平后不再重发内容" "$(sse_text "$WORK/text-caught-up.txt")" ""
-check "游标追平后仍然推终态" "$(sse_status "$WORK/text-caught-up.txt")" "succeeded"
+# 已结束的任务照样能补齐：带一个更早的游标重连，快照会把完整文本和终态一起推回来，换设备打开画布靠的就是这条路径。
+job_stream "$WORK/text-done.txt" 3 1
+check "补齐已结束的任务能拿回完整内容" "$(stream_text "$WORK/text-done.txt" "$TEXT_JOB")" "$TEXT_FULL"
+check "补齐已结束的任务会推终态" "$(stream_status "$WORK/text-done.txt" "$TEXT_JOB")" "succeeded"
+# 游标追平之后，已经结束的任务不会再被补一遍，只剩还在跑的任务需要推。
+job_stream "$WORK/text-caught-up.txt" 3 "$(stream_seq "$WORK/text-done.txt")"
+check "游标追平后不再补已结束的任务" "$(stream_status "$WORK/text-caught-up.txt" "$TEXT_JOB")" ""
+check "游标追平后也不会重发内容" "$(stream_text "$WORK/text-caught-up.txt" "$TEXT_JOB")" ""
 
 # 幂等：同一个键既不重复建任务，也不重复扣费。
 check "同一幂等键不会重复建文本任务" "$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"text-1","kind":"text","model":"mock-text","prompt":"介绍一下无限画布","params":{},"inputFileIds":[]}' | jq -r .data.id)" "$TEXT_JOB"
 sleep 2
 check "重发幂等键不会重复扣费" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)" "49"
 
-# 断线续传：订阅一会儿就掐断，任务继续在服务端跑；带上已收到的字数重连，两段拼起来正好是完整文本。
+# 断线续传：订阅一会儿就掐断，任务继续在服务端跑；带上断开时的游标重连，剩下的内容与终态都能补齐。
 TEXT_JOB2=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"text-2","kind":"text","model":"mock-text","prompt":"再写一段","params":{},"inputFileIds":[],"context":{"source":"canvas","projectId":"agent-p1","nodeId":"text-node-2"}}' | jq -r .data.id)
-curl -s -N --max-time 2.5 "$BASE/v1/jobs/$TEXT_JOB2/text" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/text-sse1.txt"
-PART1=$(sse_text "$WORK/text-sse1.txt")
+job_stream "$WORK/text-sse1.txt" 2.5 0
+PART1=$(stream_text "$WORK/text-sse1.txt" "$TEXT_JOB2")
 check "断开前已经收到增量" "$([ -n "$PART1" ] && [ "$PART1" != "$TEXT_FULL" ] && echo yes || echo "no（实际「$PART1」）")" "yes"
-check "断开时还没推终态" "$(sse_status "$WORK/text-sse1.txt")" ""
+check "断开时还没推终态" "$(stream_status "$WORK/text-sse1.txt" "$TEXT_JOB2")" "running"
 check "订阅断开不会中断任务" "$(text_job "$TEXT_JOB2" | jq -r .data.status)" "running"
-curl -s -N --max-time 10 "$BASE/v1/jobs/$TEXT_JOB2/text?since=$(printf '%s' "$PART1" | jq -Rs 'length')" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/text-sse2.txt"
-check "按 since 重连补齐后能拼出完整文本" "$PART1$(sse_text "$WORK/text-sse2.txt")" "$TEXT_FULL"
-check "重连后能收到终态" "$(sse_status "$WORK/text-sse2.txt")" "succeeded"
+job_stream "$WORK/text-sse2.txt" 10 "$(stream_seq "$WORK/text-sse1.txt")"
+check "按游标重连补齐后能拿回完整文本" "$(stream_text "$WORK/text-sse2.txt" "$TEXT_JOB2")" "$TEXT_FULL"
+check "重连后能收到终态" "$(stream_status "$WORK/text-sse2.txt" "$TEXT_JOB2")" "succeeded"
 check "断线期间的内容也已落库" "$(text_job "$TEXT_JOB2" | jq -r .data.text)" "$TEXT_FULL"
 
 # 取消正在跑的文本任务：已经流出来的半截留在任务里，算力点原路返还。
@@ -656,6 +659,45 @@ for _ in $(seq 1 30); do
 done
 check "Gemini 格式的文本流也能跑通" "$(text_job "$GEMINI_TEXT_JOB" | jq -r .data.text)" "$TEXT_FULL"
 check "文本任务也能被后台按类型筛出来" "$(curl -s "$BASE/admin/jobs?kind=text" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "4"
+
+echo "任务事件流"
+# 生成任务的进度不再靠轮询：一条 SSE 连接订阅当前用户的所有任务。
+# 之所以必须是一条，是因为浏览器对同源只允许 6 个并发连接，每任务一条会把连接池占满。
+curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":50}' >/dev/null
+check "未登录无法订阅任务事件流" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/jobs/stream")" "401"
+
+# 一条连接同时跟两个任务：一个慢的文本任务和一个秒回的生图任务，两边的事件都要从同一条流里出来。
+job_stream "$WORK/stream-base.txt" 2 0
+STREAM_SEQ=$(stream_seq "$WORK/stream-base.txt")
+job_stream "$WORK/stream-multi.txt" 14 "$STREAM_SEQ" &
+STREAM_PID=$!
+sleep 0.5
+MULTI_TEXT=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"stream-text","kind":"text","model":"mock-text","prompt":"一条流里的文本","params":{},"inputFileIds":[]}' | jq -r .data.id)
+MULTI_IMAGE=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"stream-image","kind":"image","model":"mock-image","prompt":"一条流里的图","params":{"count":1},"inputFileIds":[]}' | jq -r .data.id)
+wait "$STREAM_PID" 2>/dev/null
+check "同一条连接推到了文本任务的终态" "$(stream_status "$WORK/stream-multi.txt" "$MULTI_TEXT")" "succeeded"
+check "同一条连接推到了生图任务的终态" "$(stream_status "$WORK/stream-multi.txt" "$MULTI_IMAGE")" "succeeded"
+check "同一条连接里的文本增量拼得回完整文本" "$(stream_text "$WORK/stream-multi.txt" "$MULTI_TEXT")" "$TEXT_FULL"
+check "同一条连接里带回了生图产物" "$(grep '^data: ' "$WORK/stream-multi.txt" | sed 's/^data: //' | jq -rs --arg id "$MULTI_IMAGE" '[.[] | select(.type=="job" and .job.id==$id) | .job.outputs[0].mimeType] | last // ""')" "image/png"
+check "同一条连接里两个任务的进度互不干扰" "$(grep '^data: ' "$WORK/stream-multi.txt" | sed 's/^data: //' | jq -rs --arg a "$MULTI_TEXT" --arg b "$MULTI_IMAGE" '[.[] | select(.type=="job") | .job.id] | (index($a) != null) and (index($b) != null)')" "true"
+
+# 断线期间跑完的任务：重连带上断开时的游标就能补回终态，不用重新拉一次全量。
+# 游标用的是自增序号而不是时间戳，同一毫秒内落多次变更也不会被漏掉。
+CATCH_JOB=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"stream-catchup","kind":"text","model":"mock-text","prompt":"断线期间跑完","params":{},"inputFileIds":[]}' | jq -r .data.id)
+job_stream "$WORK/stream-before.txt" 2 "$(stream_seq "$WORK/stream-multi.txt")"
+CATCH_SEQ=$(stream_seq "$WORK/stream-before.txt")
+check "断开时任务还没结束" "$(stream_status "$WORK/stream-before.txt" "$CATCH_JOB")" "running"
+sleep 8
+check "断线期间任务照常跑完" "$(text_job "$CATCH_JOB" | jq -r .data.status)" "succeeded"
+job_stream "$WORK/stream-after.txt" 3 "$CATCH_SEQ"
+check "断线期间的终态在重连补齐里能拿回" "$(stream_status "$WORK/stream-after.txt" "$CATCH_JOB")" "succeeded"
+check "断线期间的文本在重连补齐里能拿回" "$(stream_text "$WORK/stream-after.txt" "$CATCH_JOB")" "$TEXT_FULL"
+
+# 安全：事件流按用户分发，拿别人的令牌订阅不到这个账号的任务。
+job_stream "$WORK/stream-other.txt" 3 1 "$ADMIN_TOKEN"
+check "换个账号订阅不到别人的任务" "$(grep -c "$CATCH_JOB" "$WORK/stream-other.txt")" "0"
+check "换个账号的流也拿不到别人的文本" "$(stream_text "$WORK/stream-other.txt" "$CATCH_JOB")" ""
+check "换个账号的流里没有任何别人的任务快照" "$(grep '^data: ' "$WORK/stream-other.txt" | sed 's/^data: //' | jq -rs '[.[] | select(.type=="job")] | length')" "0"
 
 echo
 printf '通过 %d 项，失败 %d 项\n' "$PASS" "$FAIL"

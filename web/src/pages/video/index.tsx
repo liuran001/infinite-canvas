@@ -14,7 +14,7 @@ import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, seedanceReferenceLabel, seedanceVideoReferenceError, seedanceVideoReferenceHint, SEEDANCE_REFERENCE_LIMITS, SEEDANCE_VIDEO_MIME_TYPES } from "@/lib/seedance-video";
 import { adoptServerMedia, deleteStoredMedia, resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
 import { resolveImageUrl, uploadImage } from "@/services/image-storage";
-import { createVideoTask, isGenerationReady, pollVideoTask, serverVideoTask, VIDEO_POLL_LIMIT, VIDEO_POLL_MS, type VideoTask } from "@/services/api/generation";
+import { awaitVideoTask, createVideoTask, isGenerationReady, serverVideoTask, type VideoTask } from "@/services/api/generation";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useJobStore } from "@/stores/use-job-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
@@ -389,30 +389,24 @@ export default function VideoPage() {
         setStartedAt((value) => value || performance.now());
         setResults((value) => (value.length ? value : [{ id: log.id, status: "pending" }]));
         try {
-            for (let attempt = 0; attempt < VIDEO_POLL_LIMIT; attempt += 1) {
-                const state = await pollVideoTask(log.task);
-                if (state.status === "completed") {
-                    const stored = adoptServerMedia(state.file);
-                    const nextVideo: GeneratedVideo = {
-                        id: nanoid(),
-                        url: stored.url,
-                        storageKey: stored.storageKey,
-                        durationMs: Date.now() - log.createdAt,
-                        width: stored.width || 1280,
-                        height: stored.height || 720,
-                        bytes: stored.bytes,
-                        mimeType: stored.mimeType,
-                    };
-                    setResults([{ id: nextVideo.id, status: "success", video: nextVideo }]);
-                    if (agentTaskId) updateAgentTask(agentTaskId, { status: "succeeded", successCount: 1, failCount: 0, error: undefined });
-                    await saveLog({ ...log, status: "成功", durationMs: nextVideo.durationMs, video: nextVideo, error: undefined });
-                    message.success("视频已生成");
-                    return;
-                }
-                if (state.status === "failed") throw new Error(state.error);
-                if (attempt === VIDEO_POLL_LIMIT - 1) throw new Error("视频生成超时，请稍后重试");
-                await delay(VIDEO_POLL_MS);
-            }
+            // 状态由服务端事件流推过来，这里直接等终态；超时判定在服务端做，客户端不再自己轮询计数。
+            const state = await awaitVideoTask(log.task);
+            if (state.status === "failed") throw new Error(state.error);
+            const stored = adoptServerMedia(state.file);
+            const nextVideo: GeneratedVideo = {
+                id: nanoid(),
+                url: stored.url,
+                storageKey: stored.storageKey,
+                durationMs: Date.now() - log.createdAt,
+                width: stored.width || 1280,
+                height: stored.height || 720,
+                bytes: stored.bytes,
+                mimeType: stored.mimeType,
+            };
+            setResults([{ id: nextVideo.id, status: "success", video: nextVideo }]);
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: "succeeded", successCount: 1, failCount: 0, error: undefined });
+            await saveLog({ ...log, status: "成功", durationMs: nextVideo.durationMs, video: nextVideo, error: undefined });
+            message.success("视频已生成");
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : "生成失败";
             setResults([{ id: log.id, status: "failed", error: errorMessage }]);
@@ -1057,8 +1051,4 @@ function normalizeVideoSize(value: string) {
 
 function normalizeResolution(value: string) {
     return normalizeVideoResolutionValue(value);
-}
-
-function delay(ms: number) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }
