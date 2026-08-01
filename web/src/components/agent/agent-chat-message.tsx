@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 import { App, Button, Image, Modal } from "antd";
 import { Brain, CheckCircle2, ChevronDown, ChevronRight, Circle, CircleAlert, Copy, ExternalLink, FilePenLine, FileText, FolderOpen, ListChecks, LoaderCircle, Search, ShieldAlert, TerminalSquare, Wrench, XCircle } from "lucide-react";
 import { Streamdown, type LinkSafetyModalProps } from "streamdown";
@@ -185,9 +185,9 @@ export function AgentApprovalCard({ approval, theme, onDecision }: { approval: A
                 </div>
             </div>
             <div className="mt-3 flex flex-wrap justify-end gap-1.5 border-t pt-3" style={{ borderColor: theme.node.stroke }}>
-                <Button danger type="text" className="!h-8" onClick={() => onDecision("decline")}>拒绝</Button>
-                <Button type="text" className="!h-8" onClick={() => onDecision("accept")}>允许一次</Button>
-                <Button type="text" className="!h-8" style={{ color: "#ea580c" }} onClick={() => onDecision("acceptForSession")}>本会话允许</Button>
+                <Button danger type="text" className="!h-8" disabled={Boolean(approval.deciding)} loading={approval.deciding === "decline"} onClick={() => onDecision("decline")}>拒绝</Button>
+                <Button type="text" className="!h-8" disabled={Boolean(approval.deciding)} loading={approval.deciding === "accept"} onClick={() => onDecision("accept")}>允许一次</Button>
+                <Button type="text" className="!h-8" disabled={Boolean(approval.deciding)} loading={approval.deciding === "acceptForSession"} style={{ color: "#ea580c" }} onClick={() => onDecision("acceptForSession")}>本会话允许</Button>
             </div>
         </div>
     );
@@ -198,29 +198,35 @@ export function AgentToolCard({ title, text, detail, theme }: { title: string; t
     if (plan) return <AgentPlanCard title={title} plan={plan} theme={theme} />;
     const kind = String(objectField(detail, "kind") || "");
     if (kind === "reasoning") return <AgentReasoningSummary text={text} detail={detail} theme={theme} />;
-    if (kind === "command") return <AgentCommandSummary text={text} detail={detail} theme={theme} />;
+    if (kind === "command") return <AgentCommandGroup items={[{ id: title, text, detail }]} theme={theme} />;
     // 联网搜索结果已经拆成条目，用专门的卡片展示标题链接与来源，不再把整块 JSON 摊给用户。
     const searchResults = agentSearchResults(detail);
     if (searchResults.length) return <AgentSearchCard title={title} text={text} results={searchResults} output={String(objectField(detail, "output") || "")} theme={theme} />;
     const state = toolCardState(title, text, detail);
     const view = userDetail(detail);
     const showText = title !== "读取画布" || text !== "已读取当前画布内容";
-    return (
-        <details className="group min-w-0 rounded-xl border px-3 py-2.5 text-left" style={{ borderColor: theme.node.stroke, background: "transparent", color: theme.node.text }}>
-            <summary className={`list-none ${view ? "cursor-pointer" : "cursor-default"}`} onClick={(event) => { if (!view) event.preventDefault(); }}>
-                <div className="flex min-w-0 items-center gap-2 text-sm leading-5">
-                    <span className="shrink-0" style={{ color: state.color }}>{toolIcon(kind, state.icon)}</span>
-                    <span className="min-w-0 truncate font-medium">{title}</span>
-                    <span className="shrink-0 text-[11px]" style={{ color: state.color }}>{state.label}</span>
-                    {view ? <ChevronDown className="ml-auto size-3.5 shrink-0 transition-transform group-open:rotate-180" style={{ color: theme.node.muted }} /> : null}
+    const className = "group min-w-0 rounded-xl border px-3 py-2.5 text-left";
+    const style = { borderColor: theme.node.stroke, background: "transparent", color: theme.node.text };
+    const content = (
+        <>
+            <div className="flex min-w-0 items-center gap-2 text-sm leading-5">
+                <span className="shrink-0" style={{ color: state.color }}>{toolIcon(kind, state.icon)}</span>
+                <span className="min-w-0 truncate font-medium">{title}</span>
+                <span className="shrink-0 text-[11px]" style={{ color: state.color }}>{state.label}</span>
+                {view ? <ChevronDown className="ml-auto size-3.5 shrink-0 transition-transform group-open:rotate-180" style={{ color: theme.node.muted }} /> : null}
+            </div>
+            {showText ? (
+                <div className={`mt-1 whitespace-pre-wrap break-words pl-6 text-sm leading-5 ${kind === "command" ? "font-mono text-[12px]" : ""}`} style={{ color: state.isError ? state.color : theme.node.muted }}>
+                    {text}
                 </div>
-                {showText ? (
-                    <div className={`mt-1 whitespace-pre-wrap break-words pl-6 text-sm leading-5 ${kind === "command" ? "font-mono text-[12px]" : ""}`} style={{ color: state.isError ? state.color : theme.node.muted }}>
-                        {text}
-                    </div>
-                ) : null}
-            </summary>
-            {view ? <div className="ml-6"><AgentDetailBlock detail={view} theme={theme} /></div> : null}
+            ) : null}
+        </>
+    );
+    if (!view) return <div className={className} style={style}>{content}</div>;
+    return (
+        <details className={className} style={style}>
+            <summary className="list-none cursor-pointer">{content}</summary>
+            <div className="ml-6"><AgentDetailBlock detail={view} theme={theme} /></div>
         </details>
     );
 }
@@ -244,25 +250,79 @@ function AgentReasoningSummary({ text, detail, theme }: { text: string; detail?:
     );
 }
 
-function AgentCommandSummary({ text, detail, theme }: { text: string; detail?: unknown; theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {
-    const view = userDetail(detail);
-    const status = String(objectField(detail, "status") || "");
-    const running = ["inProgress", "in_progress", "running", "started", "pending"].includes(status);
-    const failed = ["failed", "error"].includes(status);
-    const color = failed ? "#dc2626" : running ? "#d97706" : theme.node.muted;
+type AgentCommandItem = Pick<AgentChatMessageItem, "id" | "text" | "detail">;
+
+export function AgentCommandGroup({ items, theme }: { items: AgentCommandItem[]; theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {
+    const states = items.map((item) => commandViewState(item.detail));
+    const running = states.some((state) => state.running);
+    const failed = states.filter((state) => state.failed).length;
+    const expandable = items.some((item) => Boolean(item.text.trim() || userDetail(item.detail)));
+    const color = running ? "#d97706" : failed ? "#dc2626" : theme.node.muted;
+    const label = running
+        ? items.length > 1 ? `正在执行 ${items.length} 条命令` : "正在执行命令"
+        : `已执行 ${items.length} 条命令${failed ? ` · ${failed} 条失败` : ""}`;
+    const header = (
+        <div className="flex min-w-0 items-center gap-2 text-sm" style={{ color }}>
+            {running ? <LoaderCircle className="size-4 shrink-0 animate-spin" /> : <TerminalSquare className="size-4 shrink-0" />}
+            <span className="font-medium">{label}</span>
+            {expandable ? <ChevronRight className="size-3.5 shrink-0 transition-transform group-open:rotate-90" /> : null}
+        </div>
+    );
+    if (!expandable) return <div className="min-w-0 py-1 text-left">{header}</div>;
     return (
         <details className="group min-w-0 text-left">
-            <summary className={`list-none py-1 ${view ? "cursor-pointer" : "cursor-default"}`} onClick={(event) => { if (!view) event.preventDefault(); }}>
-                <div className="flex min-w-0 items-center gap-2 text-sm" style={{ color }}>
-                    {running ? <LoaderCircle className="size-4 shrink-0 animate-spin" /> : <TerminalSquare className="size-4 shrink-0" />}
-                    <span className="font-medium">{failed ? "命令执行失败" : running ? "正在执行命令" : "已执行 1 条命令"}</span>
-                    {view ? <ChevronRight className="size-3.5 shrink-0 transition-transform group-open:rotate-90" /> : null}
-                </div>
-                <div className="mt-1 truncate pl-6 font-mono text-[12px] leading-5" style={{ color: failed ? color : theme.node.muted }} title={text}>{text}</div>
-            </summary>
-            {view ? <div className="ml-6"><AgentDetailBlock detail={view} theme={theme} /></div> : null}
+            <summary className="cursor-pointer list-none py-1">{header}</summary>
+            {items.length === 1
+                ? <AgentSingleCommand item={items[0]} theme={theme} />
+                : <div className="ml-6 mt-1">{items.map((item, index) => <AgentCommandEntry key={item.id} item={item} index={index} theme={theme} />)}</div>
+            }
         </details>
     );
+}
+
+function AgentSingleCommand({ item, theme }: { item: AgentCommandItem; theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {
+    const view = userDetail(item.detail);
+    return (
+        <div className="ml-6 pb-1">
+            {item.text ? <div className="mt-1.5 whitespace-pre-wrap break-all font-mono text-[11px] leading-5" style={{ color: theme.node.text }}>{item.text}</div> : null}
+            {view ? <AgentDetailBlock detail={view} theme={theme} /> : null}
+        </div>
+    );
+}
+
+function AgentCommandEntry({ item, index, theme }: { item: AgentCommandItem; index: number; theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {
+    const [open, setOpen] = useState(false);
+    const detailId = useId();
+    const view = userDetail(item.detail);
+    const state = commandViewState(item.detail);
+    const status = state.failed ? "执行失败" : state.running ? "执行中" : "已完成";
+    const color = state.failed ? "#dc2626" : state.running ? "#d97706" : "#16a34a";
+    const content = (
+        <>
+            <span className="w-4 shrink-0 text-center text-[10px] tabular-nums opacity-50" style={{ color: theme.node.muted }}>{index + 1}</span>
+            <code className="min-w-0 flex-1 truncate text-[11px] leading-5" style={{ color: theme.node.text }} title={item.text}>{item.text || "命令"}</code>
+            <span className="shrink-0" style={{ color }} title={status} aria-label={status}>
+                {state.running ? <LoaderCircle className="size-3.5 animate-spin" /> : state.failed ? <XCircle className="size-3.5" /> : <CheckCircle2 className="size-3.5" />}
+            </span>
+            {view ? <ChevronRight className={`size-3.5 shrink-0 transition-transform ${open ? "rotate-90" : ""}`} style={{ color: theme.node.muted }} /> : null}
+        </>
+    );
+    return (
+        <div className={index ? "border-t" : ""} style={{ borderColor: theme.node.stroke }}>
+            {view
+                ? <button type="button" className="flex w-full min-w-0 items-center gap-2 py-2 text-left" aria-expanded={open} aria-controls={detailId} onClick={() => setOpen((value) => !value)}>{content}</button>
+                : <div className="flex min-w-0 items-center gap-2 py-2 text-left">{content}</div>}
+            {view && open ? <div id={detailId} className="pb-2 pl-6"><AgentDetailBlock detail={view} theme={theme} /></div> : null}
+        </div>
+    );
+}
+
+function commandViewState(detail: unknown) {
+    const status = String(objectField(detail, "status") || "").toLowerCase();
+    return {
+        running: ["inprogress", "in_progress", "running", "started", "pending"].includes(status),
+        failed: ["failed", "error"].includes(status),
+    };
 }
 
 function AgentPlanCard({ title, plan, theme }: { title: string; plan: PlanDetail; theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {

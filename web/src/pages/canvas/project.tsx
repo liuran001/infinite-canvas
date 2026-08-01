@@ -161,7 +161,6 @@ function InfiniteCanvasPage() {
     const agentPanelOpen = useAgentStore((state) => state.panelOpen);
     const toggleAgentPanel = useAgentStore((state) => state.togglePanel);
     const openAgentPanel = useAgentStore((state) => state.openPanel);
-    const setAgentState = useAgentStore((state) => state.setAgentState);
     const containerRef = useRef<HTMLDivElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
     const uploadTargetRef = useRef<{ nodeId?: string; position?: Position } | null>(null);
@@ -415,11 +414,6 @@ function InfiniteCanvasPage() {
             cancelled = true;
         };
     }, [hydrated, isServerModeReady, navigate, openProject, projectId, serverToken]);
-
-    useEffect(() => {
-        if (!projectLoaded) return;
-        setAgentState({ activeThreadId: "", messages: [], tokenUsage: null, pendingTool: null });
-    }, [projectId, projectLoaded, setAgentState]);
 
     // 云端 Agent 的会话按画布归属，进入画布就绑定：面板没打开也会挂上事件流，
     // agent 在后台改画布时画面才能实时刷新。登录态与服务端配置是异步就绪的，就绪后要再绑一次。

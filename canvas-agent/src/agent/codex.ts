@@ -4,8 +4,9 @@ import path from "node:path";
 
 import { logger } from "../utils/logger.js";
 import { errorMessage, field } from "../utils/value.js";
-import { CodexAppClient } from "./codex-client.js";
-import { summarizeCodexThread, threadMessages } from "./codex-history.js";
+import { CodexAppClient, CodexReportedError } from "./codex-client.js";
+import { codexEventHistory } from "./codex-event-history.js";
+import { settledTurnIds, summarizeCodexThread, threadMessages } from "./codex-history.js";
 import type { CodexReasoningEffort } from "./codex-protocol.js";
 import type { AgentAttachment, AgentEmit, AgentPermissionMode } from "./types.js";
 
@@ -14,22 +15,22 @@ type CodexRunOptions = { threadId?: string; cwd?: string; permissionMode?: Agent
 let codexQueue: Promise<unknown> = Promise.resolve();
 let codexApp: CodexAppClient | null = null;
 let codexAppStart: Promise<CodexAppClient> | null = null;
-let codexThreadId = "";
-const unmaterializedThreadIds = new Set<string>();
+/** 仅表示最近主动加载/选择的线程；运行中的 turn 身份由 CodexAppClient 自己维护。 */
+let loadedThreadId = "";
 
 export { summarizeCodexThread } from "./codex-history.js";
 
 /** 将 Codex turn 加入串行队列并等待执行完成。 */
-export async function runCodexTurn(prompt: string, emit: AgentEmit, attachments: AgentAttachment[] = [], options: CodexRunOptions = {}) {
+export async function runCodexTurn(prompt: string, lifecycleEmit: AgentEmit, attachments: AgentAttachment[] = [], options: CodexRunOptions = {}) {
     if (!prompt.trim()) return;
-    codexQueue = codexQueue.catch(() => undefined).then(() => runCodexTurnNow(prompt, emit, attachments, options));
+    codexQueue = codexQueue.catch(() => undefined).then(() => runCodexTurnNow(prompt, lifecycleEmit, attachments, options));
     await codexQueue;
 }
 
 /** 中断当前线程正在执行的 Codex turn。 */
 export async function interruptCodexTurn(threadId?: string) {
-    if (!codexApp || (threadId && threadId !== codexThreadId)) return false;
-    return await codexApp.interruptCurrentTurn();
+    if (!codexApp) return false;
+    return await codexApp.interruptCurrentTurn(threadId);
 }
 
 /** 回复当前 app-server 的待处理权限请求。 */
@@ -41,20 +42,17 @@ export async function resolveCodexApproval(requestId: string, decision: string) 
 export async function startCodexThread(emit: AgentEmit, cwd?: string, permissionMode: AgentPermissionMode = "request") {
     const app = await getCodexApp(emit);
     const thread = await app.startThread(cwd, permissionMode);
-    codexThreadId = String(field(thread, "id") || "");
-    if (codexThreadId) unmaterializedThreadIds.add(codexThreadId);
+    loadedThreadId = String(field(thread, "id") || "");
     return thread;
 }
 
 /** 恢复指定 Codex 线程并返回聊天历史。 */
 export async function resumeCodexThread(emit: AgentEmit, threadId: string, cwd?: string, permissionMode: AgentPermissionMode = "request") {
     const app = await getCodexApp(emit);
-    await loadCodexThread(emit, threadId, cwd, false);
-    const thread = await app.resumeThread(threadId, cwd, permissionMode);
-    assertThreadWorkspace(thread, cwd);
-    codexThreadId = String(field(thread, "id") || threadId);
-    const historyThread = await loadCodexThread(emit, codexThreadId, cwd, true);
-    return { thread, messages: threadMessages(historyThread, app.planUpdates(threadId)) };
+    const thread = await resumeLoadedThread(app, threadId, cwd, permissionMode, true);
+    const history = await loadCodexHistory(emit, threadId, cwd);
+    const supplementalItems = await codexEventHistory.readThread(threadId);
+    return { thread, messages: threadMessages(history.thread, app.planUpdates(threadId), supplementalItems), settledTurnIds: settledTurnIds(history.thread, supplementalItems), historyReady: history.historyReady };
 }
 
 /** 查询当前工作空间中的 Codex 线程。 */
@@ -80,29 +78,24 @@ export async function listCodexModels(emit: AgentEmit) {
 /** 读取指定 Codex 线程及其聊天历史。 */
 export async function readCodexThread(emit: AgentEmit, threadId: string, cwd?: string) {
     const app = await getCodexApp(emit);
-    let thread: unknown;
-    try {
-        thread = await loadCodexThread(emit, threadId, cwd, !unmaterializedThreadIds.has(threadId));
-    } catch (error) {
-        if (!/not materialized yet.*includeTurns/i.test(errorMessage(error))) throw error;
-        unmaterializedThreadIds.add(threadId);
-        thread = await loadCodexThread(emit, threadId, cwd, false);
-    }
-    return { thread: summarizeCodexThread(thread), messages: threadMessages(thread, app.planUpdates(threadId)) };
-}
-
-/** 确认指定 Codex 线程属于当前工作空间。 */
-export async function verifyCodexThreadWorkspace(emit: AgentEmit, threadId: string, cwd: string) {
-    await loadCodexThread(emit, threadId, cwd, false);
+    const history = await loadCodexHistory(emit, threadId, cwd);
+    const supplementalItems = await codexEventHistory.readThread(threadId);
+    return { thread: summarizeCodexThread(history.thread), messages: threadMessages(history.thread, app.planUpdates(threadId), supplementalItems), settledTurnIds: settledTurnIds(history.thread, supplementalItems), historyReady: history.historyReady };
 }
 
 /** 归档指定 Codex 线程。 */
 export async function archiveCodexThread(emit: AgentEmit, threadId: string, cwd?: string) {
     const app = await getCodexApp(emit);
-    await loadCodexThread(emit, threadId, cwd, false);
+    try {
+        await loadCodexThread(emit, threadId, cwd, false);
+    } catch (error) {
+        if (!isRecoverableThreadError(error)) throw error;
+        await resumeLoadedThread(app, threadId, cwd, "request", false);
+    }
     await app.archiveThread(threadId);
     app.clearPlanUpdates(threadId);
-    unmaterializedThreadIds.delete(threadId);
+    await codexEventHistory.removeThread(threadId);
+    if (loadedThreadId === threadId) loadedThreadId = "";
 }
 
 /** 判断线程异常是否允许自动新建线程后重试。 */
@@ -111,29 +104,27 @@ export function isRecoverableThreadError(error: unknown) {
 }
 
 /** 执行一次 Codex turn，并负责附件临时文件和线程恢复。 */
-async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: AgentAttachment[], options: CodexRunOptions) {
+async function runCodexTurnNow(prompt: string, lifecycleEmit: AgentEmit, attachments: AgentAttachment[], options: CodexRunOptions) {
     let files: string[] = [];
     try {
         options.onStart?.();
         files = await writeAttachmentFiles(attachments);
-        const app = await getCodexApp(options.appEmit || emit);
-        let threadId = await ensureCodexThread(app, options, emit);
+        const app = await getCodexApp(options.appEmit || lifecycleEmit);
+        let threadId = await ensureCodexThread(app, options, lifecycleEmit);
         options.onThread?.(threadId);
-        unmaterializedThreadIds.delete(threadId);
         try {
             await app.startTurn(threadId, prompt, files, options.permissionMode || "request", options.model, options.effort, options.onTurn);
         } catch (error) {
             if (!isRecoverableThreadError(error)) throw error;
-            emit("agent_log", { text: `Codex thread unavailable, starting a new thread: ${errorMessage(error)}` });
-            codexThreadId = "";
-            threadId = await ensureCodexThread(app, { cwd: options.cwd }, emit);
+            lifecycleEmit("agent_log", { text: `Codex thread unavailable, starting a new thread: ${errorMessage(error)}` });
+            loadedThreadId = "";
+            threadId = await ensureCodexThread(app, { cwd: options.cwd }, lifecycleEmit);
             options.onThread?.(threadId);
-            unmaterializedThreadIds.delete(threadId);
             await app.startTurn(threadId, prompt, files, options.permissionMode || "request", options.model, options.effort, options.onTurn);
         }
     } catch (error) {
         logger.error("Codex turn failed", error);
-        emit("agent_error", { message: errorMessage(error) });
+        if (!(error instanceof CodexReportedError)) lifecycleEmit("agent_error", { message: errorMessage(error) });
     } finally {
         options.onFinish?.();
         await Promise.all(files.map((file) => fs.unlink(file).catch(() => undefined)));
@@ -143,25 +134,21 @@ async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: Age
 /** 恢复请求线程或创建新的 Codex 线程。 */
 async function ensureCodexThread(app: CodexAppClient, options: CodexRunOptions, emit: AgentEmit) {
     if (options.threadId) {
-        if (options.threadId === codexThreadId) return codexThreadId;
+        if (options.threadId === loadedThreadId) return loadedThreadId;
         try {
-            const result = await app.readThread(options.threadId, false);
-            assertThreadWorkspace(field(result, "thread") || {}, options.cwd);
-            const thread = await app.resumeThread(options.threadId, options.cwd, options.permissionMode || "request");
-            assertThreadWorkspace(thread, options.cwd);
-            codexThreadId = String(field(thread, "id") || options.threadId);
-            return codexThreadId;
+            await resumeLoadedThread(app, options.threadId, options.cwd, options.permissionMode || "request", true);
+            return loadedThreadId;
         } catch (error) {
             if (!isRecoverableThreadError(error)) throw error;
             emit("agent_log", { text: `Codex thread unavailable, starting a new thread: ${errorMessage(error)}` });
+            loadedThreadId = "";
         }
     }
-    if (!codexThreadId) {
+    if (!loadedThreadId) {
         const thread = await app.startThread(options.cwd, options.permissionMode || "request");
-        codexThreadId = String(field(thread, "id") || "");
-        if (codexThreadId) unmaterializedThreadIds.add(codexThreadId);
+        loadedThreadId = String(field(thread, "id") || "");
     }
-    return codexThreadId;
+    return loadedThreadId;
 }
 
 /** 从 app-server 读取线程并校验工作空间。 */
@@ -173,12 +160,38 @@ async function loadCodexThread(emit: AgentEmit, threadId: string, cwd: string | 
     return thread;
 }
 
+/** 读取线程历史，并显式标记 Codex 是否已经物化 turns。 */
+async function loadCodexHistory(emit: AgentEmit, threadId: string, cwd?: string) {
+    try {
+        return { thread: await loadCodexThread(emit, threadId, cwd, true), historyReady: true };
+    } catch (error) {
+        if (/not materialized yet.*includeTurns/i.test(errorMessage(error))) return { thread: await loadCodexThread(emit, threadId, cwd, false), historyReady: false };
+        if (!isRecoverableThreadError(error)) throw error;
+        const app = await getCodexApp(emit);
+        const thread = await resumeLoadedThread(app, threadId, cwd, "request", false);
+        try {
+            return { thread: await loadCodexThread(emit, threadId, cwd, true), historyReady: true };
+        } catch (historyError) {
+            if (/not materialized yet.*includeTurns/i.test(errorMessage(historyError))) return { thread, historyReady: false };
+            throw historyError;
+        }
+    }
+}
+
+/** 恢复线程并统一校验工作空间与进程内活动线程。 */
+async function resumeLoadedThread(app: CodexAppClient, threadId: string, cwd?: string, permissionMode: AgentPermissionMode = "request", updateLoaded = true) {
+    const thread = await app.resumeThread(threadId, cwd, permissionMode);
+    assertThreadWorkspace(thread, cwd);
+    if (updateLoaded) loadedThreadId = String(field(thread, "id") || threadId);
+    return thread;
+}
+
 /** 获取已启动的 Codex app-server 客户端。 */
 async function getCodexApp(emit: AgentEmit) {
     if (codexApp) return codexApp;
     codexAppStart ||= CodexAppClient.start(emit, () => {
         codexApp = null;
-        codexThreadId = "";
+        loadedThreadId = "";
     });
     try {
         codexApp = await codexAppStart;

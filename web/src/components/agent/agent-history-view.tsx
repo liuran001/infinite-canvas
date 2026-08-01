@@ -33,6 +33,7 @@ export function AgentHistoryView({
     const [selectedIds, setSelectedIds] = useState(() => new Set<string>());
     const selectedThreads = threads.filter((thread) => selectedIds.has(thread.id));
     const allSelected = Boolean(threads.length) && selectedThreads.length === threads.length;
+    const canResume = connected && !loading && !busy;
     const toggleThread = (threadId: string) => {
         setSelectedIds((current) => {
             const next = new Set(current);
@@ -76,12 +77,15 @@ export function AgentHistoryView({
                             <div
                                 key={thread.id}
                                 role="button"
-                                tabIndex={0}
-                                className="cursor-pointer rounded-lg border px-2.5 py-2 transition hover:bg-black/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current/20 dark:hover:bg-white/10"
+                                tabIndex={canResume ? 0 : -1}
+                                aria-disabled={!canResume}
+                                className={`${canResume ? "cursor-pointer hover:bg-black/5 dark:hover:bg-white/10" : "cursor-default opacity-60"} rounded-lg border px-2.5 py-2 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current/20`}
                                 style={{ borderColor: active ? theme.node.text : theme.node.stroke, background: "transparent", color: theme.node.text }}
-                                onClick={() => onResumeThread(thread.id)}
+                                onClick={() => {
+                                    if (canResume) onResumeThread(thread.id);
+                                }}
                                 onKeyDown={(event) => {
-                                    if (event.key !== "Enter" && event.key !== " ") return;
+                                    if (!canResume || (event.key !== "Enter" && event.key !== " ")) return;
                                     event.preventDefault();
                                     onResumeThread(thread.id);
                                 }}

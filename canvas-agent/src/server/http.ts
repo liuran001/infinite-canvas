@@ -4,10 +4,10 @@ import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 
 import { runClaudeTurn } from "../agent/claude.js";
-import { archiveCodexThread, interruptCodexTurn, isRecoverableThreadError, listCodexModels, listCodexThreads, readCodexThread, resolveCodexApproval, resumeCodexThread, runCodexTurn, startCodexThread, summarizeCodexThread, verifyCodexThreadWorkspace } from "../agent/codex.js";
+import { archiveCodexThread, interruptCodexTurn, listCodexModels, listCodexThreads, readCodexThread, resolveCodexApproval, resumeCodexThread, runCodexTurn, startCodexThread, summarizeCodexThread } from "../agent/codex.js";
 import type { CodexReasoningEffort } from "../agent/codex-protocol.js";
 import type { AgentAttachment, AgentPermissionMode } from "../agent/types.js";
-import { CanvasSession } from "../canvas/session.js";
+import { AGENT_PROTOCOL_VERSION, CanvasSession } from "../canvas/session.js";
 import { DEFAULT_PORT, ensureSiteWorkspace, loadConfig, saveConfig, updateSiteWorkspace, type CanvasAgentConfig } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { checkVersions } from "../version-check.js";
@@ -22,13 +22,24 @@ export function startHttpServer() {
     const session = new CanvasSession();
     /** 将 Agent 事件广播到所属线程或全部网页。 */
     const emit = (type: string, payload: unknown) => {
-        const data = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
-        const threadId = String(data.threadId || data.thread_id || ensureSiteWorkspace(config).activeThreadId || "");
+        const scope = session.codexBusy ? session.codexEventScope : { threadId: "", turnId: "", sourceClientId: "" };
+        const value = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
+        const threadId = String(value.threadId || value.thread_id || scope.threadId || ensureSiteWorkspace(config).activeThreadId || "");
+        const turnId = String(value.turnId || value.turn_id || scope.turnId || "");
+        const sourceClientId = String(value.sourceClientId || scope.sourceClientId || "");
+        const data = {
+            ...value,
+            ...(threadId ? { threadId, thread_id: threadId } : {}),
+            ...(turnId ? { turnId, turn_id: turnId } : {}),
+            ...(sourceClientId ? { sourceClientId } : {}),
+        };
+        session.trackCodexEvent(type, data);
         threadId ? session.emitThread(type, threadId, data) : session.emitAll(type, data);
     };
     /** 保存并广播当前站点工作空间的活跃线程。 */
     const setActiveThread = (activeThreadId: string, payload: Record<string, unknown> = {}) => {
         const workspace = updateSiteWorkspace(config, { activeThreadId: activeThreadId || undefined });
+        if (!session.codexBusy && session.codexThreadId !== activeThreadId) session.setCodexState({ threadId: activeThreadId, turnId: "" });
         session.emitThread("workspace_changed", activeThreadId, { ...payload, activeThreadId });
         return workspace;
     };
@@ -52,12 +63,14 @@ export function startHttpServer() {
         next();
     });
     app.get("/health", (_req, res) => res.json(session.health()));
-    app.get("/config", (_req, res) => res.json({ ok: true, url: config.url, hasToken: true }));
+    app.get("/config", (_req, res) => res.json({ ok: true, protocolVersion: AGENT_PROTOCOL_VERSION, url: config.url, hasToken: true }));
     app.use((req, res, next) => {
         if (validToken(req, requestUrl(req, config), config.token)) return next();
         res.status(401).json({ ok: false, error: "invalid token" });
     });
-    app.get("/events", (req, res) => session.openEvents(requestUrl(req, config), res));
+    app.get("/events", (req, res) => {
+        session.openEvents(requestUrl(req, config), res, ensureSiteWorkspace(config).activeThreadId || "");
+    });
     app.post("/canvas/state", (req, res) => {
         session.updateState(req.body, String(req.query.clientId || "") || undefined);
         res.json({ ok: true });
@@ -103,98 +116,119 @@ export function startHttpServer() {
         const result = await listCodexThreads(emit, { cwd: workspace.workspacePath, searchTerm: String(req.query.searchTerm || "") });
         res.json({ ok: true, workspace, ...result });
     }));
-    app.post("/agent/codex/threads/new", route(async (req, res) => {
-        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
+    app.post("/agent/codex/threads/new", codexMutation(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
         const thread = await startCodexThread(emit, workspace.workspacePath, permissionMode(req.body?.permissionMode));
         const activeThreadId = String((thread as Record<string, unknown>).id || "");
-        const nextWorkspace = setActiveThread(activeThreadId, { emptyThread: true });
+        const nextWorkspace = setActiveThread(activeThreadId, { emptyThread: true, sourceClientId: String(req.body?.clientId || "") });
         res.json({ ok: true, workspace: nextWorkspace, thread: summarizeCodexThread(thread), messages: [] });
     }));
-    app.post("/agent/codex/threads/reset", (req, res) => {
-        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
-        res.json({ ok: true, workspace: setActiveThread("", { emptyThread: true, draftThread: true }) });
-    });
+    app.post("/agent/codex/threads/reset", codexMutation((req, res) => {
+        res.json({ ok: true, workspace: setActiveThread("", { emptyThread: true, draftThread: true, sourceClientId: String(req.body?.clientId || "") }) });
+    }));
     app.get("/agent/codex/threads/:threadId", route(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
         const threadId = routeParam(req.params.threadId);
-        try {
-            res.json({ ok: true, workspace, ...(await readCodexThread(emit, threadId, workspace.workspacePath)) });
-        } catch (error) {
-            if (workspace.activeThreadId !== threadId || !isRecoverableThreadError(error)) throw error;
-            res.json({ ok: true, workspace, thread: { id: threadId, preview: "", cwd: workspace.workspacePath }, messages: [] });
-        }
+        res.json({ ok: true, workspace, ...(await readCodexThread(emit, threadId, workspace.workspacePath)) });
     }));
-    app.post("/agent/codex/threads/:threadId/resume", route(async (req, res) => {
-        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
+    app.post("/agent/codex/history/ack", (req, res) => {
+        const threadId = String(req.body?.threadId || "");
+        const turnIds = Array.isArray(req.body?.turnIds) ? req.body.turnIds.map(String) : [];
+        session.acknowledgeCodexHistory(threadId, turnIds);
+        res.json({ ok: true });
+    });
+    app.post("/agent/codex/threads/:threadId/resume", codexMutation(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
         const threadId = routeParam(req.params.threadId);
         const result = await resumeCodexThread(emit, threadId, workspace.workspacePath, permissionMode(req.body?.permissionMode));
-        const nextWorkspace = setActiveThread(threadId);
+        const nextWorkspace = setActiveThread(threadId, { sourceClientId: String(req.body?.clientId || "") });
         res.json({ ok: true, workspace: nextWorkspace, ...result });
     }));
-    app.post("/agent/codex/threads/:threadId/delete", route(async (req, res) => {
-        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
+    app.post("/agent/codex/threads/:threadId/delete", codexMutation(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
         const threadId = routeParam(req.params.threadId);
         await archiveCodexThread(emit, threadId, workspace.workspacePath);
-        setActiveThread(workspace.activeThreadId === threadId ? "" : workspace.activeThreadId || "");
+        setActiveThread(workspace.activeThreadId === threadId ? "" : workspace.activeThreadId || "", { sourceClientId: String(req.body?.clientId || "") });
         res.json({ ok: true });
     }));
-    app.post("/agent/codex/turn", route(async (req, res) => {
-        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
+    app.post("/agent/codex/turn", codexMutation(async (req, res) => {
         const attachments = Array.isArray(req.body?.attachments) ? (req.body.attachments as AgentAttachment[]) : [];
         const workspace = ensureSiteWorkspace(config);
         const prompt = String(req.body?.prompt || "");
         if (!prompt.trim()) return res.status(400).json({ ok: false, error: "请输入任务内容" });
         const clientId = String(req.body?.clientId || "");
+        if (!clientId || !session.hasClient(clientId)) return res.status(409).json({ ok: false, error: "发起任务的网页已断开，请重新连接后再试" });
+        const requestedThreadId = String(req.body?.threadId || "");
+        const activeThreadId = workspace.activeThreadId || "";
+        if (requestedThreadId !== activeThreadId) return res.status(409).json({ ok: false, error: "当前会话已在其他页面切换，请同步后重试" });
         const model = String(req.body?.model || "") || undefined;
         const effort = reasoningEffort(req.body?.effort);
+        const messageId = String(req.body?.messageId || Date.now());
+        const messageText = String(req.body?.messageText || prompt || `发送了 ${attachments.length} 张图片`);
+        let threadId = activeThreadId;
         logger.info("Codex turn accepted", { threadId: req.body?.threadId, model: model || "default", reasoningEffort: effort || "default", promptLength: prompt.length, attachmentCount: attachments.length });
-        session.setCodexState({ busy: true, threadId: String(req.body?.threadId || workspace.activeThreadId || ""), turnId: "" });
+        session.bindClient(clientId);
+        session.setCodexState({ busy: true, threadId, turnId: "" });
         try {
-            let threadId = String(req.body?.threadId || workspace.activeThreadId || "");
             let turnId = "";
             if (!threadId) {
                 const thread = await startCodexThread(emit, workspace.workspacePath, permissionMode(req.body?.permissionMode));
                 threadId = String((thread as Record<string, unknown>).id || "");
-                setActiveThread(threadId, { emptyThread: true });
-            } else if (threadId !== workspace.activeThreadId) {
-                await verifyCodexThreadWorkspace(emit, threadId, workspace.workspacePath);
-                setActiveThread(threadId);
+                setActiveThread(threadId, { emptyThread: true, sourceClientId: clientId });
             }
+            session.setCodexState({ busy: true, threadId, turnId: "" });
             const attachmentRefs = session.setTurnAttachments(clientId, attachments);
-            const chatMessage = {
+            session.emitThread("chat_message", threadId, {
                 sourceClientId: clientId,
-                message: { id: String(req.body?.messageId || Date.now()), role: "user", text: String(req.body?.messageText || prompt || `发送了 ${attachments.length} 张图片`) },
+                message: { id: `${threadId}:pending:synthetic:user`, itemId: "synthetic:user", clientMessageId: messageId, threadId, turnId: "", role: "user", text: messageText },
+            });
+            let chatTurnId = "";
+            /** 将包装层日志和兜底错误固定广播到当前 turn。 */
+            const lifecycleEmit = (type: string, payload: unknown) => {
+                const value = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
+                const eventThreadId = String(value.threadId || value.thread_id || threadId);
+                const eventTurnId = String(value.turnId || value.turn_id || turnId);
+                const sourceClientId = String(value.sourceClientId || clientId);
+                session.emitThread(type, eventThreadId, {
+                    ...value,
+                    threadId: eventThreadId,
+                    thread_id: eventThreadId,
+                    ...(eventTurnId ? { turnId: eventTurnId, turn_id: eventTurnId } : {}),
+                    ...(sourceClientId ? { sourceClientId } : {}),
+                });
             };
-            let chatThreadId = "";
-            /** 将当前 turn 事件固定广播到实际线程。 */
-            const turnEmit = (type: string, payload: unknown) => {
-                const data = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
-                session.emitThread(type, threadId, { ...data, ...(turnId ? { turn_id: turnId } : {}) });
-            };
-            void runCodexTurn(withAttachmentContext(prompt, attachmentRefs), turnEmit, attachments, {
+            void runCodexTurn(withAttachmentContext(prompt, attachmentRefs), lifecycleEmit, attachments, {
                 threadId,
                 cwd: workspace.workspacePath,
                 permissionMode: permissionMode(req.body?.permissionMode),
                 model,
                 effort,
                 appEmit: emit,
-                onStart: clientId ? () => session.bindClient(clientId) : undefined,
+                onStart: () => session.bindClient(clientId),
                 onThread: (actualThreadId) => {
+                    const threadChanged = actualThreadId !== threadId;
                     if (actualThreadId !== threadId) {
                         threadId = actualThreadId;
-                        setActiveThread(threadId, { emptyThread: true });
+                        setActiveThread(threadId, { emptyThread: true, sourceClientId: clientId });
                     }
                     session.setCodexState({ busy: true, threadId, turnId: "" });
-                    if (chatThreadId !== threadId) {
-                        chatThreadId = threadId;
-                        session.emitThread("chat_message", threadId, chatMessage);
+                    if (threadChanged) {
+                        session.emitThread("chat_message", threadId, {
+                            sourceClientId: clientId,
+                            message: { id: `${threadId}:pending:synthetic:user`, itemId: "synthetic:user", clientMessageId: messageId, threadId, turnId: "", role: "user", text: messageText },
+                        });
                     }
                 },
                 onTurn: (actualTurnId) => {
                     turnId = actualTurnId;
+                    if (chatTurnId !== turnId) {
+                        chatTurnId = turnId;
+                        session.emitThread("chat_message", threadId, {
+                            turnId,
+                            sourceClientId: clientId,
+                            message: { id: `${threadId}:${turnId}:synthetic:user`, itemId: "synthetic:user", clientMessageId: messageId, threadId, turnId, role: "user", text: messageText },
+                        });
+                    }
                     logger.info("Codex turn started", { threadId, turnId, model: model || "default", reasoningEffort: effort || "default" });
                     session.setCodexState({ busy: true, threadId, turnId });
                 },
@@ -207,10 +241,23 @@ export function startHttpServer() {
             });
             res.json({ ok: true, threadId });
         } catch (error) {
-            session.setCodexState({ busy: false, threadId: String(req.body?.threadId || workspace.activeThreadId || ""), turnId: "" });
+            session.releaseClient(clientId);
+            session.setCodexState({ busy: false, threadId, turnId: "" });
             throw error;
         }
     }));
+
+    /** 将 Codex 写操作串行化，避免多窗口在异步请求期间交叉修改会话。 */
+    function codexMutation(handler: (req: Request, res: Response) => unknown | Promise<unknown>) {
+        return route(async (req, res) => {
+            if (!session.beginCodexMutation()) return res.status(409).json({ ok: false, error: "Codex 正在运行或正在切换会话，请稍后重试" });
+            try {
+                return await handler(req, res);
+            } finally {
+                session.endCodexMutation();
+            }
+        });
+    }
     app.post("/agent/codex/approval", route(async (req, res) => {
         const decision = String(req.body?.decision || "");
         if (!["accept", "acceptForSession", "decline", "cancel"].includes(decision)) return res.status(400).json({ ok: false, error: "无效的审批决定" });

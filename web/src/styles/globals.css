@@ -523,6 +523,10 @@
     line-height: 1.15rem;
 }
 
+.agent-streamdown [data-streamdown="code-block-body"] code > span {
+    display: block;
+}
+
 .agent-streamdown [data-streamdown="code-block-actions"] {
     gap: 0;
     margin: 0;
