@@ -2,13 +2,22 @@ import { fail, SafeError } from "../lib/errors";
 import { upstreamJson } from "../lib/upstream";
 import { getSettings, type SearchProviderName, type SearchService } from "./settings";
 
-export type SearchResult = { title: string; url: string; publishedDate: string; text: string };
+/** imageUrl 是这条结果自带的配图地址，服务商没给就是空串。 */
+export type SearchResult = { title: string; url: string; publishedDate: string; text: string; imageUrl: string };
+
+/**
+ * 一次搜索的完整返回。图片分两个口子放：
+ * 能确定属于某条结果的写进该结果的 imageUrl，只知道属于本次搜索、落不到具体结果上的放进 images。
+ * 之所以不合并成一个数组，是因为两家服务商给图的方式本来就不一样（Exa 每条结果一张配图、Tavily 是整次搜索一组图），
+ * 合并就得凭空编造图片和网页的从属关系。上层只认这两个口子，仍然不需要知道自己在用哪一家。
+ */
+export type SearchResults = { results: SearchResult[]; images: string[] };
 
 /** 读回来的网页正文字段和搜索结果一致，不另开一套结构。 */
 export type WebPage = SearchResult;
 
 /** 换搜索服务只要再实现一对 provider 并注册到 PROVIDERS，agent 那边不用改。 */
-export type SearchProvider = (service: SearchService, query: string, limit: number, signal: AbortSignal) => Promise<SearchResult[]>;
+export type SearchProvider = (service: SearchService, query: string, limit: number, signal: AbortSignal) => Promise<SearchResults>;
 
 /** 读网页走同一套 provider 抽象：agent 只认「给个网址拿回正文」，换服务商同样不用改 agent。 */
 export type WebPageProvider = (service: SearchService, url: string, maxChars: number, signal: AbortSignal) => Promise<WebPage>;
@@ -22,12 +31,13 @@ const TAVILY_BASE_URL = "https://api.tavily.com";
 /** baseUrl 留空就回落到服务商官方地址。各家端点路径不同（Exa 是 /contents、Tavily 是 /extract），所以路径由各自的 provider 自己拼。 */
 const endpoint = (service: SearchService, fallback: string, path: string) => `${(service.baseUrl || fallback).replace(/\/+$/, "")}${path}`;
 
-type ExaResult = { title?: string; url?: string; publishedDate?: string; text?: string; summary?: string; highlights?: string[] };
+type ExaResult = { title?: string; url?: string; publishedDate?: string; text?: string; summary?: string; highlights?: string[]; image?: string };
 
 /**
  * Exa 搜索。官方文档（https://exa.ai/docs/reference/search）的请求格式是
  * POST https://api.exa.ai/search，密钥放 x-api-key 头（文档同时说明 Authorization: Bearer 也可用），
  * 请求体里 contents.text 打开才会返回正文。
+ * 每条结果自带一个 image 字段（实测就是该网页的主图/og:image），所以图片全都能落到具体结果上，images 恒为空。
  */
 const exaSearch: SearchProvider = async (service, query, limit, signal) => {
     const payload = await upstreamJson<{ results?: ExaResult[] }>(
@@ -40,19 +50,23 @@ const exaSearch: SearchProvider = async (service, query, limit, signal) => {
         },
         "联网搜索失败",
     );
-    return (payload.results || []).map((item) => ({
-        title: (item.title || "").trim(),
-        url: (item.url || "").trim(),
-        publishedDate: (item.publishedDate || "").trim(),
-        text: (item.summary || item.text || (item.highlights || []).join("\n") || "").slice(0, MAX_TEXT_CHARS).trim(),
-    }));
+    return {
+        results: (payload.results || []).map((item) => ({
+            title: (item.title || "").trim(),
+            url: (item.url || "").trim(),
+            publishedDate: (item.publishedDate || "").trim(),
+            text: (item.summary || item.text || (item.highlights || []).join("\n") || "").slice(0, MAX_TEXT_CHARS).trim(),
+            imageUrl: (item.image || "").trim(),
+        })),
+        images: [],
+    };
 };
 
 /**
  * Exa 读网页。官方文档（https://exa.ai/docs/reference/get-contents）的请求格式是
  * POST https://api.exa.ai/contents，密钥同样放 x-api-key 头；
  * urls 是网址数组（1~100 条），text 传对象时用 maxCharacters 限制正文长度，
- * 响应和 /search 一样是 { requestId, results: [...], statuses, costDollars }。
+ * 响应和 /search 一样是 { requestId, results: [...], statuses, costDollars }，因此配图同样在 image 字段里。
  * 不传 livecrawl（官方文档已标为 deprecated）也不传 maxAgeHours：两个都省略时的默认行为
  * 正好是「缓存里有就直接给，没有再现抓」，正是读网页要的。
  */
@@ -71,7 +85,13 @@ const exaContents: WebPageProvider = async (service, url, maxChars, signal) => {
     const text = (item?.text || "").trim();
     // 抓不到正文（付费墙、纯图片页、上游只回了 statuses）不能返回空字符串糊弄模型，抛出去还能换下一家试试。
     if (!text) throw fail("没能读取到这个网页的正文");
-    return { title: (item?.title || "").trim(), url: (item?.url || url).trim(), publishedDate: (item?.publishedDate || "").trim(), text: text.slice(0, maxChars) };
+    return {
+        title: (item?.title || "").trim(),
+        url: (item?.url || url).trim(),
+        publishedDate: (item?.publishedDate || "").trim(),
+        text: text.slice(0, maxChars),
+        imageUrl: (item?.image || "").trim(),
+    };
 };
 
 type TavilyResult = { title?: string; url?: string; content?: string; published_date?: string };
@@ -83,24 +103,31 @@ type TavilyExtractResult = { title?: string; url?: string; raw_content?: string 
  * 每条的摘要正文在 content 字段；raw_content 默认是 null，要额外参数才给全文，
  * 读全文统一交给 read_webpage 走 /extract，搜索这里不去要，免得一次搜索就把上下文吃满。
  * 也不取 Tavily 独有的 answer：那是它自己生成的答案，取了会让不同服务商的返回结构不一致。
+ * include_images 打开后图片在顶层 images 里，是整次搜索选出来的一组图，落不到具体某条结果上，所以只能进 images。
+ * 每条结果同时也会多出一个 images 字段，但实测那是整页图片的原样堆放（1px 占位图、75x75 缩略图都在里面），
+ * 拿第一张当这条结果的配图纯属猜，宁可不给。图片条数按结果条数截断，免得一次搜索甩回几十条链接把上下文吃掉。
  */
 const tavilySearch: SearchProvider = async (service, query, limit, signal) => {
-    const payload = await upstreamJson<{ results?: TavilyResult[] }>(
+    const payload = await upstreamJson<{ results?: TavilyResult[]; images?: string[] }>(
         endpoint(service, TAVILY_BASE_URL, "/search"),
         {
             method: "POST",
             headers: { Authorization: `Bearer ${service.apiKey}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ query, max_results: limit }),
+            body: JSON.stringify({ query, max_results: limit, include_images: true }),
             signal,
         },
         "联网搜索失败",
     );
-    return (payload.results || []).map((item) => ({
-        title: (item.title || "").trim(),
-        url: (item.url || "").trim(),
-        publishedDate: (item.published_date || "").trim(),
-        text: (item.content || "").slice(0, MAX_TEXT_CHARS).trim(),
-    }));
+    return {
+        results: (payload.results || []).map((item) => ({
+            title: (item.title || "").trim(),
+            url: (item.url || "").trim(),
+            publishedDate: (item.published_date || "").trim(),
+            text: (item.content || "").slice(0, MAX_TEXT_CHARS).trim(),
+            imageUrl: "",
+        })),
+        images: (payload.images || []).map((image) => String(image || "").trim()).filter(Boolean).slice(0, limit),
+    };
 };
 
 /**
@@ -123,7 +150,8 @@ const tavilyExtract: WebPageProvider = async (service, url, maxChars, signal) =>
     const item = (payload.results || [])[0];
     const text = (item?.raw_content || "").trim();
     if (!text) throw fail("没能读取到这个网页的正文");
-    return { title: (item?.title || "").trim(), url: (item?.url || url).trim(), publishedDate: "", text: text.slice(0, maxChars) };
+    // /extract 不返回配图，这里只能给空串；要配图就用 web_search。
+    return { title: (item?.title || "").trim(), url: (item?.url || url).trim(), publishedDate: "", text: text.slice(0, maxChars), imageUrl: "" };
 };
 
 const PROVIDERS: Record<SearchProviderName, { search: SearchProvider; fetch: WebPageProvider }> = {
@@ -135,11 +163,12 @@ const PROVIDERS: Record<SearchProviderName, { search: SearchProvider; fetch: Web
  * 只允许 http/https，并挡掉本机与内网地址。
  * 网址是模型给的，而模型会被网页内容、用户输入里的提示词带偏，必须假定它可能被诱导去探测部署环境——
  * 容器网关（172.17.x）、云厂商元数据（169.254.169.254）、同机上没鉴权的服务都在这条路径的射程内。
- * provider 换成「服务端自己抓」的实现时这层就是唯一防线，所以拦截放在这里，对所有 provider 生效。
+ * provider 换成「服务端自己抓」的实现时这层就是唯一防线，所以拦截放在这里，对所有 provider 生效；
+ * import_image 是服务端直接下载并落库，比读正文更需要这层，因此共用同一份判断，不另写一套。
  * 只做字面量判断、不解析 DNS：域名指向内网这种情况挡不住，交给部署侧的出网策略。
  * （服务商 baseUrl 不走这里：那是管理员配的，和渠道 baseUrl 一样属于可信配置，模型控制不了。）
  */
-function safeWebUrl(raw: string) {
+export function safeWebUrl(raw: string) {
     const value = raw.trim();
     if (!value) throw fail("缺少要读取的网址");
     let url: URL;
@@ -149,10 +178,18 @@ function safeWebUrl(raw: string) {
         throw fail("网址格式不正确，需要以 http:// 或 https:// 开头");
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") throw fail("只能读取 http/https 网址");
-    const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    const parts = host.split(".").map(Number);
+    // 主机名先归一化再判断：末尾多一个点（localhost.）和 IPv4 映射写法（::ffff:127.0.0.1）指的是同一台机器，
+    // 不剥掉就能绕过下面所有判断。
+    const host = url.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+    const plain = host.startsWith("::ffff:") ? host.slice(7) : host;
+    const labels = plain.split(".");
+    const parts = labels.map(Number);
     const isIpv4 = parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255);
+    // 末段是纯数字却又不是标准四段 IPv4 的主机名（2130706433、127.1、0x7f.1）会被系统照样解析成 127.0.0.1，
+    // 按四段拆的私网判断根本轮不到，只能整体按内网处理；真实域名不会以纯数字结尾。
+    const numericHost = /^\d+$/.test(labels[labels.length - 1]) && !isIpv4;
     const internal =
+        numericHost ||
         host === "localhost" ||
         host.endsWith(".localhost") ||
         host.endsWith(".local") ||

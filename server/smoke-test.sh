@@ -150,6 +150,26 @@ echo "生成任务成功路径"
 # 这样工具调用循环、落库、SSE、断线续传都能被真正跑到，而不是只测 HTTP 状态码。
 cat >"$WORK/upstream.js" <<'EOF'
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+// import_image 用的假图床素材。都是真的图片字节，服务端按魔数认格式，写死 base64 才能断言「没有被重新编码过」。
+// 两张 png 的内容必须互不相同、也不能和上面那张生成用的 PNG 相同：saveFile 按内容去重，
+// 撞上了就会复用同一条文件记录，验不出「导入真的新建了文件」和「配额真的被占用」。
+const PNG_IMPORT = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAD0lEQVQImWNg+M+AQMRxAJ6jD/HnSNDJAAAAAElFTkSuQmCC";
+const PNG_OTHER = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEElEQVQImWNgYPiPAw0pCQCpcD/B+Cvn4QAAAABJRU5ErkJggg==";
+const WEBP = "UklGRhwAAABXRUJQVlA4TA8AAAAvBYAAAAcQ0f/+ByKi/wEA";
+const AVIF =
+    "AAAAHGZ0eXBhdmlmAAAAAG1pZjFhdmlmbWlhZgAAANZtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAAAAAAACJpbG9jAAAAAERAAAEAAQAAAAAA+gABAAAAAAAAACYAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABhdjAxAAAAAA5waXRtAAAAAAABAAAAVmlwcnAAAAA4aXBjbwAAAAxhdjFDgSACAAAAABRpc3BlAAAAAAAAAAQAAAAEAAAAEHBpeGkAAAAAAwgICAAAABZpcG1hAAAAAAAAAAEAAQOBAgMAAAAubWRhdBIACgg4BH2kBDQaQDIYGUJjBMAANAAExbXoBe6cVBGx8nK3xDOA";
+// 服务端下载图片时用的对外地址，由脚本按本机主机名拼好传进来。
+const IMG_ORIGIN = process.argv[3] || "";
+// 假图床：路径决定返回什么，用来覆盖「正常图片 / 伪装成图片的 HTML / 响应头就不是图片 / 不支持的格式」几条路径。
+const IMAGES = {
+    "/img/ok.png": ["image/png", Buffer.from(PNG_IMPORT, "base64")],
+    "/img/other.png": ["image/png", Buffer.from(PNG_OTHER, "base64")],
+    "/img/ok.webp": ["image/webp", Buffer.from(WEBP, "base64")],
+    "/img/photo.avif": ["image/avif", Buffer.from(AVIF, "base64")],
+    // 扩展名和响应头都写着 png，字节却是 HTML：只信其中任何一个，这份内容就会被存进用户的云空间。
+    "/img/fake.png": ["image/png", Buffer.from("<!DOCTYPE html><html><body>我不是图片</body></html>")],
+    "/img/page.png": ["text/html", Buffer.from("<!DOCTYPE html><html><body>这是网页</body></html>")],
+};
 // agent 的每轮回复慢一点，冒烟脚本才有机会在循环跑到一半时把 SSE 掐掉。
 const AGENT_DELAY_MS = 1200;
 // 文本流按片慢慢吐，冒烟脚本才有机会在生成中途读到半截内容、把连接掐掉再续上。
@@ -192,6 +212,15 @@ function toolCall(messages) {
     if (text.includes("读取内网")) return { name: "read_webpage", args: { url: "http://127.0.0.1:9/admin" } };
     if (text.includes("读取网页")) return { name: "read_webpage", args: { url: "https://example.com/long-article" } };
     if (text.includes("联网搜索")) return { name: "web_search", args: { query: "无限画布" } };
+    // 导入图片：服务端会真的按这个地址发起下载，所以除了内网那条，其余都指向上面的假图床。
+    if (text.includes("导入内网图片")) return { name: "import_image", args: { url: "http://127.0.0.1:9/secret.png" } };
+    if (text.includes("导入超大图片")) return { name: "import_image", args: { url: `${IMG_ORIGIN}/img/huge.png` } };
+    if (text.includes("导入伪装图片")) return { name: "import_image", args: { url: `${IMG_ORIGIN}/img/fake.png` } };
+    if (text.includes("导入网页地址")) return { name: "import_image", args: { url: `${IMG_ORIGIN}/img/page.png` } };
+    if (text.includes("导入 avif 图片")) return { name: "import_image", args: { url: `${IMG_ORIGIN}/img/photo.avif` } };
+    if (text.includes("导入 webp 图片")) return { name: "import_image", args: { url: `${IMG_ORIGIN}/img/ok.webp` } };
+    if (text.includes("导入另一张图片")) return { name: "import_image", args: { url: `${IMG_ORIGIN}/img/other.png` } };
+    if (text.includes("导入图片")) return { name: "import_image", args: { url: `${IMG_ORIGIN}/img/ok.png` } };
     // 把消息里出现的 storageKey 原样带进工具参数：用来验证用户上传的附件真的能被工具引用到。
     const storageKey = (text.match(/server:[A-Za-z0-9_-]+/) || [])[0];
     if (text.includes("用这张图建节点") && storageKey) return { name: "create_node", args: { type: "image", title: "附件节点", storageKey } };
@@ -199,12 +228,33 @@ function toolCall(messages) {
 }
 
 require("http").createServer((req, res) => {
+    // 服务端超上限时会直接掐断下载，这里不接住 error 事件的话，一个 ECONNRESET 就能把 mock 进程带崩。
+    res.on("error", () => {});
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
         res.setHeader("Content-Type", "application/json");
         if (req.url === "/_tools") return res.end(JSON.stringify({ tools: lastTools }));
         if (req.url === "/_last") return res.end(JSON.stringify(lastChat || {}));
+        if (IMAGES[req.url]) {
+            const [type, buffer] = IMAGES[req.url];
+            res.setHeader("Content-Type", type);
+            return res.end(buffer);
+        }
+        // 超大图片：故意不给 Content-Length，一直往外吐，用来验证服务端是边收边数、超上限当场掐断，
+        // 而不是先下完整份再判断大小。
+        if (req.url === "/img/huge.png") {
+            res.setHeader("Content-Type", "image/png");
+            const chunk = Buffer.alloc(1 << 20, 0x61);
+            let sent = 0;
+            const push = () => {
+                if (res.destroyed || res.writableEnded) return;
+                if (sent >= 16) return res.end();
+                sent += 1;
+                res.write(chunk, push);
+            };
+            return push();
+        }
         // 假的 Linux.do：换 token 与拉用户资料，用来验证关闭注册时第三方登录会被挡住。
         if (req.url.startsWith("/oauth2/token")) return res.end(JSON.stringify({ access_token: "linuxdo-access-token" }));
         if (req.url.startsWith("/api/user")) return res.end(JSON.stringify({ id: 424242, username: "smoke-linuxdo", name: "冒烟测试" }));
@@ -228,7 +278,8 @@ require("http").createServer((req, res) => {
             return res.end(JSON.stringify({ requestId: "smoke", results: [{ id: url, url, title: "冒烟长文Exa", publishedDate: "2026-01-01T00:00:00.000Z", text: LONG_TEXT.slice(0, max) }], statuses: [{ id: url, status: "success" }] }));
         }
         if (req.url.includes("/exa/search")) {
-            return res.end(JSON.stringify({ results: [{ title: "冒烟搜索结果", url: "https://example.com/exa", publishedDate: "2026-01-01T00:00:00.000Z", text: "来自 Exa 的正文" }] }));
+            // Exa 每条结果自带一张配图，图片能落到具体结果上。
+            return res.end(JSON.stringify({ results: [{ title: "冒烟搜索结果", url: "https://example.com/exa", publishedDate: "2026-01-01T00:00:00.000Z", text: "来自 Exa 的正文", image: "https://example.com/exa-cover.jpg" }] }));
         }
         if (req.url.includes("/tavily/extract")) {
             const url = (body.urls || [])[0] || "";
@@ -236,7 +287,14 @@ require("http").createServer((req, res) => {
             return res.end(JSON.stringify({ results: [{ url, title: "冒烟长文Tavily", raw_content: LONG_TEXT }], failed_results: [] }));
         }
         if (req.url.includes("/tavily/search")) {
-            return res.end(JSON.stringify({ results: [{ title: "冒烟搜索结果", url: "https://example.com/tavily", content: "来自 Tavily 的摘要" }] }));
+            // Tavily 的图片在顶层 images，落不到具体结果上；每条结果自己的 images 是整页图片的原样堆放
+            // （占位图、缩略图都在里面），服务端不该拿它当这条结果的配图。
+            return res.end(
+                JSON.stringify({
+                    images: body.include_images ? ["https://example.com/tavily-1.jpg", "https://example.com/tavily-2.jpg"] : [],
+                    results: [{ title: "冒烟搜索结果", url: "https://example.com/tavily", content: "来自 Tavily 的摘要", images: ["https://example.com/tavily-placeholder-1px.png"] }],
+                }),
+            );
         }
 
         if (req.url.includes("/chat/completions")) {
@@ -263,9 +321,15 @@ require("http").createServer((req, res) => {
 
         res.end(JSON.stringify({ data: [{ b64_json: PNG }] }));
     });
-}).listen(Number(process.argv[2]), "127.0.0.1");
+// 监听所有网卡而不是只监听 127.0.0.1：import_image 的地址要用本机主机名才能过服务端的内网拦截，
+// 而主机名解析出来的未必是 127.0.0.1。
+}).listen(Number(process.argv[2]));
 EOF
-node "$WORK/upstream.js" "$UPSTREAM_PORT" &
+# 服务端下载图片时用的地址：safeWebUrl 只做字面量判断、不解析 DNS（这是它写明的边界），
+# 主机名字面量上不是内网地址，正好把 mock 图床装扮成一个「公网图床」，
+# 让「下载 → 校验大小与格式 → 落库占配额」整条真链路都能在离线环境里跑一遍。
+IMG_ORIGIN="http://${HOSTNAME:-$(uname -n)}:$UPSTREAM_PORT"
+node "$WORK/upstream.js" "$UPSTREAM_PORT" "$IMG_ORIGIN" &
 UPSTREAM_PID=$!
 sleep 1
 
@@ -566,6 +630,7 @@ check "工具结果落库" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[] | selec
 check "模型最终回复落库" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[] | select(.role=="assistant")][-1].content')" "已经按你的要求改好画布了。"
 check "工具列表里没有 web_search" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="web_search")] | length')" "0"
 check "工具列表里没有 read_webpage" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_webpage")] | length')" "0"
+check "工具列表里没有 import_image" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="import_image")] | length')" "0"
 check "工具列表里有画布读写工具" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_canvas" or .=="create_node" or .=="connect_nodes")] | length')" "3"
 
 # 工具直接改的是服务端画布，revision 递增后前端现有的增量同步就能拉到。
@@ -670,6 +735,7 @@ for _ in $(seq 1 40); do
 done
 check "配了密钥后才把 web_search 下发给模型" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="web_search")] | length')" "1"
 check "配了密钥后才把 read_webpage 下发给模型" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_webpage")] | length')" "1"
+check "配了密钥后才把 import_image 下发给模型" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="import_image")] | length')" "1"
 
 # 读网页真的把上游正文取回来，并按服务端上限截断后告诉模型「没读完」。
 agent_message() {
@@ -693,7 +759,10 @@ TAVILY_PAGE=$(last_tool_result "$SEARCH_SESSION" "read_webpage" | jq -r '.data')
 check "换成 Tavily 也能读到正文" "$(echo "$TAVILY_PAGE" | jq -r '.title')" "冒烟长文Tavily"
 check "Tavily 的整篇原文同样被截断" "$(echo "$TAVILY_PAGE" | jq -r '.text | length')" "8000"
 agent_message "$SEARCH_SESSION" "search-m2" "帮我联网搜索"
-check "换成 Tavily 也能搜到结果" "$(last_tool_result "$SEARCH_SESSION" "web_search" | jq -r '.data.results[0].url')" "https://example.com/tavily"
+TAVILY_FOUND=$(last_tool_result "$SEARCH_SESSION" "web_search" | jq -r '.data')
+check "换成 Tavily 也能搜到结果" "$(echo "$TAVILY_FOUND" | jq -r '.results[0].url')" "https://example.com/tavily"
+check "Tavily 的图片进本次搜索的图片列表" "$(echo "$TAVILY_FOUND" | jq -r '.images[0]')" "https://example.com/tavily-1.jpg"
+check "Tavily 不把整页图片堆当成结果配图" "$(echo "$TAVILY_FOUND" | jq -r '.results[0].imageUrl')" ""
 
 # 多服务自动切换：权重高的那家必定 500，整条链路仍要成功。
 agent_settings "$SEARCH_FAILOVER" '""'
@@ -710,6 +779,54 @@ agent_message "$SEARCH_SESSION" "read-m4" "帮我读取内网地址"
 INTERNAL=$(last_tool_result "$SEARCH_SESSION" "read_webpage")
 check "读网页拒绝内网地址" "$(echo "$INTERNAL" | jq -r '.ok')" "false"
 check "拒绝内网地址给出中文原因" "$(echo "$INTERNAL" | jq -r '.error')" "不能读取本机或内网地址"
+
+# 搜到的图片要能真的变成画布用得上的服务端文件。整条链路是「搜索拿到图片地址 → import_image 落库 → storageKey 建节点」。
+agent_message "$SEARCH_SESSION" "search-m4" "帮我联网搜索"
+EXA_FOUND=$(last_tool_result "$SEARCH_SESSION" "web_search" | jq -r '.data')
+check "Exa 的配图跟着对应结果一起回来" "$(echo "$EXA_FOUND" | jq -r '.results[0].imageUrl')" "https://example.com/exa-cover.jpg"
+check "Exa 的图片都能归属到结果上" "$(echo "$EXA_FOUND" | jq -r '.images | length')" "0"
+
+check "mock 图床可按主机名访问" "$(curl -s -o /dev/null -w '%{http_code}' "$IMG_ORIGIN/img/ok.png")" "200"
+agent_message "$SEARCH_SESSION" "img-m1" "帮我导入图片"
+IMPORT_OK=$(last_tool_result "$SEARCH_SESSION" "import_image")
+check "导入网上的图片成功" "$(echo "$IMPORT_OK" | jq -r '.ok')" "true"
+IMPORT_KEY=$(echo "$IMPORT_OK" | jq -r '.data.storageKey')
+IMPORT_ID="${IMPORT_KEY#server:}"
+check "导入后拿到 server: 形式的 storageKey" "$(echo "$IMPORT_KEY" | grep -c '^server:')" "1"
+check "落库类型按字节判断" "$(echo "$IMPORT_OK" | jq -r '.data.mimeType')" "image/png"
+check "导入的文件进了这个用户的云空间" "$(curl -s "$BASE/v1/files/$IMPORT_ID" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.id)" "$IMPORT_ID"
+check "导入的图片可按直链读回" "$(curl -s -o /dev/null -w '%{content_type}' "$BASE/files/$IMPORT_ID/content")" "image/png"
+# 拿到的 storageKey 要能直接喂给 create_node，否则「搜到图 → 插进画布」还是断的。
+agent_message "$SEARCH_SESSION" "img-m2" "用这张图建节点 $IMPORT_KEY"
+check "导入的 storageKey 能直接建成画布图片节点" "$(curl -s "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.data.nodes[] | select(.metadata.storageKey=="'"$IMPORT_KEY"'")] | length')" "1"
+
+# 本来就支持的格式原样落库，不做任何转码：字节数和源文件一模一样才算没被重新编码。
+agent_message "$SEARCH_SESSION" "img-m3" "帮我导入 webp 图片"
+IMPORT_WEBP=$(last_tool_result "$SEARCH_SESSION" "import_image" | jq -r '.data')
+check "webp 原样导入不被转码" "$(echo "$IMPORT_WEBP" | jq -r '.mimeType')" "image/webp"
+check "webp 字节数与源文件一致" "$(echo "$IMPORT_WEBP" | jq -r '.bytes')" "36"
+check "webp 的宽高也解析出来了" "$(echo "$IMPORT_WEBP" | jq -r '"\(.width)x\(.height)"')" "6x3"
+
+# 下面四条都是必须挡住的输入。挡住之后云空间用量不能有任何变化，否则等于被写进去了。
+BAD_USED=$(curl -s "$BASE/v1/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)
+agent_message "$SEARCH_SESSION" "img-m4" "帮我导入内网图片"
+check "导入图片同样拒绝内网地址" "$(last_tool_result "$SEARCH_SESSION" "import_image" | jq -r '.error')" "不能读取本机或内网地址"
+agent_message "$SEARCH_SESSION" "img-m5" "帮我导入超大图片"
+check "超过上限的图片被中断下载" "$(last_tool_result "$SEARCH_SESSION" "import_image" | jq -r '.error')" "图片超过 10MB，已中止下载，请换一张小一点的图"
+agent_message "$SEARCH_SESSION" "img-m6" "帮我导入伪装图片"
+check "伪装成 png 的 HTML 被字节校验挡住" "$(last_tool_result "$SEARCH_SESSION" "import_image" | jq -r '.error')" "这个地址的内容不是图片"
+agent_message "$SEARCH_SESSION" "img-m7" "帮我导入网页地址"
+check "响应头就不是图片时直接拒绝" "$(last_tool_result "$SEARCH_SESSION" "import_image" | jq -r '.error')" "这个地址返回的不是图片：text/html"
+agent_message "$SEARCH_SESSION" "img-m8" "帮我导入 avif 图片"
+check "画布与上游都吃不下的格式被拒绝" "$(last_tool_result "$SEARCH_SESSION" "import_image" | jq -r '.error')" "暂不支持 avif 格式的图片，请换一张 png、jpeg 或 webp 的图片地址"
+check "被拒绝的内容一个字节都没落库" "$(curl -s "$BASE/v1/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)" "$BAD_USED"
+
+# 导入占的是用户自己的云空间，配额压满后必须明确报错，不能悄悄存进去。
+curl -s -X POST "$BASE/admin/users/$USER_ID/quota" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d "{\"quota\":$BAD_USED}" >/dev/null
+agent_message "$SEARCH_SESSION" "img-m9" "帮我导入另一张图片"
+check "云空间不足时导入明确报错" "$(last_tool_result "$SEARCH_SESSION" "import_image" | jq -r '.error' | grep -c '云空间不足')" "1"
+check "配额不足时也没写进云空间" "$(curl -s "$BASE/v1/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)" "$BAD_USED"
+curl -s -X POST "$BASE/admin/users/$USER_ID/quota" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"quota":104857600}' >/dev/null
 
 # 留空表示保持不变，别把已配好的密钥洗掉。
 agent_settings "$SEARCH_EXA_KEEP" '""'

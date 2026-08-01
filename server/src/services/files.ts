@@ -52,6 +52,19 @@ function readImageMeta(body: Buffer, mimeType: string): FileMeta {
 }
 
 /**
+ * 按字节魔数认出图片格式，返回 image-size 的格式名（png / jpg / webp / gif / avif ...），认不出来返回空串。
+ * 从外部地址下载的内容只能这样判断：URL 扩展名和响应头都是对方随便写的，
+ * 一个改名成 .png 的 HTML 或可执行文件必须在落库之前就被认出来。
+ */
+export function imageTypeOf(body: Buffer) {
+    try {
+        return imageSize(body).type || "";
+    } catch {
+        return "";
+    }
+}
+
+/**
  * 写入文件对象。相同内容（同 owner + 同 sha256）直接复用已有记录，
  * 避免同一张参考图反复上传占用存储；命中复用时不产生新增占用，因此不校验配额。
  */

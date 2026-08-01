@@ -1,10 +1,10 @@
 import { config } from "../config";
 import type { Job, JobKind, StoredFile } from "../db/entities";
 import { fail, newId } from "../lib/errors";
-import { listFiles, publicFileUrl } from "./files";
+import { imageTypeOf, listFiles, publicFileUrl, saveFile } from "./files";
 import type { GenerationParams } from "./generation";
 import { createJob, getJob, toJobView } from "./jobs";
-import { webFetch, webSearch } from "./search";
+import { safeWebUrl, webFetch, webSearch } from "./search";
 import { publicSettings } from "./settings";
 import { readProjectCanvas, renameProjectCanvas, updateProjectCanvas, type CanvasNodeData, type CanvasProjectData } from "./sync";
 
@@ -42,6 +42,23 @@ const MAX_BATCH_NODES = 50;
  * 再往上就该换更具体的来源，而不是继续放宽——每读一篇，后面每一轮都要把它重新算一遍 token。
  */
 const MAX_PAGE_CHARS = 8000;
+
+/**
+ * 从网址导入图片的大小上限。
+ * 定成 10MB 是因为：默认云空间配额只有 100MB，模型挑的一张配图占掉一成已经是上限了；
+ * 而搜索结果里的网页配图通常只有几百 KB，10MB 足够覆盖到高清原图。
+ * 用户自己上传的图仍然按 files.ts 的 30MB 走——那是用户自己决定要存什么，模型不是。
+ */
+const MAX_IMPORT_BYTES = 10 << 20;
+/** 外部地址可能一直不响应，超时了就得放手，不能让 agent 的这一轮卡死在下载上。 */
+const IMPORT_TIMEOUT_MS = 20000;
+/**
+ * 允许导入的图片格式，是「浏览器能显示 ∩ OpenAI 能收 ∩ Gemini 能收」的交集。
+ * 导进来的图既要在画布上用 <img> 显示，又要能当参考图发给上游模型，少满足一头就会在另一头炸；
+ * 服务端没有图像处理库，不做转码，认不出或不在交集里的格式直接报错让模型换一张。
+ * 键是 image-size 认出来的格式名，值是真正落库的 mime——一律以字节为准，不采信响应头。
+ */
+const IMPORT_IMAGE_MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg", webp: "image/webp" };
 
 /** 画布里的图片引用统一是 server:<fileId>，工具参数也用同一套写法，模型不用去猜内部 ID。 */
 const STORAGE_PREFIX = "server:";
@@ -187,7 +204,10 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
     if (access.search) {
         tools.push({
             name: "web_search",
-            description: "联网搜索获取实时资料。需要最新信息或不确定的事实时使用。返回的是每条结果的摘要，只够判断相关性；摘要里没有的细节要用 read_webpage 读原文。",
+            description:
+                "联网搜索获取实时资料。需要最新信息或不确定的事实时使用。返回的是每条结果的摘要，只够判断相关性；摘要里没有的细节要用 read_webpage 读原文。" +
+                "结果里的 imageUrl 是该条结果自带的配图，顶层 images 是本次搜索搜到、但说不清属于哪条结果的图；" +
+                "要把图用到画布上，先用 import_image 把图片地址导入成服务端文件，不能直接把网址填进节点。",
             parameters: { type: "object", properties: { query: string("搜索关键词"), limit: number("返回条数上限") }, required: ["query"] },
         });
         tools.push({
@@ -198,6 +218,15 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
                 "一次只读一个网址，读回来的正文会占掉大量上下文，不要把搜到的结果逐条读一遍。" +
                 "正文过长会被截断，返回里的 truncated 为 true 时说明只看到了开头部分。",
             parameters: { type: "object", properties: { url: string("要读取的网页网址，必须是完整的 http/https 地址") }, required: ["url"] },
+        });
+        tools.push({
+            name: "import_image",
+            description:
+                "把一个公网图片地址下载成服务端文件，返回可以直接用的 storageKey。" +
+                "标准用法是 web_search 拿到 imageUrl 或 images 里的图片地址 → 用这个工具导入 → 把返回的 storageKey 交给 create_node 建图片节点，或放进 generate_image 的 referenceStorageKeys 当参考图。" +
+                "一次只导一张，会占用户的云空间，所以只导真正要用的那张；" +
+                `只接受 png、jpeg、webp 三种格式且不超过 ${MAX_IMPORT_BYTES >> 20}MB，报错说格式不支持时换搜索结果里的另一个图片地址重试。`,
+            parameters: { type: "object", properties: { url: string("图片的完整 http/https 地址，通常来自 web_search 结果里的 imageUrl 或 images") }, required: ["url"] },
         });
     }
     return tools;
@@ -448,6 +477,69 @@ async function viewImage(ctx: ToolContext, args: Record<string, unknown>) {
     return { storageKey: storageKeyOf(file.id), mimeType: file.mimeType, width: file.width, height: file.height, note: "图片已加入对话上下文，可以直接描述或据此继续操作" };
 }
 
+/** 边收边数，超上限立刻掐断连接：等整份下完再判断，内存和带宽已经先被吃掉了。 */
+async function readCapped(body: ReadableStream<Uint8Array>, limit: number, message: string) {
+    const reader = body.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > limit) {
+            await reader.cancel();
+            throw fail(message);
+        }
+        chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks);
+}
+
+/**
+ * 把公网图片地址导入成服务端文件。这是「搜到图 → 用上图」中间缺的那一步：
+ * 画布节点和生成任务只认 server:<fileId>，外部网址得先变成用户自己的文件才能用。
+ * 只返回 storageKey、不顺手建节点，是因为导进来的图有一半是要当 generate_image 的参考图的，
+ * 那种情况下画布上并不需要多出一个图片节点；真要建节点，create_node 已经把标题、坐标、入组这些参数都表达好了，
+ * 在这里再写一份只会变成两处维护。
+ */
+async function importImage(ctx: ToolContext, args: Record<string, unknown>) {
+    if (!ctx.access.search) throw fail("未配置联网搜索");
+    // 地址是模型给的，和 read_webpage 过同一套内网拦截。这条路径比读正文更要紧：读正文只是把文字塞进上下文，
+    // 这里会把响应体当成用户的文件存下来，内网探测的结果会直接落进画布。
+    const url = safeWebUrl(text(args, "url"));
+    const response = await fetch(url, {
+        // 明确告诉对方我们只要这几种格式：会做内容协商的 CDN 会直接回 png/jpeg/webp，
+        // 省掉一次「拿回 avif 再报错、让模型换一张」的往返。
+        headers: { Accept: "image/png,image/jpeg,image/webp,image/*;q=0.8" },
+        // 超时和用户中止合成一个信号：外部地址不响应要能自己放手，用户点中止也要立刻停。
+        signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(IMPORT_TIMEOUT_MS)]),
+    }).catch(() => {
+        throw fail("图片下载失败：地址无响应或已超时");
+    });
+    if (!response.ok) throw fail(`图片下载失败：HTTP ${response.status}`);
+    if (!response.body) throw fail("图片下载失败：这个地址没有返回内容");
+    const declared = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    if (!declared.startsWith("image/")) throw fail(`这个地址返回的不是图片：${declared || "未知类型"}`);
+
+    const body = await readCapped(response.body, MAX_IMPORT_BYTES, `图片超过 ${MAX_IMPORT_BYTES >> 20}MB，已中止下载，请换一张小一点的图`);
+    // 响应头说是图片不算数，最终以字节魔数为准，落库的 mime 也用认出来的那个。
+    const type = imageTypeOf(body);
+    if (!type) throw fail("这个地址的内容不是图片");
+    const mimeType = IMPORT_IMAGE_MIME[type];
+    if (!mimeType) throw fail(`暂不支持 ${type} 格式的图片，请换一张 png、jpeg 或 webp 的图片地址`);
+
+    // 走和用户上传同一条 saveFile：同样占云空间配额、同样按内容去重，配额不够时由它抛中文错误。
+    const file = await saveFile(ctx.userId, body, mimeType);
+    return {
+        storageKey: storageKeyOf(file.id),
+        mimeType: file.mimeType,
+        width: file.width,
+        height: file.height,
+        bytes: Number(file.bytes),
+        note: "图片已存进这个用户的云空间，可以把 storageKey 交给 create_node 建图片节点，或放进 generate_image 的 referenceStorageKeys 当参考图",
+    };
+}
+
 export async function runAgentTool(ctx: ToolContext, name: string, args: Record<string, unknown>): Promise<unknown> {
     if (name === "read_canvas") {
         const project = await readProjectCanvas(ctx.userId, ctx.projectId);
@@ -594,9 +686,11 @@ export async function runAgentTool(ctx: ToolContext, name: string, args: Record<
 
     if (name === "web_search") {
         if (!ctx.access.search) throw fail("未配置联网搜索");
-        const results = await webSearch(text(args, "query"), num(args, "limit") || 0, ctx.signal);
-        return { count: results.length, results };
+        const { results, images } = await webSearch(text(args, "query"), num(args, "limit") || 0, ctx.signal);
+        return { count: results.length, results, images };
     }
+
+    if (name === "import_image") return importImage(ctx, args);
 
     if (name === "read_webpage") {
         if (!ctx.access.search) throw fail("未配置联网搜索");
