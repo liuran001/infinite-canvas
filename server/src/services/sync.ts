@@ -1,11 +1,13 @@
 import { MoreThan } from "typeorm";
 
 import { repo } from "../db/data-source";
-import { Project, UserAsset } from "../db/entities";
+import { Project, UserAsset, UserPlugin } from "../db/entities";
 import { fail, now } from "../lib/errors";
+import { releaseFiles } from "./cleanup";
 
 export type ProjectInput = { id: string; title: string; data: unknown; revision?: number };
 export type UserAssetInput = { id: string; kind: string; title: string; data: unknown; revision?: number };
+export type UserPluginInput = { id: string; data: unknown; revision?: number };
 
 const MAX_SYNC_ITEMS = 500;
 
@@ -64,12 +66,13 @@ export async function saveProject(userId: string, input: ProjectInput) {
     return toProjectView(row);
 }
 
-/** 软删除，让其他设备也能同步到删除动作。 */
+/** 软删除，让其他设备也能同步到删除动作；引用的文件没人再用就真删，释放云空间。 */
 export async function deleteProject(userId: string, id: string) {
     const projects = repo(Project);
     const saved = await projects.findOneBy({ userId, projectId: id });
     if (!saved) return;
     await projects.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() });
+    await releaseFiles(userId, saved.data);
 }
 
 export async function listUserAssets(userId: string, since: string) {
@@ -106,4 +109,44 @@ export async function deleteUserAsset(userId: string, id: string) {
     const saved = await assets.findOneBy({ userId, assetId: id });
     if (!saved) return;
     await assets.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() });
+    await releaseFiles(userId, saved.data);
+}
+
+function toPluginView(row: UserPlugin) {
+    return { id: row.pluginId, data: parseData(row.data), revision: row.revision, deleted: row.deleted, createdAt: row.createdAt, updatedAt: row.updatedAt };
+}
+
+/** 已安装的画布节点插件，换设备登录后照样带着走。 */
+export async function listUserPlugins(userId: string, since: string) {
+    const rows = await repo(UserPlugin).find({
+        where: since ? { userId, updatedAt: MoreThan(since) } : { userId },
+        order: { updatedAt: "DESC" },
+        take: MAX_SYNC_ITEMS,
+    });
+    return rows.map(toPluginView);
+}
+
+export async function saveUserPlugin(userId: string, input: UserPluginInput) {
+    const id = input.id?.trim();
+    if (!id) throw fail("缺少插件 ID");
+    const plugins = repo(UserPlugin);
+    const saved = await plugins.findOneBy({ userId, pluginId: id });
+    if (saved && input.revision !== undefined && input.revision < saved.revision) throw fail("插件在其他设备上已更新，请先同步");
+    const row = await plugins.save({
+        pluginId: id,
+        userId,
+        data: JSON.stringify(input.data ?? {}),
+        revision: (saved?.revision || 0) + 1,
+        deleted: false,
+        createdAt: saved?.createdAt || now(),
+        updatedAt: now(),
+    } as UserPlugin);
+    return toPluginView(row);
+}
+
+export async function deleteUserPlugin(userId: string, id: string) {
+    const plugins = repo(UserPlugin);
+    const saved = await plugins.findOneBy({ userId, pluginId: id });
+    if (!saved) return;
+    await plugins.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() });
 }

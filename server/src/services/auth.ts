@@ -5,9 +5,10 @@ import { Like } from "typeorm";
 
 import { config, warnDefaultSecurityConfig } from "../config";
 import { repo } from "../db/data-source";
-import { CreditLog, User, type CreditLogType, type UserRole, type UserStatus } from "../db/entities";
+import { CreditLog, DEFAULT_STORAGE_QUOTA, User, type CreditLogType, type UserRole, type UserStatus } from "../db/entities";
 import { fail, firstNonEmpty, newAffCode, newId, now } from "../lib/errors";
 import type { Query } from "../lib/response";
+import { usedBytesOf } from "./quota";
 import { getSettings } from "./settings";
 
 export type AuthUser = {
@@ -50,6 +51,7 @@ function newUser(patch: Partial<User>): User {
         avatarUrl: "",
         role: "user",
         credits: 0,
+        storageQuota: DEFAULT_STORAGE_QUOTA,
         affCode: newAffCode(),
         affCount: 0,
         inviterId: "",
@@ -67,7 +69,7 @@ function signToken(user: User) {
     return jwt.sign({ userId: user.id, username: user.username, role: user.role }, config.jwtSecret, { expiresIn: `${config.jwtExpireHours}h`, subject: user.id });
 }
 
-async function newSession(user: User): Promise<AuthSession> {
+export async function newSession(user: User): Promise<AuthSession> {
     return { token: signToken(user), user: publicUser(user) };
 }
 
@@ -118,7 +120,8 @@ export async function listUsers(query: Query) {
     const like = query.keyword ? Like(`%${query.keyword}%`) : undefined;
     const where = like ? [{ username: like }, { displayName: like }, { email: like }, { linuxDoId: like }] : {};
     const [items, total] = await repo(User).findAndCount({ where, order: { createdAt: "DESC" }, skip: query.offset, take: query.pageSize });
-    return { items: items.map((user) => ({ ...user, password: "" })), total };
+    const used = await usedBytesOf(items.map((user) => user.id));
+    return { items: items.map((user) => ({ ...user, password: "", storageQuota: Number(user.storageQuota), storageUsed: used.get(user.id) || 0 })), total };
 }
 
 export async function saveUser(input: Partial<User>, password: string) {
@@ -141,6 +144,31 @@ export async function saveUser(input: Partial<User>, password: string) {
 
 export async function deleteUser(id: string) {
     await repo(User).delete({ id });
+}
+
+/** 修改密码。第三方登录创建的账号本来就没有密码，这种情况允许直接设置。 */
+export async function changePassword(userId: string, oldPassword: string, newPassword: string) {
+    const users = repo(User);
+    const user = await users.findOneBy({ id: userId });
+    if (!user) throw fail("用户不存在");
+    if (user.password && !(await bcrypt.compare(oldPassword || "", user.password))) throw fail("原密码不正确");
+    if ((newPassword || "").length < 6) throw fail("新密码至少 6 位");
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.updatedAt = now();
+    await users.save(user);
+}
+
+/** 解绑第三方登录。没有密码时解绑会导致再也登不进来，必须先设密码。 */
+export async function unbindLinuxDo(userId: string) {
+    const users = repo(User);
+    const user = await users.findOneBy({ id: userId });
+    if (!user) throw fail("用户不存在");
+    if (!user.linuxDoId) throw fail("当前账号未绑定 Linux.do");
+    if (!user.password) throw fail("请先设置登录密码，否则解绑后将无法登录");
+    user.linuxDoId = "";
+    user.updatedAt = now();
+    await users.save(user);
+    return publicUser(user);
 }
 
 async function writeCreditLog(userId: string, type: CreditLogType, amount: number, balance: number, remark: string, extra?: unknown) {
@@ -167,6 +195,16 @@ export async function adjustUserCredits(id: string, credits: number) {
     const saved = await users.save(user);
     if (previous !== credits) await writeCreditLog(id, "admin_adjust", credits - previous, credits, "后台手动调整");
     return { ...saved, password: "" };
+}
+
+/** 调整云空间配额。已用量按文件对象实时聚合，这里只改上限。 */
+export async function adjustUserQuota(id: string, quota: number) {
+    const users = repo(User);
+    const user = await users.findOneBy({ id });
+    if (!user) throw fail("用户不存在");
+    user.storageQuota = Math.max(0, Math.floor(quota));
+    user.updatedAt = now();
+    return { ...(await users.save(user)), password: "" };
 }
 
 /** 扣点走带条件的原子更新，余额不足时不会扣成负数。 */
@@ -234,7 +272,11 @@ function linuxDoRedirectUri(req: Request) {
     return `${requestOrigin(req)}/api/auth/linux-do/callback`;
 }
 
-export async function linuxDoAuthorizeUrl(req: Request, redirect: string) {
+/**
+ * 发起 Linux.do 授权。传 bindUserId 表示这是「给已登录账号绑定」而不是登录。
+ * state 用 JWT 签名：OAuth 回调是无鉴权的浏览器跳转，只有签名过的 state 才能安全携带用户身份。
+ */
+export async function linuxDoAuthorizeUrl(req: Request, redirect: string, bindUserId = "") {
     const settings = await getSettings();
     if (!settings.public.auth.linuxDo.enabled) throw fail("Linux.do 登录未开启");
     const { clientId, clientSecret } = settings.private.auth.linuxDo;
@@ -244,7 +286,7 @@ export async function linuxDoAuthorizeUrl(req: Request, redirect: string) {
         redirect_uri: linuxDoRedirectUri(req),
         response_type: "code",
         scope: "read",
-        state: Buffer.from(redirect || "/").toString("base64url"),
+        state: jwt.sign({ redirect: safeRedirectPath(redirect || "/"), bindUserId }, config.jwtSecret, { expiresIn: "10m" }),
     });
     return `${config.linuxDo.authorizeUrl}?${params}`;
 }
@@ -266,7 +308,16 @@ async function linuxDoJson<T>(url: string, init: RequestInit): Promise<T> {
 }
 
 export async function loginWithLinuxDo(req: Request, code: string, state: string) {
-    const redirect = safeRedirectPath(Buffer.from(state || "", "base64url").toString("utf8") || "/");
+    let redirect = "/";
+    let bindUserId = "";
+    try {
+        const payload = jwt.verify(state, config.jwtSecret) as { redirect?: string; bindUserId?: string };
+        redirect = safeRedirectPath(payload.redirect || "/");
+        bindUserId = payload.bindUserId || "";
+    } catch {
+        throw Object.assign(fail("授权状态已失效，请重新发起"), { redirect });
+    }
+
     const settings = await getSettings();
     if (!settings.public.auth.linuxDo.enabled) throw Object.assign(fail("Linux.do 登录未开启"), { redirect });
     const { clientId, clientSecret } = settings.private.auth.linuxDo;
@@ -281,7 +332,23 @@ export async function loginWithLinuxDo(req: Request, code: string, state: string
     if (!linuxDoId || linuxDoId === "0") throw Object.assign(fail("Linux.do 用户信息无效"), { redirect });
 
     const users = repo(User);
-    let user = await users.findOneBy({ linuxDoId });
+    const bound = await users.findOneBy({ linuxDoId });
+
+    // 绑定流程：把 Linux.do 账号挂到已登录的用户上，不换发登录态。
+    if (bindUserId) {
+        if (bound && bound.id !== bindUserId) throw Object.assign(fail("该 Linux.do 账号已绑定其他用户"), { redirect });
+        const user = await users.findOneBy({ id: bindUserId });
+        if (!user) throw Object.assign(fail("用户不存在"), { redirect });
+        user.linuxDoId = linuxDoId;
+        user.displayName = firstNonEmpty(user.displayName, profile.name);
+        user.avatarUrl = firstNonEmpty(user.avatarUrl, linuxDoAvatar(profile.avatar_template || ""));
+        user.updatedAt = now();
+        user.extra = JSON.stringify({ linuxDo: profile });
+        await users.save(user);
+        return { session: null, redirect, bound: true };
+    }
+
+    let user = bound;
     if (!user) {
         if (!settings.public.auth.allowRegister) throw Object.assign(fail("当前未开放注册"), { redirect });
         const base = (profile.username || "").trim() || `linuxdo-${linuxDoId}`;
@@ -295,5 +362,5 @@ export async function loginWithLinuxDo(req: Request, code: string, state: string
     user.lastLoginAt = now();
     user.updatedAt = now();
     user.extra = JSON.stringify({ linuxDo: profile });
-    return { session: await newSession(await users.save(user)), redirect };
+    return { session: await newSession(await users.save(user)), redirect, bound: false };
 }

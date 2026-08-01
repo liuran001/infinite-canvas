@@ -14,6 +14,9 @@ export type JobKind = "image" | "video" | "audio";
 export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
 export type FileStorage = "local" | "s3";
 
+/** 默认云空间配额 100MB，管理员可按用户单独调整。 */
+export const DEFAULT_STORAGE_QUOTA = 100 << 20;
+
 @Entity("users")
 export class User {
     @PrimaryColumn(id) id!: string;
@@ -24,12 +27,15 @@ export class User {
     @Column({ type: "text", nullable: true }) avatarUrl!: string;
     @Column({ type: "varchar", length: 32, default: "user" }) role!: UserRole;
     @Column({ type: "int", default: 0 }) credits!: number;
+    @Column({ type: "bigint", default: DEFAULT_STORAGE_QUOTA }) storageQuota!: number;
     @Column(short) affCode!: string;
     @Column({ type: "int", default: 0 }) affCount!: number;
     @Column(short) inviterId!: string;
     @Index() @Column(short) linuxDoId!: string;
     @Column({ type: "varchar", length: 32, default: "active" }) status!: UserStatus;
     @Column(short) lastLoginAt!: string;
+    /** 用户偏好 JSON（默认模型、生成参数、系统提示词等），跟着账号走，换设备保留。 */
+    @Column({ type: LONG_TEXT, nullable: true }) preferences!: string;
     @Column({ type: "text", nullable: true }) extra!: string;
     @Index() @Column(short) createdAt!: string;
     @Column(short) updatedAt!: string;
@@ -122,11 +128,14 @@ export class StoredFile {
     @Index() @Column(short) createdAt!: string;
 }
 
-/** 用户画布项目，revision 单调递增用于多设备增量同步。 */
+/**
+ * 用户画布项目，revision 单调递增用于多设备增量同步。
+ * 主键带上 userId：projectId 由客户端生成，不同用户之间不保证唯一。
+ */
 @Entity("projects")
 export class Project {
+    @PrimaryColumn(short) userId!: string;
     @PrimaryColumn(id) projectId!: string;
-    @Index() @Column(short) userId!: string;
     @Column(short) title!: string;
     @Column({ type: LONG_TEXT, nullable: true }) data!: string;
     @Column({ type: "int", default: 1 }) revision!: number;
@@ -138,8 +147,8 @@ export class Project {
 /** 用户自己的素材库，与管理后台的公共素材分开。 */
 @Entity("user_assets")
 export class UserAsset {
+    @PrimaryColumn(short) userId!: string;
     @PrimaryColumn(id) assetId!: string;
-    @Index() @Column(short) userId!: string;
     @Column({ type: "varchar", length: 32, default: "image" }) kind!: string;
     @Column(short) title!: string;
     @Column({ type: LONG_TEXT, nullable: true }) data!: string;
@@ -147,6 +156,35 @@ export class UserAsset {
     @Column({ type: "boolean", default: false }) deleted!: boolean;
     @Column(short) createdAt!: string;
     @Index() @Column(short) updatedAt!: string;
+}
+
+/**
+ * 用户安装的画布节点插件，换设备后可以带着走。
+ * pluginId 由插件作者定义，不同用户装同一个插件必然重名，所以必须复合主键。
+ */
+@Entity("user_plugins")
+export class UserPlugin {
+    @PrimaryColumn(short) userId!: string;
+    @PrimaryColumn({ type: "varchar", length: 191 }) pluginId!: string;
+    @Column({ type: LONG_TEXT, nullable: true }) data!: string;
+    @Column({ type: "int", default: 1 }) revision!: number;
+    @Column({ type: "boolean", default: false }) deleted!: boolean;
+    @Column(short) createdAt!: string;
+    @Index() @Column(short) updatedAt!: string;
+}
+
+/** 用户注册的 Passkey 凭证。公钥按 base64 存，校验时还原成字节。 */
+@Entity("passkeys")
+export class Passkey {
+    @PrimaryColumn(id) id!: string;
+    @Index({ unique: true }) @Column({ type: "varchar", length: 255 }) credentialId!: string;
+    @Index() @Column(short) userId!: string;
+    @Column({ type: "text", nullable: true }) publicKey!: string;
+    @Column({ type: "int", default: 0 }) counter!: number;
+    @Column({ type: "simple-json", nullable: true }) transports!: string[];
+    /** 用户可编辑的名称，方便区分多个设备上的 Passkey。 */
+    @Column(short) name!: string;
+    @Column(short) createdAt!: string;
 }
 
 /**
@@ -178,4 +216,4 @@ export class Job {
     @Column(short) finishedAt!: string;
 }
 
-export const entities = [User, CreditLog, Setting, Prompt, PromptCategory, Asset, StoredFile, Project, UserAsset, Job];
+export const entities = [User, CreditLog, Setting, Prompt, PromptCategory, Asset, StoredFile, Project, UserAsset, UserPlugin, Passkey, Job];

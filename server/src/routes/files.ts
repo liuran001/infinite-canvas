@@ -6,11 +6,19 @@ import { fail } from "../lib/errors";
 import { handle, ok } from "../lib/response";
 import { requireUser, userAuth } from "../middleware/auth";
 import { deleteFile, getFile, saveFile } from "../services/files";
+import { storageOf } from "../services/quota";
 import { getObject } from "../services/storage";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 << 20 } });
 
 export const fileRouter = Router();
+
+/** 当前用户的云空间用量，已用量按文件对象实时聚合。 */
+fileRouter.get(
+    "/v1/storage",
+    userAuth,
+    handle(async (req, res) => ok(res, await storageOf(requireUser(req).id))),
+);
 
 /**
  * 上传素材。宽高由服务端解析，视频/音频时长交由前端回传，

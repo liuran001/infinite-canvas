@@ -2,7 +2,7 @@ import { Router } from "express";
 
 import { handle, ok } from "../lib/response";
 import { requireUser, userAuth } from "../middleware/auth";
-import { deleteProject, deleteUserAsset, getProject, listProjects, listUserAssets, saveProject, saveUserAsset } from "../services/sync";
+import { deleteProject, deleteUserAsset, deleteUserPlugin, getProject, listProjects, listUserAssets, listUserPlugins, saveProject, saveUserAsset, saveUserPlugin } from "../services/sync";
 
 export const syncRouter = Router();
 syncRouter.use(userAuth);
@@ -42,6 +42,24 @@ syncRouter.delete(
     "/v1/user-assets/:id",
     handle(async (req, res) => {
         await deleteUserAsset(requireUser(req).id, String(req.params.id));
+        ok(res, true);
+    }),
+);
+
+syncRouter.get("/v1/user-plugins", handle(async (req, res) => ok(res, { items: await listUserPlugins(requireUser(req).id, String(req.query.since || "")) })));
+
+syncRouter.put(
+    "/v1/user-plugins/:id",
+    handle(async (req, res) => {
+        const body = req.body || {};
+        ok(res, await saveUserPlugin(requireUser(req).id, { id: String(req.params.id), data: body.data, revision: body.revision }));
+    }),
+);
+
+syncRouter.delete(
+    "/v1/user-plugins/:id",
+    handle(async (req, res) => {
+        await deleteUserPlugin(requireUser(req).id, String(req.params.id));
         ok(res, true);
     }),
 );

@@ -5,10 +5,13 @@ import express from "express";
 import { config } from "./config";
 import { errorJson, notFoundJson, ok } from "./lib/response";
 import { adminRouter } from "./routes/admin";
+import { adminReviewRouter } from "./routes/admin-review";
 import { aiRouter } from "./routes/ai";
 import { adminUserRouter, authRouter } from "./routes/auth";
 import { fileRouter } from "./routes/files";
 import { jobRouter } from "./routes/jobs";
+import { passkeyRouter } from "./routes/passkey";
+import { preferenceRouter } from "./routes/preferences";
 import { publicRouter } from "./routes/public";
 import { syncRouter } from "./routes/sync";
 
@@ -30,6 +33,8 @@ export function createApp() {
     const api = express.Router();
     api.get("/health", (_req, res) => ok(res, "ok"));
     api.use(authRouter);
+    api.use(passkeyRouter);
+    api.use(preferenceRouter);
     api.use(publicRouter);
     api.use(fileRouter);
     api.use(jobRouter);
@@ -37,6 +42,7 @@ export function createApp() {
     api.use(aiRouter);
     api.use("/admin", adminUserRouter);
     api.use("/admin", adminRouter);
+    api.use("/admin", adminReviewRouter);
 
     app.use("/api", api);
     app.use("/api", notFoundJson);

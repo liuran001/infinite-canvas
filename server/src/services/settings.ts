@@ -6,7 +6,18 @@ import { fail, now } from "../lib/errors";
 export type ApiFormat = "openai" | "gemini" | "ark";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 
-export type ChannelModel = { name: string; capability: ModelCapability };
+export type ChannelModel = {
+    name: string;
+    /** 前端展示名，留空时用 name。用来把 gemini-3.1-flash-image 这类内部名展示成 Nano Banana 2。 */
+    label?: string;
+    capability: ModelCapability;
+};
+
+/**
+ * 模型算力点成本。qualityCredits 按画质档位在基础价上叠加，
+ * 用于 2K / 4K 这类同一模型但成本不同的情况，例如 { medium: 2, high: 5 }。
+ */
+export type ModelCost = { model: string; credits: number; qualityCredits?: Record<string, number> };
 
 export type ModelChannel = {
     apiFormat: ApiFormat;
@@ -19,10 +30,9 @@ export type ModelChannel = {
     remark: string;
 };
 
-export type ModelCost = { model: string; credits: number };
 
 /** 前端在服务器模式下靠 apiFormat 决定文本请求走哪条代理，靠 capability 过滤模型选择器。 */
-export type PublicModel = { name: string; apiFormat: ApiFormat; capability: ModelCapability };
+export type PublicModel = { name: string; label: string; apiFormat: ApiFormat; capability: ModelCapability };
 
 export type PublicSetting = {
     modelChannel: {
@@ -38,6 +48,8 @@ export type PublicSetting = {
     };
     auth: { allowRegister: boolean; linuxDo: { enabled: boolean } };
     storage: { remoteEnabled: boolean };
+    /** 各类功能入口的总开关。配了模型也可以先不对外开放，关掉后所有用户都看不到对应入口。 */
+    capabilities: Record<ModelCapability, boolean>;
 };
 
 export type PrivateSetting = {
@@ -76,7 +88,8 @@ function normalizeChannelModels(models: Array<string | Partial<ChannelModel>> | 
         if (!name || seen.has(name)) continue;
         seen.add(name);
         const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
-        result.push({ name, capability });
+        const label = typeof item === "string" ? "" : (item.label || "").trim();
+        result.push({ name, capability, ...(label ? { label } : {}) });
     }
     return result;
 }
@@ -117,13 +130,19 @@ function normalizePublic(setting: Partial<PublicSetting> | undefined, channels: 
         for (const model of item.models) {
             if (seen.has(model.name)) continue;
             seen.add(model.name);
-            models.push({ name: model.name, apiFormat: item.apiFormat, capability: model.capability });
+            models.push({ name: model.name, label: model.label || model.name, apiFormat: item.apiFormat, capability: model.capability });
         }
     }
     return {
         modelChannel: {
             models,
-            modelCosts: (channel?.modelCosts || []).map((cost) => ({ model: String(cost.model || "").trim(), credits: Math.max(0, Number(cost.credits) || 0) })).filter((cost) => cost.model),
+            modelCosts: (channel?.modelCosts || [])
+                .map((cost) => ({
+                    model: String(cost.model || "").trim(),
+                    credits: Math.max(0, Number(cost.credits) || 0),
+                    qualityCredits: Object.fromEntries(Object.entries(cost.qualityCredits || {}).map(([quality, value]) => [quality, Math.max(0, Number(value) || 0)])),
+                }))
+                .filter((cost) => cost.model),
             defaultModel: repairDefaultModel(channel?.defaultModel || "", models, "text"),
             defaultImageModel: repairDefaultModel(channel?.defaultImageModel || "", models, "image"),
             defaultVideoModel: repairDefaultModel(channel?.defaultVideoModel || "", models, "video"),
@@ -137,6 +156,12 @@ function normalizePublic(setting: Partial<PublicSetting> | undefined, channels: 
             linuxDo: { enabled: Boolean(setting?.auth?.linuxDo?.enabled) },
         },
         storage: { remoteEnabled: setting?.storage?.remoteEnabled !== false },
+        capabilities: {
+            image: setting?.capabilities?.image !== false,
+            text: setting?.capabilities?.text !== false,
+            video: setting?.capabilities?.video !== false,
+            audio: setting?.capabilities?.audio !== false,
+        },
     };
 }
 
@@ -205,9 +230,15 @@ export async function saveSettings(input: Partial<Settings>) {
     return hideSecrets(merged);
 }
 
-export async function modelCost(model: string) {
+/**
+ * 单次调用的算力点成本。quality 命中 qualityCredits 时在基础价上叠加，
+ * 用来给 2K / 4K 这种同模型不同成本的档位单独定价。
+ */
+export async function modelCost(model: string, quality?: string) {
     const settings = await publicSettings();
-    return settings.modelChannel.modelCosts.find((cost) => cost.model === model.trim())?.credits || 0;
+    const cost = settings.modelChannel.modelCosts.find((item) => item.model === model.trim());
+    if (!cost) return 0;
+    return cost.credits + (quality ? cost.qualityCredits?.[quality.trim()] || 0 : 0);
 }
 
 /** 按权重随机挑一个支持该模型的可用渠道。 */

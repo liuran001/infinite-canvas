@@ -12,6 +12,7 @@
     "dependencies": {
         "@aws-sdk/client-s3": "^3.699.0",
         "@aws-sdk/s3-request-presigner": "^3.699.0",
+        "@simplewebauthn/server": "^13.3.2",
         "bcryptjs": "^2.4.3",
         "better-sqlite3": "^11.7.0",
         "dotenv": "^16.4.7",

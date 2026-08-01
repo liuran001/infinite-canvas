@@ -5,6 +5,7 @@ import mime from "mime-types";
 import { repo } from "../db/data-source";
 import { StoredFile } from "../db/entities";
 import { fail, newId, now } from "../lib/errors";
+import { assertQuota } from "./quota";
 import { deleteObject, putObject, useS3 } from "./storage";
 
 const IMAGE_MAX_BYTES = 30 << 20;
@@ -52,7 +53,7 @@ function readImageMeta(body: Buffer, mimeType: string): FileMeta {
 
 /**
  * 写入文件对象。相同内容（同 owner + 同 sha256）直接复用已有记录，
- * 避免同一张参考图反复上传占用存储。
+ * 避免同一张参考图反复上传占用存储；命中复用时不产生新增占用，因此不校验配额。
  */
 export async function saveFile(userId: string, body: Buffer, mimeType: string, meta: FileMeta = {}) {
     const type = (mimeType || "application/octet-stream").split(";")[0].trim().toLowerCase() || "application/octet-stream";
@@ -64,6 +65,7 @@ export async function saveFile(userId: string, body: Buffer, mimeType: string, m
     const checksum = createHash("sha256").update(body).digest("hex");
     const existing = await files.findOneBy({ userId, checksum });
     if (existing) return existing;
+    await assertQuota(userId, body.length);
 
     const id = newId("file");
     const key = objectKey(id, type);

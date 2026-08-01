@@ -203,7 +203,7 @@ async function runJob(job: Job) {
     const controller = new AbortController();
     runningJobs.set(job.id, controller);
     const params = JSON.parse(job.params || "{}") as GenerationParams;
-    const credits = (await modelCost(job.model)) * Math.max(1, params.count || 1);
+    const credits = (await modelCost(job.model, params.quality)) * Math.max(1, params.count || 1);
     try {
         await patchJob(job, { status: "running", progress: 10 });
         // 扣点在实际调用上游之前，失败路径统一返还，避免任务重试重复扣费。
