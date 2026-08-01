@@ -20,6 +20,8 @@ export type AuthUser = {
     credits: number;
     createdAt: string;
     updatedAt: string;
+    /** 是否已绑定 Linux.do。只回布尔，账号设置据此决定给「绑定」还是「解绑」，不外泄第三方 ID。 */
+    linuxDoBound: boolean;
 };
 
 export type AuthSession = { token: string; user: AuthUser };
@@ -34,11 +36,12 @@ export function publicUser(user: User): AuthUser {
         credits: user.credits,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
+        linuxDoBound: Boolean(user.linuxDoId),
     };
 }
 
 export function guestUser(): AuthUser {
-    return { id: "", username: "guest", displayName: "", avatarUrl: "", role: "guest", credits: 0, createdAt: "", updatedAt: "" };
+    return { id: "", username: "guest", displayName: "", avatarUrl: "", role: "guest", credits: 0, createdAt: "", updatedAt: "", linuxDoBound: false };
 }
 
 function newUser(patch: Partial<User>): User {

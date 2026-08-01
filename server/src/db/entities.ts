@@ -10,7 +10,7 @@ const short = { type: "varchar", length: 255, default: "" } as const;
 export type UserRole = "guest" | "user" | "admin";
 export type UserStatus = "active" | "ban";
 export type CreditLogType = "admin_adjust" | "ai_consume" | "ai_refund";
-export type JobKind = "image" | "video" | "audio";
+export type JobKind = "image" | "video" | "audio" | "text";
 export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
 export type FileStorage = "local" | "s3";
 export type AgentSessionStatus = "idle" | "running" | "failed";
@@ -207,6 +207,11 @@ export class Job {
     @Column({ type: LONG_TEXT, nullable: true }) params!: string;
     @Column({ type: "simple-json", nullable: true }) inputFileIds!: string[];
     @Column({ type: "simple-json", nullable: true }) outputFileIds!: string[];
+    /**
+     * 文本任务的产出。上游是流式返回的，收的过程中就要按节奏落库：
+     * 只在结束时写一次的话，中途断开或进程被杀就什么都留不下，用户既拿不到内容又已经扣了算力点。
+     */
+    @Column({ type: LONG_TEXT, nullable: true }) text!: string;
     /** 客户端自定义的任务归属信息（发起页面、画布与节点 ID），换设备后据此把任务定位回界面。 */
     @Column({ type: "simple-json", nullable: true }) context!: Record<string, unknown>;
     @Column({ type: "text", nullable: true }) error!: string;

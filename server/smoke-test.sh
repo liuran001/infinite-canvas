@@ -36,6 +36,8 @@ PORT="$PORT" \
     ADMIN_USERNAME=admin ADMIN_PASSWORD=smoke-test \
     JWT_SECRET=smoke-test-secret \
     STORAGE_DRIVER=sqlite DATABASE_DSN="$WORK/test.db" DATA_DIR="$WORK/data" \
+    LINUX_DO_TOKEN_URL="http://127.0.0.1:$UPSTREAM_PORT/oauth2/token" \
+    LINUX_DO_USERINFO_URL="http://127.0.0.1:$UPSTREAM_PORT/api/user" \
     npx tsx src/index.ts >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 
@@ -150,7 +152,26 @@ cat >"$WORK/upstream.js" <<'EOF'
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 // agent 的每轮回复慢一点，冒烟脚本才有机会在循环跑到一半时把 SSE 掐掉。
 const AGENT_DELAY_MS = 1200;
+// 文本流按片慢慢吐，冒烟脚本才有机会在生成中途读到半截内容、把连接掐掉再续上。
+const TEXT_CHUNKS = ["无限画布", "把生成任务", "放在服务端，", "刷新页面", "也不会丢，", "内容会接着写完。"];
+const TEXT_DELAY_MS = 800;
 let lastTools = [];
+
+function streamText(res, toEvent) {
+    res.setHeader("Content-Type", "text/event-stream");
+    let index = 0;
+    const push = () => {
+        // 上游任务被取消时连接已经断了，继续往里写会把 mock 进程搞崩。
+        if (res.destroyed || res.writableEnded) return;
+        if (index >= TEXT_CHUNKS.length) {
+            res.write("data: [DONE]\n\n");
+            return res.end();
+        }
+        res.write(`data: ${JSON.stringify(toEvent(TEXT_CHUNKS[index++]))}\n\n`);
+        setTimeout(push, TEXT_DELAY_MS);
+    };
+    setTimeout(push, TEXT_DELAY_MS);
+}
 
 function toolCall(messages) {
     const lastUser = [...messages].reverse().find((item) => item.role === "user");
@@ -166,6 +187,12 @@ require("http").createServer((req, res) => {
     req.on("end", () => {
         res.setHeader("Content-Type", "application/json");
         if (req.url === "/_tools") return res.end(JSON.stringify({ tools: lastTools }));
+        // 假的 Linux.do：换 token 与拉用户资料，用来验证关闭注册时第三方登录会被挡住。
+        if (req.url.startsWith("/oauth2/token")) return res.end(JSON.stringify({ access_token: "linuxdo-access-token" }));
+        if (req.url.startsWith("/api/user")) return res.end(JSON.stringify({ id: 424242, username: "smoke-linuxdo", name: "冒烟测试" }));
+        // 文本任务走流式的 /responses 与 Gemini 的 streamGenerateContent，请求体用不上。
+        if (req.url.includes("/responses")) return streamText(res, (text) => ({ type: "response.output_text.delta", delta: text }));
+        if (req.url.includes("streamGenerateContent")) return streamText(res, (text) => ({ candidates: [{ content: { parts: [{ text }] } }] }));
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 
         if (req.url.includes("/chat/completions")) {
@@ -253,6 +280,31 @@ check "新密码可登录" "$(curl -s -X POST "$BASE/auth/login" -H 'Content-Typ
 check "未绑定时解绑被拒" "$(curl -s -X POST "$BASE/auth/linux-do/unbind" -H "Authorization: Bearer $USER_TOKEN" | jq -r .msg)" "当前账号未绑定 Linux.do"
 check "未开启时拿不到绑定地址" "$(curl -s "$BASE/auth/linux-do/bind" -H "Authorization: Bearer $USER_TOKEN" | jq -r .msg)" "Linux.do 登录未开启"
 check "伪造的授权 state 被拒绝" "$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/auth/linux-do/callback?code=x&state=forged" | grep -c 'error=')" "1"
+
+# 关闭注册后，第三方登录同样不能凭空建号，否则等于给注册开关开了个后门。
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{
+  "public": { "auth": { "allowRegister": false, "linuxDo": { "enabled": true } } },
+  "private": { "auth": { "linuxDo": { "clientId": "smoke-id", "clientSecret": "smoke-secret" } } }
+}' >/dev/null
+oauth_state() { curl -s -o /dev/null -w '%{redirect_url}' "$BASE/auth/linux-do/authorize?redirect=/" | sed -n 's/.*[?&]state=\([^&]*\).*/\1/p'; }
+oauth_callback() { curl -s -o /dev/null -w '%{redirect_url}' "$BASE/auth/linux-do/callback?code=smoke-code&state=$1"; }
+decode() { python3 -c "import sys,urllib.parse as u; print(u.unquote(sys.argv[1]))" "$1"; }
+
+CLOSED_CB="$(oauth_callback "$(oauth_state)")"
+check "关闭注册时第三方登录不发令牌" "$(echo "$CLOSED_CB" | grep -c 'token=')" "0"
+check "关闭注册时第三方登录被拒" "$(decode "$(echo "$CLOSED_CB" | sed -n 's/.*[?&]error=\([^&]*\).*/\1/p')")" "当前未开放注册"
+check "被拒后没有凭空建出账号" "$(curl -s "$BASE/admin/users?keyword=smoke-linuxdo" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items | length')" "0"
+
+# 开回注册后同一个 Linux.do 账号应当能正常建号登录，确认上面拦的是注册开关而不是链路本身坏了。
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"allowRegister":true,"linuxDo":{"enabled":true}}},"private":{"auth":{"linuxDo":{"clientId":"smoke-id","clientSecret":"smoke-secret"}}}}' >/dev/null
+OPEN_CB="$(oauth_callback "$(oauth_state)")"
+check "开放注册后第三方登录换到令牌" "$(echo "$OPEN_CB" | grep -c 'token=')" "1"
+check "开放注册后账号已建出来" "$(curl -s "$BASE/admin/users?keyword=smoke-linuxdo" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items | length')" "1"
+
+# 已经绑定过的账号，即使再关掉注册也必须还能登录，否则老用户会被误伤。
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"allowRegister":false,"linuxDo":{"enabled":true}}},"private":{"auth":{"linuxDo":{"clientId":"smoke-id","clientSecret":"smoke-secret"}}}}' >/dev/null
+check "关闭注册不影响已绑定用户登录" "$(echo "$(oauth_callback "$(oauth_state)")" | grep -c 'token=')" "1"
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"allowRegister":true,"linuxDo":{"enabled":false}}}}' >/dev/null
 
 echo "节点插件云端同步"
 curl -s -X PUT "$BASE/v1/user-plugins/demo-plugin" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"data":{"id":"demo-plugin","name":"演示插件","version":"1.0.0","enabled":true,"source":"export default {}"}}' >/dev/null
@@ -529,6 +581,81 @@ check "中止会留下可见的提示消息" "$(curl -s "$BASE/v1/agent/sessions
 curl -s -X DELETE "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
 check "删除后会话不再列出" "$(curl -s "$BASE/v1/agent/sessions?projectId=agent-p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.items[] | select(.id=="'"$SESSION"'")] | length')" "0"
 check "删除后拉消息被拒绝" "$(curl -s "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" | jq -r .msg)" "会话不存在"
+
+echo "文本任务"
+# 文本生成和生图走同一套任务队列：服务端边收上游流边落库，前端断开也不影响任务继续跑完。
+TEXT_FULL="无限画布把生成任务放在服务端，刷新页面也不会丢，内容会接着写完。"
+# 把 SSE 里的 delta 拼回完整文本 / 数出它有多少个字，用来验证断线续传接得上。
+sse_text() { grep '^data: ' "$1" | sed 's/^data: //' | jq -rs '[.[] | select(.type=="delta") | .text] | add // ""'; }
+sse_status() { grep '^data: ' "$1" | sed 's/^data: //' | jq -rs '[.[] | select(.type=="status") | .status] | last // ""'; }
+text_job() { curl -s "$BASE/v1/jobs/$1" -H "Authorization: Bearer $USER_TOKEN"; }
+
+curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":50}' >/dev/null
+TEXT_JOB=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"text-1","kind":"text","model":"mock-text","prompt":"介绍一下无限画布","params":{"reasoningEffort":"auto"},"inputFileIds":[],"context":{"source":"canvas","projectId":"agent-p1","nodeId":"text-node-1"}}' | jq -r .data.id)
+check "提交文本任务成功" "$([ -n "$TEXT_JOB" ] && [ "$TEXT_JOB" != "null" ] && echo yes || echo no)" "yes"
+check "文本任务被识别为 text 类型" "$(text_job "$TEXT_JOB" | jq -r .data.kind)" "text"
+
+# 上游每 0.8 秒吐一片，落库节奏是「攒够 1 秒或 400 字」，这时库里应该已经有半截内容。
+sleep 2
+PARTIAL=$(text_job "$TEXT_JOB" | jq -r .data.text)
+check "生成中途已经把部分内容落库" "$([ -n "$PARTIAL" ] && [ "$PARTIAL" != "$TEXT_FULL" ] && echo yes || echo "no（实际「$PARTIAL」）")" "yes"
+check "落库的半截内容是完整文本的前缀" "$(case "$TEXT_FULL" in "$PARTIAL"*) echo yes ;; *) echo no ;; esac)" "yes"
+check "中途任务仍在进行中" "$(text_job "$TEXT_JOB" | jq -r .data.status)" "running"
+
+for _ in $(seq 1 30); do
+    [ "$(text_job "$TEXT_JOB" | jq -r .data.status)" = "succeeded" ] && break
+    sleep 1
+done
+check "文本任务执行成功" "$(text_job "$TEXT_JOB" | jq -r .data.status)" "succeeded"
+check "完成后拿到完整内容" "$(text_job "$TEXT_JOB" | jq -r .data.text)" "$TEXT_FULL"
+check "文本任务不产出文件" "$(text_job "$TEXT_JOB" | jq -r '.data.outputs | length')" "0"
+check "文本任务照常扣算力点" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)" "49"
+
+# 已结束的任务照样能订阅：一次性把完整内容和终态推回来，换设备打开画布靠的就是这条路径。
+curl -s -N --max-time 5 "$BASE/v1/jobs/$TEXT_JOB/text" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/text-done.txt"
+check "订阅已完成的任务能拿回完整内容" "$(sse_text "$WORK/text-done.txt")" "$TEXT_FULL"
+check "订阅已完成的任务会推终态" "$(sse_status "$WORK/text-done.txt")" "succeeded"
+curl -s -N --max-time 5 "$BASE/v1/jobs/$TEXT_JOB/text?since=$(printf '%s' "$TEXT_FULL" | jq -Rs 'length')" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/text-caught-up.txt"
+check "游标追平后不再重发内容" "$(sse_text "$WORK/text-caught-up.txt")" ""
+check "游标追平后仍然推终态" "$(sse_status "$WORK/text-caught-up.txt")" "succeeded"
+
+# 幂等：同一个键既不重复建任务，也不重复扣费。
+check "同一幂等键不会重复建文本任务" "$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"text-1","kind":"text","model":"mock-text","prompt":"介绍一下无限画布","params":{},"inputFileIds":[]}' | jq -r .data.id)" "$TEXT_JOB"
+sleep 2
+check "重发幂等键不会重复扣费" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)" "49"
+
+# 断线续传：订阅一会儿就掐断，任务继续在服务端跑；带上已收到的字数重连，两段拼起来正好是完整文本。
+TEXT_JOB2=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"text-2","kind":"text","model":"mock-text","prompt":"再写一段","params":{},"inputFileIds":[],"context":{"source":"canvas","projectId":"agent-p1","nodeId":"text-node-2"}}' | jq -r .data.id)
+curl -s -N --max-time 2.5 "$BASE/v1/jobs/$TEXT_JOB2/text" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/text-sse1.txt"
+PART1=$(sse_text "$WORK/text-sse1.txt")
+check "断开前已经收到增量" "$([ -n "$PART1" ] && [ "$PART1" != "$TEXT_FULL" ] && echo yes || echo "no（实际「$PART1」）")" "yes"
+check "断开时还没推终态" "$(sse_status "$WORK/text-sse1.txt")" ""
+check "订阅断开不会中断任务" "$(text_job "$TEXT_JOB2" | jq -r .data.status)" "running"
+curl -s -N --max-time 10 "$BASE/v1/jobs/$TEXT_JOB2/text?since=$(printf '%s' "$PART1" | jq -Rs 'length')" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/text-sse2.txt"
+check "按 since 重连补齐后能拼出完整文本" "$PART1$(sse_text "$WORK/text-sse2.txt")" "$TEXT_FULL"
+check "重连后能收到终态" "$(sse_status "$WORK/text-sse2.txt")" "succeeded"
+check "断线期间的内容也已落库" "$(text_job "$TEXT_JOB2" | jq -r .data.text)" "$TEXT_FULL"
+
+# 取消正在跑的文本任务：已经流出来的半截留在任务里，算力点原路返还。
+TEXT_JOB3=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"text-3","kind":"text","model":"mock-text","prompt":"这段会被取消","params":{},"inputFileIds":[]}' | jq -r .data.id)
+sleep 2.5
+curl -s -X POST "$BASE/v1/jobs/$TEXT_JOB3/cancel" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
+sleep 1
+CANCELED=$(text_job "$TEXT_JOB3")
+check "取消后任务状态为 canceled" "$(echo "$CANCELED" | jq -r .data.status)" "canceled"
+check "取消保留已经生成的半截内容" "$([ -n "$(echo "$CANCELED" | jq -r .data.text)" ] && echo yes || echo no)" "yes"
+# 50 起步，三个文本任务各扣 1 点，被取消的那次原路返还，净消耗 2 点。
+check "取消后算力点原路返还" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)" "48"
+check "取消也写了返还流水" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.type=="ai_refund" and (.extra | fromjson | .path) == "/jobs/text")] | length')" "1"
+
+# Gemini 格式的渠道同样走流式，解析的是另一套事件结构。
+GEMINI_TEXT_JOB=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"text-gemini","kind":"text","model":"mock-gemini-text","prompt":"用 Gemini 格式写","params":{},"inputFileIds":[]}' | jq -r .data.id)
+for _ in $(seq 1 30); do
+    [ "$(text_job "$GEMINI_TEXT_JOB" | jq -r .data.status)" = "succeeded" ] && break
+    sleep 1
+done
+check "Gemini 格式的文本流也能跑通" "$(text_job "$GEMINI_TEXT_JOB" | jq -r .data.text)" "$TEXT_FULL"
+check "文本任务也能被后台按类型筛出来" "$(curl -s "$BASE/admin/jobs?kind=text" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "4"
 
 echo
 printf '通过 %d 项，失败 %d 项\n' "$PASS" "$FAIL"

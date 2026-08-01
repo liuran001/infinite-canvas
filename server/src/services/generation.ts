@@ -1,6 +1,6 @@
 import type { StoredFile } from "../db/entities";
 import { fail } from "../lib/errors";
-import { upstreamBinary, upstreamJson, upstreamMessage } from "../lib/upstream";
+import { upstreamBinary, upstreamJson, upstreamMessage, upstreamStream } from "../lib/upstream";
 import { getObject } from "./storage";
 import { buildChannelUrl, isArkPlanChannel, isSeedanceModel, type ModelChannel } from "./settings";
 
@@ -22,6 +22,7 @@ export type GenerationParams = {
     format?: string;
     speed?: number;
     instructions?: string;
+    reasoningEffort?: string;
 };
 
 export type VideoProvider = "openai" | "seedance";
@@ -31,6 +32,7 @@ type ImagePayload = { data?: Array<Record<string, unknown>>; images?: Array<Reco
 type GeminiPart = { text?: string; inlineData?: { mimeType?: string; data?: string }; inline_data?: { mime_type?: string; mimeType?: string; data?: string }; fileData?: { fileUri?: string } };
 type GeminiPayload = { candidates?: Array<{ content?: { parts?: GeminiPart[] }; finishReason?: string }>; promptFeedback?: { blockReason?: string } };
 type VideoPayload = { id?: string; status?: string; error?: { message?: string } | null; url?: string; result_url?: string; video_url?: string; content?: { video_url?: string; url?: string } | null };
+type TextStreamEvent = { type?: string; delta?: string; text?: string; error?: { message?: string }; response?: { error?: { message?: string } } };
 
 const GEMINI_RATIOS = ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"];
 
@@ -81,7 +83,7 @@ function parseGeminiImages(payload: GeminiPayload): string[] {
     return images;
 }
 
-function geminiUrl(channel: ModelChannel, model: string, action: "generateContent") {
+function geminiUrl(channel: ModelChannel, model: string, action: "generateContent" | "streamGenerateContent") {
     const baseUrl = channel.baseUrl.trim().replace(/\/+$/, "");
     const lower = baseUrl.toLowerCase();
     const versioned = lower.endsWith("/v1") || lower.endsWith("/v1beta") ? baseUrl : `${baseUrl}/v1beta`;
@@ -163,6 +165,108 @@ export async function generateImages(channel: ModelChannel, model: string, syste
     }
     const payload = await upstreamJson<ImagePayload>(buildChannelUrl(channel, "/images/edits"), { method: "POST", headers: authHeaders(channel), body: form, signal }, "图片生成失败");
     return parseImagePayload(payload);
+}
+
+/** 逐块读上游 SSE：按空行切块，把 data 行拼起来交给解析函数。上游一有内容就回调，不等整段读完。 */
+async function readUpstreamSse(body: ReadableStream<Uint8Array>, onData: (data: string) => void) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+        const { done, value } = await reader.read();
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        for (let match = /\r?\n\r?\n/.exec(buffer); match; match = /\r?\n\r?\n/.exec(buffer)) {
+            const block = buffer.slice(0, match.index);
+            buffer = buffer.slice(match.index + match[0].length);
+            const data = block
+                .split(/\r?\n/)
+                .filter((line) => line.startsWith("data:"))
+                .map((line) => line.slice(5).trim())
+                .join("");
+            if (data && data !== "[DONE]") onData(data);
+        }
+        if (done) return;
+    }
+}
+
+async function generateGeminiText(channel: ModelChannel, model: string, systemPrompt: string, prompt: string, references: StoredFile[], onDelta: (delta: string) => void, signal: AbortSignal) {
+    const parts: GeminiPart[] = [{ text: prompt }];
+    for (const file of references) parts.push({ inlineData: { mimeType: file.mimeType, data: (await readFileBuffer(file)).toString("base64") } });
+    const body = await upstreamStream(
+        `${geminiUrl(channel, model, "streamGenerateContent")}?alt=sse`,
+        {
+            method: "POST",
+            headers: { "x-goog-api-key": channel.apiKey, "Content-Type": "application/json", Accept: "text/event-stream" },
+            body: JSON.stringify({ contents: [{ role: "user", parts }], ...(systemPrompt.trim() ? { systemInstruction: { parts: [{ text: systemPrompt.trim() }] } } : {}) }),
+            signal,
+        },
+        "文本生成失败",
+    );
+    let text = "";
+    await readUpstreamSse(body, (data) => {
+        const payload = JSON.parse(data) as GeminiPayload;
+        if (payload.promptFeedback?.blockReason) throw fail(`Gemini 拒绝了该请求：${payload.promptFeedback.blockReason}`);
+        const delta = (payload.candidates || [])
+            .flatMap((candidate) => candidate.content?.parts || [])
+            .map((part) => part.text || "")
+            .join("");
+        if (!delta) return;
+        text += delta;
+        onDelta(delta);
+    });
+    return text;
+}
+
+/**
+ * 文本生成：流式读上游，每收到一段就回调一次，调用方据此边收边落库。
+ * 请求体与前端原来直连流式代理时保持一致，只是发起方从浏览器换成了服务端。
+ */
+export async function generateText(
+    channel: ModelChannel,
+    model: string,
+    systemPrompt: string,
+    prompt: string,
+    params: GenerationParams,
+    references: StoredFile[],
+    onDelta: (delta: string) => void,
+    signal: AbortSignal,
+): Promise<string> {
+    if (channel.apiFormat === "gemini") return generateGeminiText(channel, model, systemPrompt, prompt, references, onDelta, signal);
+
+    const content: Array<Record<string, unknown>> = [{ type: "input_text", text: prompt }];
+    for (const file of references) content.push({ type: "input_image", image_url: await fileToDataUrl(file) });
+    const body = await upstreamStream(
+        buildChannelUrl(channel, "/responses"),
+        {
+            method: "POST",
+            headers: { ...authHeaders(channel, "application/json"), Accept: "text/event-stream" },
+            body: JSON.stringify({
+                model,
+                input: [...(systemPrompt.trim() ? [{ role: "system", content: systemPrompt.trim() }] : []), { role: "user", content }],
+                ...(params.reasoningEffort && params.reasoningEffort !== "auto" ? { reasoning: { effort: params.reasoningEffort } } : {}),
+                stream: true,
+            }),
+            signal,
+        },
+        "文本生成失败",
+    );
+
+    let text = "";
+    await readUpstreamSse(body, (data) => {
+        const event = JSON.parse(data) as TextStreamEvent;
+        const error = event.error?.message || event.response?.error?.message;
+        if (error) throw fail(error);
+        if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+            text += event.delta;
+            onDelta(event.delta);
+        }
+        // 有的网关只在结尾给一次完整文本，没有逐字增量，这时补一次整段。
+        if (event.type === "response.output_text.done" && !text && typeof event.text === "string") {
+            text = event.text;
+            onDelta(event.text);
+        }
+    });
+    return text;
 }
 
 export function videoProvider(channel: ModelChannel, model: string): VideoProvider {

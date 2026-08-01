@@ -49,6 +49,16 @@ export async function upstreamJson<T>(url: string, init: RequestInit, fallback: 
     return payload as T;
 }
 
+/** 流式请求：只校验响应头，body 交给调用方边收边处理，不能先 text() 整段读完，否则就不是流了。 */
+export async function upstreamStream(url: string, init: RequestInit, fallback: string) {
+    const response = await fetch(url, { ...init, signal: init.signal || AbortSignal.timeout(600000) }).catch((error: Error) => {
+        throw fail(error.name === "TimeoutError" ? `${fallback}：上游接口超时` : `${fallback}：上游接口无响应或网络不可达`);
+    });
+    if (!response.ok) throw fail(upstreamMessage(await response.text().catch(() => "")) || statusMessage(response.status, fallback));
+    if (!response.body) throw fail(`${fallback}：上游没有返回内容`);
+    return response.body;
+}
+
 export async function upstreamBinary(url: string, init: RequestInit, fallback: string) {
     const response = await fetch(url, { ...init, signal: init.signal || AbortSignal.timeout(600000) }).catch((error: Error) => {
         throw fail(error.name === "TimeoutError" ? `${fallback}：上游接口超时` : `${fallback}：上游接口无响应或网络不可达`);
