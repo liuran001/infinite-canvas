@@ -361,10 +361,13 @@ function InfiniteCanvasPage() {
                 navigate("/canvas", { replace: true });
                 return;
             }
-            // 服务端仍在跑的任务对应的节点保持「生成中」并继续续查，其余中断节点照常标记为失败。
-            const pendingJobs = (await useJobStore.getState().restorePendingJobs()).filter((job) => job.context.source === "canvas" && job.context.projectId === projectId);
-            const resumable = pendingJobs.filter((job) => project.nodes.some((node) => node.id === job.context.nodeId));
-            pendingJobs.filter((job) => !resumable.includes(job)).forEach((job) => useJobStore.getState().untrackJob(job.clientJobId));
+            // 服务端仍在跑的任务对应的节点保持「生成中」并继续续查；刷新那一刻任务可能刚好已经跑完，
+            // 已结束的任务也补一份，否则结果拿不回来，已经生成好的内容会被误报成「生成已中断」。
+            const [pendingJobs, finishedJobs] = await Promise.all([useJobStore.getState().restorePendingJobs(), useJobStore.getState().restoreFinishedJobs()]);
+            const canvasJobs = [...pendingJobs, ...finishedJobs].filter((job) => job.context.source === "canvas" && job.context.projectId === projectId);
+            // 只回填仍是「生成中」的节点：节点早就拿到结果的历史任务再续查一遍只是白打请求。
+            const resumable = canvasJobs.filter((job) => project.nodes.some((node) => node.id === job.context.nodeId && node.metadata?.status === NODE_STATUS_LOADING));
+            canvasJobs.filter((job) => !resumable.includes(job)).forEach((job) => useJobStore.getState().untrackJob(job.clientJobId));
             const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes, new Set(resumable.map((job) => job.context.nodeId || ""))));
             const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
             setNodes(restoredNodes);

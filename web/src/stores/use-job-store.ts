@@ -23,6 +23,8 @@ export type TrackedJob = {
 
 const EMPTY_CONTEXT: JobContext = { source: "canvas", prompt: "" };
 const JOB_SOURCES: JobSource[] = ["image", "video", "canvas"];
+/** 已结束任务的补拉窗口：够覆盖「关掉页面隔一晚再打开」，又不至于把历史任务全拉回来重新取一遍结果。 */
+const FINISHED_JOB_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 function optionalText(value: unknown) {
     return typeof value === "string" && value ? value : undefined;
@@ -39,12 +41,21 @@ function readContext(job: ServerJob, previous?: JobContext): JobContext {
     return { source, prompt: typeof context.prompt === "string" ? context.prompt : "", projectId: optionalText(context.projectId), nodeId: optionalText(context.nodeId) };
 }
 
+function toTrackedJob(job: ServerJob, previous?: JobContext): TrackedJob {
+    return { clientJobId: job.clientJobId, jobId: job.id, kind: job.kind, status: job.status, progress: job.progress, model: job.model, context: readContext(job, previous) };
+}
+
 type JobStore = {
     jobs: Record<string, TrackedJob>;
     trackJob: (clientJobId: string, job: ServerJob, context?: JobContext) => void;
     untrackJob: (clientJobId: string) => void;
     /** 服务器模式下用服务端仍在进行的任务覆盖本地记录，服务端已经没有的记录会被丢弃。 */
     restorePendingJobs: () => Promise<TrackedJob[]>;
+    /**
+     * 最近已结束的任务。刷新那一刻任务可能刚好跑完，只查进行中的任务会漏掉结果，
+     * 界面就会把已经生成好的内容误报成中断。这些任务不再进行，只返回给调用方回填，不进 jobs 记录。
+     */
+    restoreFinishedJobs: () => Promise<TrackedJob[]>;
 };
 
 export const JOB_STORE_KEY = "infinite-canvas:job_store";
@@ -70,10 +81,19 @@ export const useJobStore = create<JobStore>()(
                 const previous = get().jobs;
                 const jobs: Record<string, TrackedJob> = {};
                 for (const job of items) {
-                    jobs[job.clientJobId] = { clientJobId: job.clientJobId, jobId: job.id, kind: job.kind, status: job.status, progress: job.progress, model: job.model, context: readContext(job, previous[job.clientJobId]?.context) };
+                    jobs[job.clientJobId] = toTrackedJob(job, previous[job.clientJobId]?.context);
                 }
                 set({ jobs });
                 return Object.values(jobs);
+            },
+            restoreFinishedJobs: async () => {
+                if (!isServerMode()) return [];
+                // 单独查一次而不是和进行中的任务合并成一个请求：已结束的任务数量远多于在跑的，
+                // 混在一起会把仍在跑的任务挤出服务端的条数上限，反而丢掉更该恢复的进度。
+                const since = new Date(Date.now() - FINISHED_JOB_WINDOW_MS).toISOString();
+                const items = (await serverApi.jobs(["succeeded", "failed"], since).catch(() => ({ items: [] }))).items;
+                const previous = get().jobs;
+                return items.map((job) => toTrackedJob(job, previous[job.clientJobId]?.context));
             },
         }),
         {

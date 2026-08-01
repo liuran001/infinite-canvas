@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { ArrowUp, LoaderCircle, Square } from "lucide-react";
+import { ArrowUp, LoaderCircle, Square, Zap } from "lucide-react";
 import { Button } from "antd";
 
 import { ModelPicker } from "@/components/model-picker";
-import { defaultConfig, resolveModelForCapability, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { defaultConfig, generationCreditCost, resolveModelForCapability, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { CanvasImageSettingsPopover } from "./canvas-image-settings-popover";
@@ -35,6 +35,8 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const mode = modeOverride ?? defaultMode(node.type);
     const config = buildNodeConfig(globalConfig, node, mode);
+    // 画质档位只对生图加价，张数也只有生图会大于 1。
+    const generationCost = generationCreditCost(config.model, mode === "image" ? config.quality : undefined, mode === "image" ? Number(config.count) || 1 : 1);
     const hasTextContent = node.type === CanvasNodeType.Text && Boolean(node.metadata?.content?.trim());
     const hasImageContent = node.type === CanvasNodeType.Image && Boolean(node.metadata?.content);
     const isEditingExistingContent = hasTextContent || hasImageContent;
@@ -124,7 +126,15 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
                                 <span className="text-xs font-medium">停止</span>
                             </>
                         ) : (
-                            <ArrowUp className="size-4" />
+                            <>
+                                <ArrowUp className="size-4" />
+                                {generationCost ? (
+                                    <span className="inline-flex items-center gap-0.5 text-xs tabular-nums">
+                                        <Zap className="size-3.5" />
+                                        {generationCost}
+                                    </span>
+                                ) : null}
+                            </>
                         )}
                     </span>
                 </Button>

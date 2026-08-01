@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
 import { useEffect } from "react";
-import { Image as ImageIcon, LoaderCircle, MessageSquare, Music2, Play, Settings2, Square, Video } from "lucide-react";
+import { Image as ImageIcon, LoaderCircle, MessageSquare, Music2, Play, Settings2, Square, Video, Zap } from "lucide-react";
 import { Button, Segmented } from "antd";
 
 import { ModelPicker } from "@/components/model-picker";
@@ -133,7 +133,12 @@ export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigC
                         <>
                             <Play className="size-4" />
                             <span>开始生成</span>
-                            {generationCost ? <span className="opacity-70">· {generationCost} 点</span> : null}
+                            {generationCost ? (
+                                <span className="inline-flex items-center gap-0.5 opacity-70">
+                                    <Zap className="size-3.5" />
+                                    {generationCost}
+                                </span>
+                            ) : null}
                         </>
                     )}
                 </span>

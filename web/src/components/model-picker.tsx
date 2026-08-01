@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useState } from "react";
-import { Cpu } from "lucide-react";
+import { Cpu, Zap } from "lucide-react";
 
 import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
@@ -71,7 +71,7 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
             >
                 {options.length ? (
                     options.map((model) => (
-                        <SelectItem key={model} value={model} textValue={modelOptionLabel(config, model)}>
+                        <SelectItem key={model} value={model} textValue={modelOptionLabel(config, model)} className="[&>span:last-child]:w-full">
                             <ModelLabel config={config} model={model} />
                         </SelectItem>
                     ))
@@ -93,10 +93,15 @@ function emptyModelLabel(capability?: ModelCapability) {
 function ModelLabel({ config, model }: { config: AiConfig; model: string }) {
     const credits = modelCreditCost(model);
     return (
-        <span className="flex min-w-0 items-center gap-2">
+        <span className="flex w-full min-w-0 items-center gap-2">
             <ModelIcon model={model} />
             <span className="min-w-0 flex-1 truncate">{modelOptionLabel(config, model)}</span>
-            {credits ? <span className="shrink-0 text-xs opacity-60">{credits} 点</span> : null}
+            {credits ? (
+                <span className="flex shrink-0 items-center gap-0.5 text-xs tabular-nums opacity-60">
+                    <Zap className="size-3" />
+                    {credits}
+                </span>
+            ) : null}
         </span>
     );
 }
