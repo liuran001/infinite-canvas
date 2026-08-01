@@ -153,7 +153,19 @@ export function ChannelEditorModal({ channel, index, onSave, onClose }: { channe
                                 {model.name}
                             </span>
                             <Input size="small" className="w-44" value={model.label || ""} placeholder="留空则显示模型名" onChange={(event) => patchModel(model.name, { label: event.target.value })} />
-                            <Segmented size="small" value={model.capability} options={capabilityOptions} onChange={(value) => patchModel(model.name, { capability: value as ServerCapability })} />
+                            <Segmented
+                                size="small"
+                                value={model.capability}
+                                options={capabilityOptions}
+                                // 视觉是文本模型的输入能力，切成生图/视频/音频后顺手清掉标注，免得留下看不见却仍会生效的旧值。
+                                onChange={(value) => patchModel(model.name, { capability: value as ServerCapability, ...(value === "text" ? {} : { vision: false }) })}
+                            />
+                            {model.capability === "text" ? (
+                                <label className="flex items-center gap-1.5 text-xs text-stone-500">
+                                    <Switch size="small" checked={model.vision === true} onChange={(vision) => patchModel(model.name, { vision })} />
+                                    <span>视觉输入</span>
+                                </label>
+                            ) : null}
                             <Button size="small" danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => applyNames(modelNames.filter((name) => name !== model.name))} />
                         </div>
                     ))
@@ -161,6 +173,8 @@ export function ChannelEditorModal({ channel, index, onSave, onClose }: { channe
                     <div className="px-2 py-6 text-center text-sm text-stone-500">还没有模型，先拉取或手动输入。</div>
                 )}
             </div>
+            {/* 模型名看不出来支不支持读图，只能管理员标注，这里说明勾错的后果。 */}
+            <div className="mt-1.5 text-xs text-stone-500">「视觉输入」只对文本模型有意义：勾上后画布 Agent 才能用「查看图片」读画布上的图；模型实际不支持却勾上会导致调用失败。</div>
 
             <div className="mt-5 flex flex-wrap items-center gap-2">
                 <span className="text-sm font-semibold">连通性测试</span>

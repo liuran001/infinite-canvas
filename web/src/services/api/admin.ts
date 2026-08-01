@@ -37,7 +37,8 @@ export type AdminCreditLog = {
     createdAt: string;
 };
 
-export type AdminChannelModel = { name: string; label?: string; capability: ServerCapability };
+/** vision 表示模型能直接读图，模型名看不出来这件事，只能管理员标注；服务端据此决定要不要给 Agent 下发看图工具。 */
+export type AdminChannelModel = { name: string; label?: string; capability: ServerCapability; vision?: boolean };
 
 export type AdminChannel = {
     apiFormat: ServerApiFormat;
@@ -54,7 +55,18 @@ export type AdminChannel = {
 export type ModelCost = ServerSettings["modelChannel"]["modelCosts"][number];
 
 /** 联网搜索服务商，与服务端 search 服务里注册的 PROVIDERS 一一对应。 */
-export type AdminSearchProvider = "exa";
+export type AdminSearchProvider = "exa" | "tavily";
+
+/** 一条联网搜索服务，结构与模型渠道对齐：可以配多条，按 weight 从高到低依次尝试，前面的失败就自动换下一条。 */
+export type AdminSearchService = {
+    provider: AdminSearchProvider;
+    name: string;
+    /** 留空表示用服务商官方地址，填了走自建代理或镜像。 */
+    baseUrl: string;
+    apiKey: string;
+    weight: number;
+    enabled: boolean;
+};
 
 /** public 与前端公开配置同构；private 只有管理后台可见，密钥字段读取时被服务端抹成空串。 */
 export type AdminSettings = {
@@ -63,8 +75,8 @@ export type AdminSettings = {
         channels: AdminChannel[];
         promptSync: { enabled: boolean; cron: string };
         auth: { linuxDo: { clientId: string; clientSecret: string } };
-        /** 联网搜索配置，apiKey 与渠道密钥一样：读取时被服务端抹空，回传空串表示保持不变。 */
-        search: { enabled: boolean; provider: AdminSearchProvider; apiKey: string; maxResults: number };
+        /** 联网搜索配置，services 里的 apiKey 与渠道密钥一样：读取时被服务端抹空，回传空串表示保持不变。 */
+        search: { enabled: boolean; maxResults: number; services: AdminSearchService[] };
     };
 };
 

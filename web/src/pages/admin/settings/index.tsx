@@ -4,17 +4,21 @@ import { Pencil, Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { useAdminAction } from "@/pages/admin/use-admin-action";
-import { adminApi, type AdminChannel, type AdminChannelModel, type AdminSearchProvider, type AdminSettings, type ModelCost } from "@/services/api/admin";
+import { adminApi, type AdminChannel, type AdminChannelModel, type AdminSearchProvider, type AdminSearchService, type AdminSettings, type ModelCost } from "@/services/api/admin";
 import { imageQualityOptions } from "@/components/image-settings-panel";
 import { useServerStore, type ServerCapability, type ServerSettings } from "@/stores/use-server-store";
 import { ChannelEditorModal } from "./components/channel-editor-modal";
 
 const newChannel = (): AdminChannel => ({ apiFormat: "openai", name: "", baseUrl: "", apiKey: "", models: [], weight: 1, enabled: true, remark: "" });
+const newSearchService = (): AdminSearchService => ({ provider: "exa", name: "", baseUrl: "", apiKey: "", weight: 1, enabled: true });
 
 const sectionClass = "mt-4 rounded-lg border border-stone-200 p-4 dark:border-stone-800";
 
-/** 服务端目前只注册了 Exa 一个搜索服务，之后接新服务在这里补一项即可。 */
-const searchProviderOptions: Array<{ label: string; value: AdminSearchProvider }> = [{ label: "Exa", value: "exa" }];
+/** 与服务端 search 服务里注册的 PROVIDERS 一一对应，之后接新服务在这里补一项即可。 */
+const searchProviderOptions: Array<{ label: string; value: AdminSearchProvider }> = [
+    { label: "Exa", value: "exa" },
+    { label: "Tavily", value: "tavily" },
+];
 
 const capabilityItems: Array<{ key: ServerCapability; label: string; hint: string }> = [
     { key: "image", label: "图片生成", hint: "图片页与画布生图节点" },
@@ -68,6 +72,7 @@ export default function AdminSettingsPage() {
     const optionsFor = (capability: ServerCapability) => models.filter((model) => model.capability === capability).map(toOption);
     const allOptions = models.map(toOption);
     const patchCost = (index: number, value: Partial<ModelCost>) => patchModelChannel({ modelCosts: modelChannel.modelCosts.map((item, current) => (current === index ? { ...item, ...value } : item)) });
+    const patchSearchService = (index: number, value: Partial<AdminSearchService>) => patchSearch({ services: search.services.map((item, current) => (current === index ? { ...item, ...value } : item)) });
 
     const openChannel = (channel: AdminChannel, index?: number) => {
         setEditingIndex(index);
@@ -219,37 +224,56 @@ export default function AdminSettingsPage() {
             </section>
 
             <section className={sectionClass}>
-                <h2 className="text-sm font-semibold">联网搜索</h2>
-                <p className="mt-0.5 text-xs text-stone-500">给画布 Agent 提供联网搜索工具；密钥保存后不会回传，留空表示保持不变。</p>
-                <div className="mt-3 flex items-center gap-2">
-                    <Switch checked={search.enabled} onChange={(enabled) => patchSearch({ enabled })} />
-                    <span className="text-sm">启用联网搜索</span>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                        <h2 className="text-sm font-semibold">联网搜索</h2>
+                        <p className="mt-0.5 text-xs text-stone-500">给画布 Agent 提供联网搜索与读取网页正文的工具；密钥保存后不会回传，留空表示保持不变。</p>
+                    </div>
+                    <Button icon={<Plus className="size-4" />} onClick={() => patchSearch({ services: [...search.services, newSearchService()] })}>
+                        新增服务
+                    </Button>
                 </div>
-                <div className="mt-4 grid gap-4 md:grid-cols-2">
-                    <label className="block">
-                        <span className="mb-1 block text-sm font-medium">搜索服务</span>
-                        <Select className="w-full" value={search.provider} options={searchProviderOptions} onChange={(provider) => patchSearch({ provider })} />
-                    </label>
-                    <label className="block">
-                        <span className="mb-1 block text-sm font-medium">搜索 API Key</span>
-                        <Input.Password value={search.apiKey} onChange={(event) => patchSearch({ apiKey: event.target.value })} placeholder="留空表示不修改" />
-                    </label>
-                    <label className="block">
-                        <span className="mb-1 block text-sm font-medium">结果条数上限</span>
+                <div className="mt-3 flex flex-wrap items-center gap-6">
+                    <div className="flex items-center gap-2">
+                        <Switch checked={search.enabled} onChange={(enabled) => patchSearch({ enabled })} />
+                        <span className="text-sm">启用联网搜索</span>
+                    </div>
+                    <label className="flex items-center gap-2">
+                        <span className="text-sm">结果条数上限</span>
                         {/* 同样按服务端的 1-20 钳位，默认 5。 */}
-                        <InputNumber className="w-full" min={1} max={20} precision={0} suffix="条" value={search.maxResults} onChange={(value) => patchSearch({ maxResults: Math.min(20, Math.max(1, Number(value) || 5)) })} />
-                        <span className="mt-1 block text-xs text-stone-500">每次搜索最多返回几条结果，范围 1-20，默认 5；条数越多上下文越长。</span>
+                        <InputNumber className="w-28" min={1} max={20} precision={0} suffix="条" value={search.maxResults} onChange={(value) => patchSearch({ maxResults: Math.min(20, Math.max(1, Number(value) || 5)) })} />
+                        <span className="text-xs text-stone-500">每次搜索最多返回几条，条数越多上下文越长。</span>
                     </label>
+                </div>
+                {/* 可以配多家：权重高的先用，调用失败会自动换下一家，所以同时配两家等于给联网能力做了备份。 */}
+                <div className="mt-3 space-y-2">
+                    {search.services.length ? (
+                        search.services.map((service, index) => (
+                            <div key={index} className="rounded-lg border border-stone-200 p-3 dark:border-stone-800">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <Switch size="small" checked={service.enabled} onChange={(enabled) => patchSearchService(index, { enabled })} />
+                                    <Select className="w-28" value={service.provider} options={searchProviderOptions} onChange={(provider) => patchSearchService(index, { provider })} />
+                                    <Input className="w-36" value={service.name} placeholder="备注名" onChange={(event) => patchSearchService(index, { name: event.target.value })} />
+                                    <Input.Password className="min-w-[220px] flex-1" value={service.apiKey} placeholder="API Key，留空表示不修改" onChange={(event) => patchSearchService(index, { apiKey: event.target.value })} />
+                                    <InputNumber className="w-28" min={1} precision={0} prefix={<span className="text-xs text-stone-500">权重</span>} value={service.weight} onChange={(value) => patchSearchService(index, { weight: Math.max(1, Number(value) || 1) })} />
+                                    <Button danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => patchSearch({ services: search.services.filter((_, current) => current !== index) })} />
+                                </div>
+                                <Input className="mt-2" value={service.baseUrl} placeholder="接口地址，留空用服务商官方地址" onChange={(event) => patchSearchService(index, { baseUrl: event.target.value })} />
+                            </div>
+                        ))
+                    ) : (
+                        <div className="py-4 text-center text-sm text-stone-500">还没有配置搜索服务，新增一条并填好 API Key 后 Agent 才能联网。</div>
+                    )}
                 </div>
                 {/*
                  * 服务端读取时会把 apiKey 抹成空串，前端没法直接判断「配没配 key」，
-                 * 只能看公开配置里由「开关打开 + key 非空」推导出来的 agent.searchEnabled。
+                 * 只能看公开配置里由「开关打开 + 至少一条可用服务」推导出来的 agent.searchEnabled。
                  * 它反映的是已保存的配置，所以文案统一说「当前」，避免和还没保存的草稿混淆。
                  */}
                 <p className={`mt-3 text-xs ${agent.searchEnabled ? "text-stone-500" : "text-amber-600 dark:text-amber-500"}`}>
                     {agent.searchEnabled
-                        ? "当前联网搜索已生效，Agent 可以调用搜索工具。"
-                        : "当前联网搜索不会生效：服务端只有在开关打开且 API Key 非空时，才会把搜索工具下发给 Agent。填好 API Key 并保存后这条提示会变为已生效。"}
+                        ? "当前联网搜索已生效，Agent 可以调用搜索与读取网页工具。"
+                        : "当前联网搜索不会生效：服务端只有在开关打开、且至少有一条启用并填了 API Key 的服务时，才会把联网工具下发给 Agent。填好后保存，这条提示会变为已生效。"}
                 </p>
             </section>
 

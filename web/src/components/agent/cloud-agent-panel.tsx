@@ -5,17 +5,20 @@ import { useShallow } from "zustand/react/shallow";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { ModelPicker } from "@/components/model-picker";
+import { serverFileUrl } from "@/services/api/server";
+import { serverStorageKey } from "@/services/image-storage";
 import { modelCreditCost, modelOptionLabel, resolveAgentModel, useEffectiveConfig } from "@/stores/use-config-store";
 import { useAgentStore } from "@/stores/use-agent-store";
 import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
 import { useIsServerMode, useServerStore } from "@/stores/use-server-store";
 import { useThemeStore } from "@/stores/use-theme-store";
-import { AgentChatComposer } from "./agent-chat-composer";
 import { AgentChatMessage, AgentWorkingMessage } from "./agent-chat-message";
 import { AgentModeSwitch } from "./agent-mode-switch";
 import { AgentPanelTabs } from "./agent-panel-tabs";
 import { AgentScrollToBottom } from "./agent-scroll-to-bottom";
-import { cloudAgentActivity, minModelRounds, toCloudChatItem } from "./cloud-agent-format";
+import { CloudAgentComposer, CloudAgentImageStrip } from "./cloud-agent-composer";
+import { cloudAgentActivity, toCloudChatItem } from "./cloud-agent-format";
+import { stripReferenceMarkers } from "./cloud-agent-references";
 
 const SCROLL_BOTTOM_THRESHOLD = 48;
 type CloudAgentTab = "chat" | "sessions";
@@ -33,7 +36,7 @@ export function CloudAgentPanel() {
     const closePanel = useAgentStore((state) => state.closePanel);
     const [tab, setTab] = useState<CloudAgentTab>("chat");
 
-    const { projectId, sessions, sessionId, sessionModel, messages, status, error, loading, sending, prompt } = useCloudAgentStore(
+    const { projectId, sessions, sessionId, sessionModel, messages, status, error, loading, sending, attachments } = useCloudAgentStore(
         useShallow((state) => ({
             projectId: state.projectId,
             sessions: state.sessions,
@@ -44,10 +47,9 @@ export function CloudAgentPanel() {
             error: state.error,
             loading: state.loading,
             sending: state.sending,
-            prompt: state.prompt,
+            attachments: state.attachments,
         })),
     );
-    const setPrompt = useCloudAgentStore((state) => state.setPrompt);
     const setModel = useCloudAgentStore((state) => state.setModel);
     const send = useCloudAgentStore((state) => state.send);
     const abort = useCloudAgentStore((state) => state.abort);
@@ -60,10 +62,19 @@ export function CloudAgentPanel() {
     const config = useEffectiveConfig();
     // 会话已经在用的模型优先，其次用户偏好，最后回落管理员默认；settings 与 config 都订阅了，配置变了会重算。
     const model = useMemo(() => resolveAgentModel(sessionModel), [config.agentModel, sessionModel, settings]);
-    const roundCost = modelCreditCost(model);
+    const messageCost = modelCreditCost(model);
     const maxRounds = settings?.agent.maxRounds || 0;
-    const usedCredits = useMemo(() => minModelRounds(messages) * roundCost, [messages, roundCost]);
-    const items = useMemo(() => messages.map(toCloudChatItem), [messages]);
+    // 附件要进上下文，模型不支持视觉时上游会直接报一串看不懂的错；这里先明确挡住，服务端仍然会再校验一次。
+    const visionWarning = attachments.length && !settings?.modelChannel.models.some((item) => item.name === model && item.vision) ? "当前模型不支持识别图片，请换一个标注了「支持视觉」的模型，或先移除图片" : "";
+    // 用户消息里的引用标记是给模型看的，展示时还原成「@标题」；附件按文件 ID 直接取直链画缩略图。
+    const items = useMemo(
+        () =>
+            messages.map((message) => ({
+                view: message.role === "user" ? { ...toCloudChatItem(message), text: stripReferenceMarkers(message.content) } : toCloudChatItem(message),
+                images: (message.attachments || []).map((id) => ({ id, name: "图片", url: serverFileUrl(id), storageKey: serverStorageKey(id), width: 0, height: 0 })),
+            })),
+        [messages],
+    );
     // 等待提示按实际进度说话：在跑工具就报工具名，其余情况说「正在思考」。
     const activity = useMemo(() => cloudAgentActivity(messages), [messages]);
     // 服务端执行失败时会把同一句中文既写进对话又放进 session.error，对话里已经有了就不再重复弹一条。
@@ -102,9 +113,9 @@ export function CloudAgentPanel() {
         });
     };
 
-    // 按轮计费的口径必须说清楚：用户在模型列表里看到的是单价，一次对话会跑很多轮。
-    const billingHint = roundCost
-        ? `系统模型按「每轮模型调用」扣费，一次对话会自动进行多轮思考与工具调用。实际消耗 = 每轮 ${roundCost} 点 × 实际轮数，发送前无法确定；本次最多 ${maxRounds} 轮，即最多约 ${roundCost * maxRounds} 点。`
+    // 计费口径是「每发一条消息扣一次」：一条消息触发多少轮思考与工具调用都不再额外扣，文案必须说清楚，别让用户以为还按轮算。
+    const billingHint = messageCost
+        ? `系统模型按「每条消息」扣费：发一条消息扣 ${messageCost} 点，这条消息触发的多轮思考与工具调用都不再额外扣点（单次最多 ${maxRounds} 轮）。`
         : "当前模型未配置算力点消耗，本次对话不扣点。";
 
     return (
@@ -185,7 +196,16 @@ export function CloudAgentPanel() {
                 <>
                     <div className="relative min-h-0 flex-1">
                         <div ref={listRef} className="thin-scrollbar h-full select-text space-y-4 overflow-y-auto px-4 pt-4" onScroll={updateScrollState}>
-                            {items.length ? items.map((item) => <AgentChatMessage key={item.id} item={item} theme={theme} />) : <CloudAgentIntro theme={theme} model={model} ready={isServerMode && Boolean(projectId)} />}
+                            {items.length ? (
+                                items.map(({ view, images }) => (
+                                    <div key={view.id}>
+                                        <AgentChatMessage item={view} theme={theme} />
+                                        {images.length ? <CloudAgentImageStrip images={images} alignRight={view.role === "user"} /> : null}
+                                    </div>
+                                ))
+                            ) : (
+                                <CloudAgentIntro theme={theme} model={model} ready={isServerMode && Boolean(projectId)} />
+                            )}
                             {running || sending ? <AgentWorkingMessage text={activity} activityKey={`${sessionId}-${messages.length}-${activity}`} theme={theme} /> : null}
                         </div>
                         {showScrollToBottom ? <AgentScrollToBottom theme={theme} title="查看最新消息" onClick={() => scrollToBottom()} /> : null}
@@ -200,19 +220,17 @@ export function CloudAgentPanel() {
 
                     <div className="flex items-center justify-center gap-3 px-4 pt-1 text-[11px] tabular-nums" style={{ color: theme.node.muted }}>
                         <Tooltip title={billingHint}>
-                            <span className="cursor-help underline decoration-dotted underline-offset-2">按轮计费 · 每轮 {roundCost} 点</span>
+                            <span className="cursor-help underline decoration-dotted underline-offset-2">每条消息 {messageCost} 点</span>
                         </Tooltip>
-                        {usedCredits ? <span>本次已消耗 ≥ {usedCredits} 点</span> : null}
-                        <span style={credits < roundCost ? { color: "#dc2626" } : undefined}>余额 {credits} 点</span>
+                        <span style={credits < messageCost ? { color: "#dc2626" } : undefined}>余额 {credits} 点</span>
                     </div>
 
-                    <AgentChatComposer
-                        prompt={prompt}
+                    <CloudAgentComposer
                         disabled={!isServerMode || !projectId}
                         sending={running || sending}
-                        placeholder={projectId ? "让系统模型帮你读取或修改当前画布" : "请先打开一个画布"}
+                        placeholder={projectId ? "让系统模型帮你读取或修改当前画布，可以把画布节点拖进来作为引用" : "请先打开一个画布"}
                         theme={theme}
-                        onPromptChange={setPrompt}
+                        visionWarning={visionWarning}
                         onSubmit={() => void send()}
                         onStop={() => void abort()}
                         left={
@@ -238,9 +256,10 @@ export function CloudAgentPanel() {
 function CloudAgentIntro({ theme, model, ready }: { theme: (typeof canvasThemes)[keyof typeof canvasThemes]; model: string; ready: boolean }) {
     const settings = useServerStore((state) => state.settings);
     const config = useEffectiveConfig();
-    const roundCost = modelCreditCost(model);
+    const messageCost = modelCreditCost(model);
     const abilities = [
         "读取画布结构、新建 / 修改 / 删除节点、连接与断开连线",
+        "把画布节点拖进输入框作为引用，也可以上传图片、把图片拖回画布",
         ...(settings?.capabilities.image && settings.modelChannel.defaultImageModel ? ["按提示词生成图片并放进画布"] : []),
         ...(settings?.agent.searchEnabled ? ["联网搜索最新资料"] : []),
     ];
@@ -255,7 +274,7 @@ function CloudAgentIntro({ theme, model, ready }: { theme: (typeof canvasThemes)
             <div className="text-xs leading-5">
                 任务跑在服务端，关掉面板、刷新页面或换设备都不会中断，回来还能看到结果。
                 {model ? `当前模型 ${modelOptionLabel(config, model)}，` : ""}
-                {roundCost ? `每轮模型调用扣 ${roundCost} 点，单次对话最多 ${settings?.agent.maxRounds || 0} 轮（最多约 ${roundCost * (settings?.agent.maxRounds || 0)} 点）。` : "当前模型未配置算力点消耗。"}
+                {messageCost ? `每发一条消息扣 ${messageCost} 点，这条消息触发的多轮思考与工具调用不再额外扣点（单次最多 ${settings?.agent.maxRounds || 0} 轮）。` : "当前模型未配置算力点消耗。"}
             </div>
         </div>
     );

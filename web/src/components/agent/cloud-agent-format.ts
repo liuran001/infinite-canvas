@@ -1,5 +1,8 @@
+import dayjs from "dayjs";
+
 import type { ServerAgentMessage } from "@/services/api/server";
 import type { AgentChatMessageItem } from "./agent-chat-message";
+import type { AgentSearchResult } from "./agent-search-card";
 
 /** 服务端工具名到中文标题：面板要让用户看清 agent 到底动了画布的什么地方。 */
 const TOOL_LABELS: Record<string, string> = {
@@ -35,6 +38,37 @@ function clip(value: string, max: number) {
     return value.length > max ? `${value.slice(0, max)}…` : value;
 }
 
+/** 来源只展示域名并去掉 www 前缀：完整 URL 又长又挤，用户判断可信度看域名就够了。解析不出来就不展示。 */
+function hostname(url: string) {
+    try {
+        return new URL(url).hostname.replace(/^www\./, "");
+    } catch {
+        return "";
+    }
+}
+
+/** publishedDate 是 UTC 的 ISO 串，直接展示用户读不出是什么时候，按本地时区转成年月日。 */
+function localDate(value: string) {
+    const day = dayjs(value);
+    return value && day.isValid() ? day.format("YYYY-MM-DD") : "";
+}
+
+/**
+ * 联网搜索的结果整块 JSON 摊给用户根本没法读，这里拆成条目交给 AgentSearchCard 渲染。
+ * 正文（Exa 可能返回整页内容）在这里就截断，避免一条搜索结果把整个面板撑爆；完整内容留在折叠的原始 JSON 里。
+ */
+function searchResults(data: unknown): AgentSearchResult[] {
+    const list = data && typeof data === "object" ? (data as { results?: unknown }).results : undefined;
+    if (!Array.isArray(list)) return [];
+    return list.flatMap((item) => {
+        const row = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+        const url = text(row.url).trim();
+        const title = text(row.title).trim();
+        if (!title && !url) return [];
+        return [{ title: title || url, url, host: hostname(url), date: localDate(text(row.publishedDate).trim()), summary: clip(text(row.text).trim(), MAX_VALUE_CHARS) }];
+    });
+}
+
 /** 把服务端消息转成现有聊天组件的数据结构，工具调用连参数和结果一起展示。 */
 export function toCloudChatItem(message: ServerAgentMessage): AgentChatMessageItem {
     const id = `cloud-${message.seq}`;
@@ -53,12 +87,15 @@ export function toCloudChatItem(message: ServerAgentMessage): AgentChatMessageIt
     const result = parseJson(message.toolResult) as { ok?: boolean; data?: unknown; error?: string } | null;
     const failed = result?.ok === false;
     const failure = String(result?.error || "工具执行失败");
+    // 只有联网搜索拆条目，其余工具照旧摊 output；原始 JSON 不截断，折叠起来备查。
+    const results = !failed && message.toolName === "web_search" ? searchResults(result?.data) : [];
+    const output = failed ? failure : results.length ? text(result?.data ?? "").trim() : clip(text(result?.data ?? "").trim(), MAX_OUTPUT_CHARS);
     return {
         id,
         role: "tool",
         title,
         text: failed ? failure : summary || "已完成",
-        detail: { status: failed ? "failed" : "completed", rows, output: failed ? failure : clip(text(result?.data ?? "").trim(), MAX_OUTPUT_CHARS) },
+        detail: { status: failed ? "failed" : "completed", rows, output, ...(results.length ? { results } : {}) },
     };
 }
 
@@ -71,17 +108,4 @@ export function cloudAgentActivity(messages: ServerAgentMessage[]) {
     // 工具消息先落一条没有结果的占位，拿到结果后用同一个 seq 再推一次；没有结果才代表这个工具还在跑。
     if (last?.role === "tool" && !last.toolResult) return `正在${TOOL_LABELS[last.toolName] || "执行工具"}`;
     return "正在思考";
-}
-
-/**
- * 已消耗算力点的下界。服务端每轮模型调用扣一次点，但消息记录里
- * 相邻两轮「只返回工具调用」的回复会连成一片，无法反推出准确轮数，
- * 所以只按「每条 assistant 回复算一轮 + 不跟在回复后面的工具段各算一轮」给严格下界。
- */
-export function minModelRounds(messages: ServerAgentMessage[]) {
-    return messages.reduce((rounds, item, index) => {
-        if (item.role === "assistant") return rounds + 1;
-        const previous = messages[index - 1]?.role;
-        return item.role === "tool" && previous !== "tool" && previous !== "assistant" ? rounds + 1 : rounds;
-    }, 0);
 }

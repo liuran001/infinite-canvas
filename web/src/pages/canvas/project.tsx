@@ -40,6 +40,7 @@ import { CanvasSidePanel } from "@/components/canvas/canvas-side-panel";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useAgentStore } from "@/stores/use-agent-store";
 import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
+import { CLOUD_AGENT_DROP_SELECTOR, CLOUD_AGENT_IMAGE_MIME } from "@/components/agent/cloud-agent-references";
 import { isServerMode, useIsServerMode, useServerStore } from "@/stores/use-server-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { pullProject } from "@/services/remote-sync";
@@ -1203,12 +1204,27 @@ function InfiniteCanvasPage() {
         const dx = clientX == null ? 0 : (clientX - dragRef.current.startX) / currentViewport.k;
         const dy = clientY == null ? 0 : (clientY - dragRef.current.startY) / currentViewport.k;
         const initialPositions = dragRef.current.initialSelectedNodes;
+        // 松手的地方在右侧 Agent 面板上：这是「把节点作为引用插进输入框」，不是把节点挪过去。
+        const onAgentPanel = clientX != null && clientY != null && Boolean(document.elementFromPoint(clientX, clientY)?.closest(CLOUD_AGENT_DROP_SELECTOR));
 
         historyPausedRef.current = false;
         nodeDraggingRef.current = false;
         setIsNodeDragging(false);
         setDropTargetGroupId(null);
-        if (dragRef.current.hasMoved && clientX != null && clientY != null) {
+        useCloudAgentStore.getState().setReferenceDropActive(false);
+        if (onAgentPanel) {
+            // 面板压在画布右侧，真按落点挪过去用户就再也看不见这些节点了，位置一律回滚到拖拽前。
+            const cloud = useCloudAgentStore.getState();
+            nodesRef.current.filter((node) => selectedNodeIdsRef.current.has(node.id)).forEach((node) => cloud.dropReference(node));
+            if (dragRef.current.hasMoved) {
+                setNodes((prev) =>
+                    prev.map((node) => {
+                        const initial = initialPositions.find((item) => item.id === node.id);
+                        return initial ? { ...node, position: { x: initial.x, y: initial.y } } : node;
+                    }),
+                );
+            }
+        } else if (dragRef.current.hasMoved && clientX != null && clientY != null) {
             const movedIds = new Set(initialPositions.map((item) => item.id));
             setNodes((prev) => {
                 const moved = prev.map((node) => {
@@ -1261,6 +1277,11 @@ function InfiniteCanvasPage() {
                     return initial ? { ...node, position: { x: initial.x + dx, y: initial.y + dy } } : node;
                 });
                 setDropTargetGroupId(findGroupDropTarget(movedIds, previewNodes)?.id || null);
+                // 拖到 Agent 面板上方时给个可以松手的提示。面板没开就不用查，省下每次 mousemove 的一次命中测试。
+                if (useAgentStore.getState().panelOpen) {
+                    const overPanel = Boolean(document.elementFromPoint(event.clientX, event.clientY)?.closest(CLOUD_AGENT_DROP_SELECTOR));
+                    if (useCloudAgentStore.getState().referenceDropActive !== overPanel) useCloudAgentStore.getState().setReferenceDropActive(overPanel);
+                }
 
                 if (rafRef.current) cancelAnimationFrame(rafRef.current);
                 rafRef.current = requestAnimationFrame(() => {
@@ -2073,9 +2094,42 @@ function InfiniteCanvasPage() {
         [createAudioFileNode, createImageFileNode, createVideoFileNode, screenToCanvas, size.height, size.width],
     );
 
+    /** 面板里的图片拖回画布：复用它已有的 storageKey，指向的还是同一份服务端文件，不重新上传也不重复占配额。 */
+    const createStoredImageNode = useCallback(async (payload: { name?: string; url: string; storageKey: string; width?: number; height?: number }, position: Position) => {
+        // 会话记录里的缩略图只有直链没有尺寸，这时候读一次原图的固有尺寸，节点比例才不会被拉歪。
+        const meta = payload.width && payload.height ? { width: payload.width, height: payload.height, mimeType: "image/png" } : await readImageMeta(payload.url);
+        const size = fitNodeSize(meta.width, meta.height);
+        const id = `image-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        setNodes((prev) => [
+            ...prev,
+            {
+                id,
+                type: CanvasNodeType.Image,
+                title: payload.name || "图片",
+                position: { x: position.x - size.width / 2, y: position.y - size.height / 2 },
+                width: size.width,
+                height: size.height,
+                metadata: imageMetadata({ url: payload.url, storageKey: payload.storageKey, width: meta.width, height: meta.height, bytes: 0, mimeType: meta.mimeType }),
+            },
+        ]);
+        setSelectedNodeIds(new Set([id]));
+        setSelectedConnectionId(null);
+    }, []);
+
     const handleDrop = useCallback(
         (event: ReactDragEvent<HTMLDivElement>) => {
             event.preventDefault();
+            // Agent 面板里的图片：拖拽数据里只有 storageKey，落点用鼠标松开处的画布坐标。
+            const stored = event.dataTransfer.getData(CLOUD_AGENT_IMAGE_MIME);
+            if (stored) {
+                try {
+                    const payload = JSON.parse(stored) as { name?: string; url: string; storageKey: string; width?: number; height?: number };
+                    if (payload?.storageKey && payload.url) void createStoredImageNode(payload, screenToCanvas(event.clientX, event.clientY));
+                } catch {
+                    message.error("拖入的图片信息无法识别");
+                }
+                return;
+            }
             const files = Array.from(event.dataTransfer.files).filter(
                 (item) => item.type.startsWith("image/") || item.type.startsWith("video/") || isAudioFile(item),
             );
@@ -2095,7 +2149,7 @@ function InfiniteCanvasPage() {
                 }
             }
         },
-        [createAudioFileNode, createImageFileNode, createVideoFileNode, screenToCanvas],
+        [createAudioFileNode, createImageFileNode, createStoredImageNode, createVideoFileNode, message, screenToCanvas],
     );
 
     const startTitleEditing = useCallback(() => {

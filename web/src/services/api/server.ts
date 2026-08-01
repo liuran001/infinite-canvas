@@ -41,8 +41,10 @@ export type ServerJobInput = {
 export type ServerAgentSessionStatus = "idle" | "running" | "failed";
 export type ServerAgentMessageRole = "user" | "assistant" | "tool";
 export type ServerAgentSession = { id: string; projectId: string; title: string; status: ServerAgentSessionStatus; model: string; error: string; lastSeq: number; createdAt: string; updatedAt: string };
+/** 用户从画布拖进面板的节点引用。只有 ID、类型、标题；storageKey 仅供前端画缩略图，不会进模型上下文。 */
+export type ServerAgentReference = { nodeId: string; type: string; title: string; storageKey?: string };
 /** seq 是会话内自增游标，断线重连按它拉增量；工具消息会先后推「已调用」和「有结果」两次，seq 相同。 */
-export type ServerAgentMessage = { seq: number; role: ServerAgentMessageRole; content: string; toolName: string; toolArgs: string; toolResult: string; createdAt: string };
+export type ServerAgentMessage = { seq: number; role: ServerAgentMessageRole; content: string; toolName: string; toolArgs: string; toolResult: string; attachments: string[]; references: ServerAgentReference[]; createdAt: string };
 export type ServerAgentEvent = { type: "message"; message: ServerAgentMessage } | { type: "status"; status: ServerAgentSessionStatus; error: string };
 /**
  * 生成任务事件流的事件形状。
@@ -179,7 +181,7 @@ export const serverApi = {
     deleteAgentSession: (id: string) => serverRequest<boolean>(`/v1/agent/sessions/${id}`, { method: "DELETE" }, "删除 Agent 会话失败"),
     agentMessages: (id: string, sinceSeq: number) => serverRequest<{ items: ServerAgentMessage[] }>(`/v1/agent/sessions/${id}/messages?sinceSeq=${sinceSeq}`, {}, "读取 Agent 消息失败"),
     /** clientMessageId 是幂等键：断网重发同一个键只会拿回已存在的那条消息，不会重复执行也不会重复扣点。model 是用户在面板上选的模型，留空表示按服务端默认。 */
-    sendAgentMessage: (id: string, body: { clientMessageId: string; content: string; model: string }) => serverRequest<ServerAgentMessage>(`/v1/agent/sessions/${id}/messages`, { method: "POST", ...jsonBody(body) }, "发送消息失败"),
+    sendAgentMessage: (id: string, body: { clientMessageId: string; content: string; model: string; attachmentIds: string[]; references: Array<{ nodeId: string }> }) => serverRequest<ServerAgentMessage>(`/v1/agent/sessions/${id}/messages`, { method: "POST", ...jsonBody(body) }, "发送消息失败"),
     abortAgentSession: (id: string) => serverRequest<ServerAgentSession>(`/v1/agent/sessions/${id}/abort`, { method: "POST" }, "中止 Agent 执行失败"),
 };
 

@@ -1,9 +1,12 @@
 import { nanoid } from "nanoid";
 import { create } from "zustand";
 
+import { buildDraftReference, expandDraftReferences, type CloudAgentDraftReference } from "@/components/agent/cloud-agent-references";
 import { serverAgentStream, serverApi, type ServerAgentEvent, type ServerAgentMessage, type ServerAgentSession, type ServerAgentSessionStatus } from "@/services/api/server";
+import { serverFileIdOf, uploadImage } from "@/services/image-storage";
 import { resolveAgentModel, useConfigStore } from "@/stores/use-config-store";
 import { isServerMode, useServerStore } from "@/stores/use-server-store";
+import type { CanvasNodeData } from "@/types/canvas";
 
 /** 记住上次打开的会话，刷新页面或换设备回来能接回原来那条对话；只是一个会话 ID，放 localStorage 足够。 */
 const SESSION_KEY = "canvas-agent-cloud-session";
@@ -12,13 +15,21 @@ const CANVAS_WRITE_TOOLS = new Set(["create_node", "update_node", "delete_node",
 const RETRY_BASE_MS = 800;
 const RETRY_MAX_MS = 8000;
 const RETRY_LIMIT = 6;
+/** 和服务端 MAX_ATTACHMENTS 对齐：超出的部分服务端会直接拒绝，前端先拦一道省得白传。 */
+const MAX_ATTACHMENTS = 6;
 
 let streamAbort: AbortController | null = null;
 let streamToken = 0;
 /** 已经拉过会话列表的画布；登录态与服务端配置是异步就绪的，就绪前不算绑定成功，之后要补拉一次。 */
 let loadedProjectId = "";
 /** 发送失败时保留幂等键，用户原样重发时复用，服务端就不会把重试当成新消息重复执行、重复扣点。 */
-let pendingSend: { clientMessageId: string; content: string } | null = null;
+let pendingSend: { clientMessageId: string; key: string } | null = null;
+/** 每次拖入都要触发一次插入，即使拖的是同一个节点；用自增序号让输入框认得出「这是新的一次」。 */
+let insertToken = 0;
+
+/** 用户在面板里上传的图片。走的是和素材同一套服务端文件，storageKey 形如 server:<fileId>。 */
+export type CloudAgentAttachment = { id: string; name: string; url: string; storageKey: string; width: number; height: number };
+
 
 function errorText(error: unknown) {
     return error instanceof Error ? error.message : "操作失败";
@@ -57,11 +68,24 @@ type CloudAgentStore = {
     loading: boolean;
     sending: boolean;
     prompt: string;
+    /** 输入框里已经插入的画布节点引用。用户把标签删掉后提交时自然就不算数了，不用额外清理。 */
+    draftReferences: CloudAgentDraftReference[];
+    /** 拖进来的节点要插到输入框的光标处，而不是追加到末尾；输入框自己知道光标在哪，所以这里只发一个信号。 */
+    pendingInsert: { label: string; token: number } | null;
+    /** 画布节点正被拖到面板上方，输入框据此给出可以松手的提示。 */
+    referenceDropActive: boolean;
+    attachments: CloudAgentAttachment[];
+    uploading: boolean;
     /** 服务端改过画布的次数，画布页据此重新拉一次远程画布并刷新到界面上。 */
     canvasReload: number;
     requestCanvasReload: () => void;
     setPrompt: (prompt: string) => void;
     setModel: (model: string) => void;
+    addAttachments: (files: FileList | File[] | null) => Promise<void>;
+    removeAttachment: (id: string) => void;
+    dropReference: (node: CanvasNodeData) => void;
+    consumePendingInsert: () => void;
+    setReferenceDropActive: (active: boolean) => void;
     bindProject: (projectId: string) => void;
     refreshSessions: () => Promise<void>;
     openSession: (sessionId: string) => Promise<void>;
@@ -141,9 +165,52 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         loading: false,
         sending: false,
         prompt: "",
+        draftReferences: [],
+        pendingInsert: null,
+        referenceDropActive: false,
+        attachments: [],
+        uploading: false,
         canvasReload: 0,
         requestCanvasReload: () => set((state) => ({ canvasReload: state.canvasReload + 1 })),
         setPrompt: (prompt) => set({ prompt }),
+
+        /** 走和素材同一条上传链路：图片存在服务端、占用户云空间配额，agent 的工具也能按 storageKey 直接引用到。 */
+        addAttachments: async (files) => {
+            const picked = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
+            if (!picked.length || get().uploading) return;
+            const room = MAX_ATTACHMENTS - get().attachments.length;
+            if (room <= 0) return set({ error: `一条消息最多带 ${MAX_ATTACHMENTS} 张图片` });
+            set({ uploading: true, error: "" });
+            try {
+                const uploaded = await Promise.all(
+                    picked.slice(0, room).map(async (file) => {
+                        const image = await uploadImage(file);
+                        return { id: serverFileIdOf(image.storageKey), name: file.name || "图片", url: image.url, storageKey: image.storageKey, width: image.width, height: image.height };
+                    }),
+                );
+                set((state) => ({ attachments: [...state.attachments, ...uploaded], uploading: false }));
+            } catch (error) {
+                set({ uploading: false, error: errorText(error) });
+            }
+        },
+
+        // 只从草稿里去掉，不删服务端文件：这张图可能已经被拖到画布上建了节点，删了那个节点就成了死链。
+        removeAttachment: (id) => set((state) => ({ attachments: state.attachments.filter((item) => item.id !== id) })),
+
+        /** 画布节点拖进面板：登记引用并请输入框把标签插到光标处。同一个节点重复拖入沿用同一个标签。 */
+        dropReference: (node) => {
+            const draft = get().draftReferences;
+            const reference = buildDraftReference(node, draft);
+            insertToken += 1;
+            set({
+                draftReferences: draft.some((item) => item.nodeId === node.id) ? draft : [...draft, reference],
+                pendingInsert: { label: reference.label, token: insertToken },
+                referenceDropActive: false,
+            });
+        },
+
+        consumePendingInsert: () => set({ pendingInsert: null }),
+        setReferenceDropActive: (referenceDropActive) => set({ referenceDropActive }),
 
         /**
          * 面板上换模型：既改当前会话下一轮要用的模型，也写进用户偏好当作以后新会话的默认。
@@ -163,7 +230,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (get().projectId !== projectId) {
                 detach();
                 loadedProjectId = "";
-                set({ projectId, sessions: [], sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", sending: false });
+                set({ projectId, sessions: [], sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", draftReferences: [], attachments: [], sending: false });
             }
             if (!projectId || loadedProjectId === projectId || !isServerMode() || !useServerStore.getState().settings?.agent.enabled) return;
             loadedProjectId = projectId;
@@ -195,7 +262,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             detach();
             localStorage.removeItem(SESSION_KEY);
             // 模型清空，新会话按用户偏好（没设过就按管理员默认）起头。
-            set({ sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "" });
+            set({ sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", draftReferences: [], attachments: [] });
         },
 
         deleteSession: async (sessionId) => {
@@ -213,11 +280,18 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         },
 
         send: async () => {
-            const content = get().prompt.trim();
-            if (!content || get().sending || get().status === "running" || !get().projectId || !isServerMode()) return;
-            set({ sending: true, error: "", prompt: "" });
-            const clientMessageId = pendingSend?.content === content ? pendingSend.clientMessageId : nanoid();
-            pendingSend = { clientMessageId, content };
+            const draft = get().prompt.trim();
+            const attachments = get().attachments;
+            if ((!draft && !attachments.length) || get().sending || get().status === "running" || !get().projectId || !isServerMode()) return;
+            // 行内标签在这一步才展开成服务端标记：位置与顺序原样保留，用户删掉的标签自然就不算引用了。
+            const { content, references } = expandDraftReferences(draft, get().draftReferences);
+            const attachmentIds = attachments.map((item) => item.id);
+            const draftReferences = get().draftReferences;
+            set({ sending: true, error: "", prompt: "", draftReferences: [], attachments: [] });
+            // 幂等键跟着「正文 + 附件」走：内容没变的重发复用同一个键，服务端不会重复执行、重复扣点。
+            const key = `${content}|${attachmentIds.join(",")}`;
+            const clientMessageId = pendingSend?.key === key ? pendingSend.clientMessageId : nanoid();
+            pendingSend = { clientMessageId, key };
             // 模型在发送这一刻定下来：会话已选的优先，其次用户偏好，最后回落管理员默认。
             const model = resolveAgentModel(get().model);
             try {
@@ -226,7 +300,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
                     localStorage.setItem(SESSION_KEY, sessionId);
                     set({ sessionId, messages: [] });
                 }
-                const message = await serverApi.sendAgentMessage(sessionId, { clientMessageId, content, model });
+                const message = await serverApi.sendAgentMessage(sessionId, { clientMessageId, content, model, attachmentIds, references });
                 pendingSend = null;
                 set((state) => ({ sending: false, status: "running", messages: mergeMessages(state.messages, [message]) }));
                 void attach(sessionId);
@@ -236,8 +310,8 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
                     if (current && get().sessionId === sessionId) set({ model: current.model });
                 });
             } catch (error) {
-                // 发送失败把草稿还回输入框，用户可以直接重发；幂等键留着复用。
-                set((state) => ({ sending: false, error: errorText(error), prompt: state.prompt || content }));
+                // 发送失败把草稿、引用和图片都还回输入框，用户可以直接重发；幂等键留着复用。
+                set((state) => ({ sending: false, error: errorText(error), prompt: state.prompt || draft, draftReferences: state.draftReferences.length ? state.draftReferences : draftReferences, attachments: state.attachments.length ? state.attachments : attachments }));
             }
         },
 

@@ -18,8 +18,8 @@ export type ServerUser = {
     linuxDoBound: boolean;
 };
 
-/** label 是管理员配置的展示名，服务端保证有值（留空时回落成 name），请求仍然用 name。 */
-export type ServerModel = { name: string; label: string; apiFormat: ServerApiFormat; capability: ServerCapability };
+/** label 是管理员配置的展示名，服务端保证有值（留空时回落成 name），请求仍然用 name。vision 表示该模型能不能读图。 */
+export type ServerModel = { name: string; label: string; apiFormat: ServerApiFormat; capability: ServerCapability; vision: boolean };
 
 export type ServerSettings = {
     modelChannel: {

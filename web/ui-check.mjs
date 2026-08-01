@@ -127,7 +127,10 @@ async function main() {
     const modeSwitch = page.getByRole("button", { name: "切换 Agent 模式" });
     if (cloudAgentEnabled) {
         check("默认进入系统模型模式", (await modeSwitch.count()) > 0 && (await modeSwitch.first().innerText()).includes("系统模型"));
-        check("系统模型面板说明按轮计费", (await page.getByText(/按轮计费/).count()) > 0);
+        check("系统模型面板说明按消息计费", (await page.getByText(/每条消息 \d+ 点/).count()) > 0);
+        // 计费口径是「每发一条消息扣一次」，面板上不能再出现按轮计费的说法，否则和实际扣费自相矛盾。
+        check("面板不再出现按轮计费的说法", (await page.getByText(/按轮计费|每轮/).count()) === 0);
+        check("系统模型面板能上传图片", (await page.getByRole("button", { name: "上传图片" }).count()) > 0);
         // 模型现在由用户自己选：选择器要在输入框里，并且显示当前这个会话实际在用的模型（不是「选择模型」占位）。
         const modelPicker = page.getByRole("combobox", { name: "选择系统模型" });
         check("系统模型面板能选模型", (await modelPicker.count()) > 0);
@@ -141,7 +144,7 @@ async function main() {
         await modeSwitch.first().click();
         await page.getByRole("menuitem", { name: /系统模型/ }).click();
         await page.waitForTimeout(800);
-        check("可切回系统模型模式", (await page.getByText(/按轮计费/).count()) > 0);
+        check("可切回系统模型模式", (await page.getByText(/每条消息 \d+ 点/).count()) > 0);
         check("切回来后模型选择器还在", (await page.getByRole("combobox", { name: "选择系统模型" }).count()) > 0);
     } else {
         check("未开放系统模型时只保留本地 Agent", (await modeSwitch.count()) === 0);

@@ -7,6 +7,7 @@ import { useCopyText } from "@/hooks/use-copy-text";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { useAgentStore, type AgentPendingApproval } from "@/stores/use-agent-store";
 import { revealAgentLocalFile } from "./agent-api";
+import { AgentSearchCard, agentSearchResults } from "./agent-search-card";
 
 const streamdownProps = {
     className: "agent-streamdown",
@@ -196,6 +197,9 @@ export function AgentToolCard({ title, text, detail, theme }: { title: string; t
     const kind = String(objectField(detail, "kind") || "");
     if (kind === "reasoning") return <AgentReasoningSummary text={text} detail={detail} theme={theme} />;
     if (kind === "command") return <AgentCommandSummary text={text} detail={detail} theme={theme} />;
+    // 联网搜索结果已经拆成条目，用专门的卡片展示标题链接与来源，不再把整块 JSON 摊给用户。
+    const searchResults = agentSearchResults(detail);
+    if (searchResults.length) return <AgentSearchCard title={title} text={text} results={searchResults} output={String(objectField(detail, "output") || "")} theme={theme} />;
     const state = toolCardState(title, text, detail);
     const view = userDetail(detail);
     const showText = title !== "读取画布" || text !== "已读取当前画布内容";
