@@ -18,7 +18,7 @@ jobRouter.post(
     "/v1/jobs",
     handle(async (req, res) => {
         const body = req.body || {};
-        const job = await createJob(requireUser(req), {
+        const job = await createJob(requireUser(req).id, {
             clientJobId: String(body.clientJobId || ""),
             kind: body.kind === "video" || body.kind === "audio" ? body.kind : "image",
             model: String(body.model || ""),

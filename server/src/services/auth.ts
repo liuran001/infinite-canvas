@@ -89,7 +89,7 @@ export async function register(username: string, password: string) {
     if (!name || !password) throw fail("用户名和密码不能为空");
     const users = repo(User);
     if (await users.findOneBy({ username: name })) throw fail("用户名已存在");
-    const user = await users.save(newUser({ username: name, password: await bcrypt.hash(password, 10) }));
+    const user = await users.save(newUser({ username: name, password: await bcrypt.hash(password, 10), storageQuota: settings.public.storage.defaultQuota }));
     return newSession(user);
 }
 
@@ -136,7 +136,7 @@ export async function saveUser(input: Partial<User>, password: string) {
     const status: UserStatus = input.status || "active";
     const user = saved
         ? { ...saved, username, email: input.email || "", displayName: input.displayName || "", role, status, updatedAt: now() }
-        : newUser({ username, email: input.email || "", displayName: input.displayName || "", role, status });
+        : newUser({ username, email: input.email || "", displayName: input.displayName || "", role, status, storageQuota: (await getSettings()).public.storage.defaultQuota });
     if (password) user.password = await bcrypt.hash(password, 10);
     if (!user.password) throw fail("密码不能为空");
     return { ...(await users.save(user)), password: "" };
@@ -353,7 +353,7 @@ export async function loginWithLinuxDo(req: Request, code: string, state: string
         if (!settings.public.auth.allowRegister) throw Object.assign(fail("当前未开放注册"), { redirect });
         const base = (profile.username || "").trim() || `linuxdo-${linuxDoId}`;
         const username = (await users.findOneBy({ username: base })) ? `${base}-${linuxDoId}` : base;
-        user = newUser({ username, displayName: (profile.name || "").trim(), avatarUrl: linuxDoAvatar(profile.avatar_template || ""), linuxDoId });
+        user = newUser({ username, displayName: (profile.name || "").trim(), avatarUrl: linuxDoAvatar(profile.avatar_template || ""), linuxDoId, storageQuota: settings.public.storage.defaultQuota });
     } else if (user.status === "ban") {
         throw Object.assign(fail("账号已被禁用"), { redirect });
     }

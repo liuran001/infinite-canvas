@@ -13,6 +13,8 @@ export type CreditLogType = "admin_adjust" | "ai_consume" | "ai_refund";
 export type JobKind = "image" | "video" | "audio";
 export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
 export type FileStorage = "local" | "s3";
+export type AgentSessionStatus = "idle" | "running" | "failed";
+export type AgentMessageRole = "user" | "assistant" | "tool";
 
 /** 默认云空间配额 100MB，管理员可按用户单独调整。 */
 export const DEFAULT_STORAGE_QUOTA = 100 << 20;
@@ -216,4 +218,43 @@ export class Job {
     @Column(short) finishedAt!: string;
 }
 
-export const entities = [User, CreditLog, Setting, Prompt, PromptCategory, Asset, StoredFile, Project, UserAsset, UserPlugin, Passkey, Job];
+/**
+ * 画布 Agent 会话，绑定到某个画布项目。sessionId 由客户端生成，
+ * 不同用户之间不保证唯一，所以和画布一样用 (userId, sessionId) 复合主键。
+ * lastSeq 是会话内已分配的最大消息序号，前端靠它做 sinceSeq 增量拉取。
+ */
+@Entity("agent_sessions")
+export class AgentSession {
+    @PrimaryColumn(short) userId!: string;
+    @PrimaryColumn(id) sessionId!: string;
+    @Index() @Column(id) projectId!: string;
+    @Column(short) title!: string;
+    @Column({ type: "varchar", length: 32, default: "idle" }) status!: AgentSessionStatus;
+    @Column(short) model!: string;
+    @Column({ type: "text", nullable: true }) error!: string;
+    @Column({ type: "int", default: 0 }) lastSeq!: number;
+    @Column({ type: "boolean", default: false }) deleted!: boolean;
+    @Column(short) createdAt!: string;
+    @Index() @Column(short) updatedAt!: string;
+}
+
+/**
+ * 会话消息。seq 在会话内单调递增，断线重连时带 sinceSeq 拉增量即可续上，
+ * 所以推理循环每走一步就要落一条，不能攒到最后一次性写。
+ * clientMessageId 是发消息的幂等键，重复提交同一个键不会重复触发执行、不重复计费。
+ */
+@Entity("agent_messages")
+export class AgentMessage {
+    @PrimaryColumn(short) userId!: string;
+    @PrimaryColumn(id) sessionId!: string;
+    @PrimaryColumn({ type: "int" }) seq!: number;
+    @Column({ type: "varchar", length: 32, default: "user" }) role!: AgentMessageRole;
+    @Column({ type: LONG_TEXT, nullable: true }) content!: string;
+    @Column(short) toolName!: string;
+    @Column({ type: LONG_TEXT, nullable: true }) toolArgs!: string;
+    @Column({ type: LONG_TEXT, nullable: true }) toolResult!: string;
+    @Index() @Column(short) clientMessageId!: string;
+    @Column(short) createdAt!: string;
+}
+
+export const entities = [User, CreditLog, Setting, Prompt, PromptCategory, Asset, StoredFile, Project, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage];

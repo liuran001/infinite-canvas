@@ -4,7 +4,6 @@ import { config } from "../config";
 import { repo } from "../db/data-source";
 import { Job, StoredFile, type JobKind, type JobStatus } from "../db/entities";
 import { fail, newId, now, SafeError } from "../lib/errors";
-import type { AuthUser } from "./auth";
 import { consumeUserCredits, refundUserCredits } from "./auth";
 import { listFiles, publicFileUrl, saveFile, saveFileFromUrl } from "./files";
 import { createVideoTask, fileToDataUrl, generateAudio, generateImages, pollVideoTask, type GenerationParams } from "./generation";
@@ -68,10 +67,10 @@ export async function toJobView(job: Job): Promise<JobView> {
  * clientJobId 是幂等键：同一用户重复提交同一个键只会命中已有任务。
  * 客户端断网重试、页面刷新后重发都不会造成重复生成或重复扣费。
  */
-export async function createJob(user: AuthUser, input: JobInput) {
+export async function createJob(userId: string, input: JobInput) {
     const clientJobId = input.clientJobId.trim();
     if (!clientJobId) throw fail("缺少任务幂等键");
-    const existing = await jobs().findOneBy({ userId: user.id, clientJobId });
+    const existing = await jobs().findOneBy({ userId, clientJobId });
     if (existing) return existing;
 
     const model = input.model.trim();
@@ -81,7 +80,7 @@ export async function createJob(user: AuthUser, input: JobInput) {
 
     const job = await jobs().save({
         id: newId("job"),
-        userId: user.id,
+        userId,
         clientJobId,
         kind: input.kind,
         status: "pending",

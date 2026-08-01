@@ -144,12 +144,51 @@ check "其他分类筛不出结果" "$(curl -s --get "$BASE/prompts" --data-urle
 
 echo "生成任务成功路径"
 # 起一个假的 OpenAI 兼容上游，返回一张 1x1 PNG，端到端验证「提交 → 执行 → 落文件 → 回读」。
+# 同时兼作 agent 的假模型：/chat/completions 与 :generateContent 会真的返回工具调用，
+# 这样工具调用循环、落库、SSE、断线续传都能被真正跑到，而不是只测 HTTP 状态码。
 cat >"$WORK/upstream.js" <<'EOF'
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+// agent 的每轮回复慢一点，冒烟脚本才有机会在循环跑到一半时把 SSE 掐掉。
+const AGENT_DELAY_MS = 1200;
+let lastTools = [];
+
+function toolCall(messages) {
+    const lastUser = [...messages].reverse().find((item) => item.role === "user");
+    const wantsImage = String(lastUser && lastUser.content || "").includes("生成图片");
+    return wantsImage
+        ? { name: "generate_image", args: { prompt: "一只猫" } }
+        : { name: "create_node", args: { type: "text", title: "冒烟节点", content: "由 agent 创建" } };
+}
+
 require("http").createServer((req, res) => {
-    req.resume();
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
         res.setHeader("Content-Type", "application/json");
+        if (req.url === "/_tools") return res.end(JSON.stringify({ tools: lastTools }));
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+
+        if (req.url.includes("/chat/completions")) {
+            lastTools = (body.tools || []).map((item) => item.function.name);
+            const messages = body.messages || [];
+            const done = messages[messages.length - 1].role === "tool";
+            const call = toolCall(messages);
+            const message = done
+                ? { role: "assistant", content: "已经按你的要求改好画布了。" }
+                : { role: "assistant", content: null, tool_calls: [{ id: "call_x", type: "function", function: { name: call.name, arguments: JSON.stringify(call.args) } }] };
+            return setTimeout(() => res.end(JSON.stringify({ choices: [{ message }] })), AGENT_DELAY_MS);
+        }
+
+        if (req.url.includes(":generateContent")) {
+            lastTools = ((body.tools || [])[0] || { functionDeclarations: [] }).functionDeclarations.map((item) => item.name);
+            const contents = body.contents || [];
+            const done = Boolean((contents[contents.length - 1].parts || [])[0].functionResponse);
+            const messages = contents.map((item) => ({ role: item.role === "model" ? "assistant" : "user", content: (item.parts[0] || {}).text || "" }));
+            const call = toolCall(messages);
+            const parts = done ? [{ text: "已经按你的要求改好画布了。" }] : [{ functionCall: { name: call.name, args: call.args } }];
+            return setTimeout(() => res.end(JSON.stringify({ candidates: [{ content: { parts } }] })), AGENT_DELAY_MS);
+        }
+
         res.end(JSON.stringify({ data: [{ b64_json: PNG }] }));
     });
 }).listen(Number(process.argv[2]), "127.0.0.1");
@@ -350,6 +389,146 @@ check "被拒绝后 Passkey 仍在" "$(curl -s "$BASE/auth/passkeys" -H "Authori
 curl -s -X POST "$BASE/auth/password" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"oldPassword":"","newPassword":"tester-pass-3"}' >/dev/null
 check "设好密码后可以删除最后一个 Passkey" "$(curl -s -X DELETE "$BASE/auth/passkeys/passkey-smoke" -H "Authorization: Bearer $USER_TOKEN" | jq -r .code)" "0"
 check "删除后列表为空" "$(curl -s "$BASE/auth/passkeys" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data | length')" "0"
+
+echo "画布 Agent"
+AGENT_CHANNELS='[
+  { "apiFormat": "openai", "name": "本地假上游", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-image", "capability": "image" }, { "name": "mock-text", "capability": "text" }], "weight": 1, "enabled": true },
+  { "apiFormat": "gemini", "name": "本地假 Gemini", "baseUrl": "http://127.0.0.1:'"$UPSTREAM_PORT"'", "apiKey": "sk-test", "models": [{ "name": "mock-gemini-text", "capability": "text" }], "weight": 1, "enabled": true }
+]'
+AGENT_COSTS='[{ "model": "mock-text", "credits": 1 }, { "model": "mock-gemini-text", "credits": 1 }, { "model": "mock-image", "credits": 1 }]'
+agent_settings() {
+    curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{
+      "private": { "channels": '"$AGENT_CHANNELS"', "search": '"$1"' },
+      "public": {
+        "modelChannel": { "defaultTextModel": "mock-text", "defaultImageModel": "mock-image", "modelCosts": '"$AGENT_COSTS"' },
+        "agent": { "enabled": true, "model": '"$2"', "maxRounds": 5 }
+      }
+    }' >/dev/null
+}
+agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '""'
+curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
+
+check "Agent 开关下发给前端" "$(curl -s "$BASE/settings" | jq -r .data.agent.enabled)" "true"
+check "最大轮数下发给前端" "$(curl -s "$BASE/settings" | jq -r .data.agent.maxRounds)" "5"
+check "没配搜索密钥时联网搜索关闭" "$(curl -s "$BASE/settings" | jq -r .data.agent.searchEnabled)" "false"
+check "搜索密钥不会下发给前端" "$(curl -s "$BASE/settings" | jq -r '.data.agent.apiKey // "none"')" "none"
+check "后台读取时搜索密钥被脱敏" "$(curl -s "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.private.search.apiKey')" ""
+check "未登录访问会话列表返回 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/agent/sessions")" "401"
+
+curl -s -X PUT "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"Agent 画布","data":{"nodes":[],"connections":[]}}' >/dev/null
+check "会话必须绑定存在的画布" "$(curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"projectId":"不存在的画布"}' | jq -r .msg)" "画布项目不存在"
+SESSION=$(curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"projectId":"agent-p1","title":"冒烟会话"}' | jq -r .data.id)
+check "创建会话成功" "$([ -n "$SESSION" ] && [ "$SESSION" != "null" ] && echo yes || echo no)" "yes"
+check "会话用的是系统配置的文本模型" "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.model)" "mock-text"
+check "按画布筛选会话生效" "$(curl -s "$BASE/v1/agent/sessions?projectId=agent-p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items | length')" "1"
+check "换个画布筛不出会话" "$(curl -s "$BASE/v1/agent/sessions?projectId=agent-p9" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items | length')" "0"
+check "他人无法读取该会话" "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .msg)" "会话不存在"
+
+# 发消息只负责入库并触发后台执行，接口立刻返回，循环在服务端继续跑。
+check "发消息要带幂等键" "$(curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"content":"x"}' | jq -r .msg)" "缺少消息幂等键"
+FIRST_SEQ=$(curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m1","content":"在画布上加一个文本节点"}' | jq -r .data.seq)
+check "用户消息落库并拿到序号" "$FIRST_SEQ" "1"
+check "同一幂等键不会重复建消息" "$(curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m1","content":"在画布上加一个文本节点"}' | jq -r .data.seq)" "1"
+check "执行期间会话状态为 running" "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" "running"
+
+for _ in $(seq 1 40); do
+    [ "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" = "idle" ] && break
+    sleep 1
+done
+AGENT_MSGS=$(curl -s "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN")
+check "循环跑完后回到 idle" "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" "idle"
+check "工具调用被真正执行" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[] | select(.role=="tool")][0].toolName')" "create_node"
+check "工具结果落库" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[] | select(.role=="tool")][0].toolResult | fromjson | .ok')" "true"
+check "模型最终回复落库" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[] | select(.role=="assistant")][-1].content')" "已经按你的要求改好画布了。"
+check "工具列表里没有 web_search" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="web_search")] | length')" "0"
+check "工具列表里有画布读写工具" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_canvas" or .=="create_node" or .=="connect_nodes")] | length')" "3"
+
+# 工具直接改的是服务端画布，revision 递增后前端现有的增量同步就能拉到。
+AGENT_PROJECT=$(curl -s "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN")
+check "工具真的改到了服务端画布" "$(echo "$AGENT_PROJECT" | jq -r '.data.data.nodes | length')" "1"
+check "画布 revision 递增可被前端拉到" "$([ "$(echo "$AGENT_PROJECT" | jq -r .data.revision)" -gt 1 ] && echo yes || echo no)" "yes"
+check "节点结构与前端约定一致" "$(echo "$AGENT_PROJECT" | jq -r '.data.data.nodes[0] | "\(.type)/\(.title)/\(.position.x)/\(.width)/\(.metadata.content)"')" "text/冒烟节点/80/340/由 agent 创建"
+check "每轮模型调用都扣算力点" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="调用模型 mock-text")] | length')" "2"
+
+# 断线增量拉取：带上最后看到的 seq 只返回后续消息。
+LAST_SEQ=$(echo "$AGENT_MSGS" | jq -r '.data.items[-1].seq')
+check "sinceSeq 只返回增量" "$(curl -s "$BASE/v1/agent/sessions/$SESSION/messages?sinceSeq=1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items[0].seq')" "2"
+check "sinceSeq 追平后没有增量" "$(curl -s "$BASE/v1/agent/sessions/$SESSION/messages?sinceSeq=$LAST_SEQ" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items | length')" "0"
+check "重连拉全量能拿回完整会话" "$(curl -s "$BASE/v1/agent/sessions/$SESSION/messages?sinceSeq=0" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items | length')" "$LAST_SEQ"
+
+# SSE 断开不能中断服务端循环：订阅上以后立刻掐断连接，循环仍要跑完并把结果落库。
+curl -s -N --max-time 2 "$BASE/v1/agent/sessions/$SESSION/stream?sinceSeq=$LAST_SEQ" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/sse.txt" &
+SSE_PID=$!
+sleep 0.5
+curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m2","content":"再加一个文本节点"}' >/dev/null
+wait "$SSE_PID" 2>/dev/null
+check "SSE 推送了会话状态" "$(grep -c '"type":"status"' "$WORK/sse.txt")" "2"
+check "SSE 推送了新消息" "$([ "$(grep -c '"type":"message"' "$WORK/sse.txt")" -gt 0 ] && echo yes || echo no)" "yes"
+check "SSE 断开时循环还没跑完" "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" "running"
+for _ in $(seq 1 40); do
+    [ "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" = "idle" ] && break
+    sleep 1
+done
+RESUMED=$(curl -s "$BASE/v1/agent/sessions/$SESSION/messages?sinceSeq=$LAST_SEQ" -H "Authorization: Bearer $USER_TOKEN")
+check "SSE 断开后循环仍跑完" "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" "idle"
+check "断线期间的进度可用 sinceSeq 补齐" "$(echo "$RESUMED" | jq -r '[.data.items[] | select(.role=="tool")] | length')" "1"
+check "断线期间的画布改动也已落库" "$(curl -s "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.data.nodes | length')" "2"
+
+# 生图工具复用现有任务队列，照常扣算力点、占云空间、落到用户文件里。
+curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m3","content":"帮我生成图片"}' >/dev/null
+for _ in $(seq 1 60); do
+    [ "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" = "idle" ] && break
+    sleep 1
+done
+IMAGE_NODE=$(curl -s "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.data.nodes[] | select(.type=="image")][0]')
+check "生图工具在画布上建了图片节点" "$(echo "$IMAGE_NODE" | jq -r .type)" "image"
+check "图片节点引用服务端文件" "$(echo "$IMAGE_NODE" | jq -r '.metadata.storageKey | startswith("server:")')" "true"
+check "生图走的是现有任务队列" "$(curl -s "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.items[] | select(.context.source=="agent" and .status=="succeeded")] | length')" "1"
+check "生图照常计费" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="调用模型 mock-image")] | length')" "3"
+
+# 换 Gemini 格式的渠道，同一套工具循环要照样跑通。
+agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 5 }' '"mock-gemini-text"'
+GEMINI_SESSION=$(curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"projectId":"agent-p1","title":"Gemini 会话"}' | jq -r .data.id)
+curl -s -X POST "$BASE/v1/agent/sessions/$GEMINI_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"gemini-m1","content":"在画布上加一个文本节点"}' >/dev/null
+for _ in $(seq 1 40); do
+    [ "$(curl -s "$BASE/v1/agent/sessions/$GEMINI_SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" = "idle" ] && break
+    sleep 1
+done
+GEMINI_MSGS=$(curl -s "$BASE/v1/agent/sessions/$GEMINI_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN")
+check "管理员指定的 Agent 专用模型生效" "$(curl -s "$BASE/v1/agent/sessions/$GEMINI_SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.model)" "mock-gemini-text"
+check "Gemini 格式的工具调用也能跑通" "$(echo "$GEMINI_MSGS" | jq -r '[.data.items[] | select(.role=="tool")][0].toolName')" "create_node"
+check "Gemini 格式能拿到最终回复" "$(echo "$GEMINI_MSGS" | jq -r '[.data.items[] | select(.role=="assistant")][-1].content')" "已经按你的要求改好画布了。"
+
+# 配上搜索密钥后才把 web_search 交给模型，没配时既不报错也不下发。
+agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "exa-test-key", "maxResults": 3 }' '""'
+check "配了密钥后联网搜索开启" "$(curl -s "$BASE/settings" | jq -r .data.agent.searchEnabled)" "true"
+SEARCH_SESSION=$(curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"projectId":"agent-p1","title":"搜索会话"}' | jq -r .data.id)
+curl -s -X POST "$BASE/v1/agent/sessions/$SEARCH_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"search-m1","content":"在画布上加一个文本节点"}' >/dev/null
+for _ in $(seq 1 40); do
+    [ "$(curl -s "$BASE/v1/agent/sessions/$SEARCH_SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" = "idle" ] && break
+    sleep 1
+done
+check "配了密钥后才把 web_search 下发给模型" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="web_search")] | length')" "1"
+# 留空表示保持不变，别把已配好的密钥洗掉。
+agent_settings '{ "enabled": true, "provider": "exa", "apiKey": "", "maxResults": 3 }' '""'
+check "留空保存不会清掉搜索密钥" "$(curl -s "$BASE/settings" | jq -r .data.agent.searchEnabled)" "true"
+agent_settings '{ "enabled": false, "provider": "exa", "apiKey": "", "maxResults": 3 }' '""'
+check "关掉开关后联网搜索不可用" "$(curl -s "$BASE/settings" | jq -r .data.agent.searchEnabled)" "false"
+
+# 中止正在跑的会话：循环停下，状态回到 idle，不留下卡住的 running。
+curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m4","content":"再加一个文本节点"}' >/dev/null
+check "执行中不允许并发发消息" "$(curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m5","content":"插队"}' | jq -r .msg)" "当前会话正在执行中，请等待完成或先中止"
+curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/abort" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
+for _ in $(seq 1 20); do
+    [ "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" != "running" ] && break
+    sleep 1
+done
+check "中止后会话不再是 running" "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" "idle"
+check "中止会留下可见的提示消息" "$(curl -s "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items[-1].content')" "已中止本次执行。"
+
+curl -s -X DELETE "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
+check "删除后会话不再列出" "$(curl -s "$BASE/v1/agent/sessions?projectId=agent-p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.items[] | select(.id=="'"$SESSION"'")] | length')" "0"
+check "删除后拉消息被拒绝" "$(curl -s "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" | jq -r .msg)" "会话不存在"
 
 echo
 printf '通过 %d 项，失败 %d 项\n' "$PASS" "$FAIL"

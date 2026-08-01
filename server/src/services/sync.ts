@@ -9,6 +9,11 @@ export type ProjectInput = { id: string; title: string; data: unknown; revision?
 export type UserAssetInput = { id: string; kind: string; title: string; data: unknown; revision?: number };
 export type UserPluginInput = { id: string; data: unknown; revision?: number };
 
+/** 与 web/src/types/canvas.ts 对齐，只声明服务端会读写的字段，其余画布字段原样保留。 */
+export type CanvasNodeData = { id: string; type: string; title: string; position: { x: number; y: number }; width: number; height: number; metadata?: Record<string, unknown> };
+export type CanvasConnectionData = { id: string; fromNodeId: string; toNodeId: string };
+export type CanvasProjectData = { nodes: CanvasNodeData[]; connections: CanvasConnectionData[] } & Record<string, unknown>;
+
 const MAX_SYNC_ITEMS = 500;
 
 function parseData(value: string) {
@@ -73,6 +78,33 @@ export async function deleteProject(userId: string, id: string) {
     if (!saved) return;
     await projects.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() });
     await releaseFiles(userId, saved.data);
+}
+
+function toCanvasData(value: string): CanvasProjectData {
+    const data = (parseData(value) || {}) as Partial<CanvasProjectData>;
+    return { ...data, nodes: Array.isArray(data.nodes) ? data.nodes : [], connections: Array.isArray(data.connections) ? data.connections : [] };
+}
+
+export async function readProjectCanvas(userId: string, id: string) {
+    const row = await repo(Project).findOneBy({ userId, projectId: id });
+    if (!row || row.deleted) throw fail("画布项目不存在");
+    return { title: row.title, revision: row.revision, data: toCanvasData(row.data) };
+}
+
+/**
+ * 服务端直接改画布（Agent 工具用）：读出当前数据就地修改再写回。
+ * 这里不做乐观锁校验——服务端读到的就是最新版本，但 revision 照常递增，
+ * 前端现有的增量同步才能拉到这次变更，客户端的过期写入也会被原有乐观锁挡下。
+ */
+export async function updateProjectCanvas<T>(userId: string, id: string, mutate: (data: CanvasProjectData) => T): Promise<T> {
+    const projects = repo(Project);
+    const saved = await projects.findOneBy({ userId, projectId: id });
+    if (!saved || saved.deleted) throw fail("画布项目不存在");
+    const data = toCanvasData(saved.data);
+    const result = mutate(data);
+    data.updatedAt = now();
+    await projects.save({ ...saved, data: JSON.stringify(data), revision: saved.revision + 1, updatedAt: now() });
+    return result;
 }
 
 export async function listUserAssets(userId: string, since: string) {

@@ -1,6 +1,6 @@
 import { config } from "../config";
 import { repo } from "../db/data-source";
-import { Setting } from "../db/entities";
+import { DEFAULT_STORAGE_QUOTA, Setting } from "../db/entities";
 import { fail, now } from "../lib/errors";
 
 export type ApiFormat = "openai" | "gemini" | "ark";
@@ -34,6 +34,8 @@ export type ModelChannel = {
 /** 前端在服务器模式下靠 apiFormat 决定文本请求走哪条代理，靠 capability 过滤模型选择器。 */
 export type PublicModel = { name: string; label: string; apiFormat: ApiFormat; capability: ModelCapability };
 
+export type SearchProviderName = "exa";
+
 export type PublicSetting = {
     modelChannel: {
         models: PublicModel[];
@@ -47,15 +49,24 @@ export type PublicSetting = {
         allowCustomChannel: boolean;
     };
     auth: { allowRegister: boolean; linuxDo: { enabled: boolean } };
-    storage: { remoteEnabled: boolean };
+    /** defaultQuota 是新账号的云空间上限（字节），已有账号不受影响。 */
+    storage: { remoteEnabled: boolean; defaultQuota: number };
     /** 各类功能入口的总开关。配了模型也可以先不对外开放，关掉后所有用户都看不到对应入口。 */
     capabilities: Record<ModelCapability, boolean>;
+    /**
+     * 画布 Agent。model 留空表示用 defaultTextModel；
+     * searchEnabled 由「开关 + 是否配了 key」推导，前端据此决定要不要展示联网搜索能力，
+     * 没配 key 时后端也不会把 web_search 工具下发给模型。
+     */
+    agent: { enabled: boolean; model: string; maxRounds: number; searchEnabled: boolean };
 };
 
 export type PrivateSetting = {
     channels: ModelChannel[];
     promptSync: { enabled: boolean; cron: string };
     auth: { linuxDo: { clientId: string; clientSecret: string } };
+    /** 联网搜索配置，只有管理员能看，apiKey 与渠道密钥一样读取时脱敏、留空表示保持不变。 */
+    search: { enabled: boolean; provider: SearchProviderName; apiKey: string; maxResults: number };
 };
 
 export type Settings = { public: PublicSetting; private: PrivateSetting };
@@ -119,14 +130,20 @@ function normalizePrivate(setting: Partial<PrivateSetting> | undefined): Private
         channels: (setting?.channels || []).map(normalizeChannel),
         promptSync: { enabled: setting?.promptSync?.enabled !== false, cron: setting?.promptSync?.cron?.trim() || "0 4 * * *" },
         auth: { linuxDo: { clientId: setting?.auth?.linuxDo?.clientId?.trim() || "", clientSecret: setting?.auth?.linuxDo?.clientSecret || "" } },
+        search: {
+            enabled: setting?.search?.enabled !== false,
+            provider: "exa",
+            apiKey: setting?.search?.apiKey || "",
+            maxResults: Math.min(20, Math.max(1, Number(setting?.search?.maxResults) || 5)),
+        },
     };
 }
 
-function normalizePublic(setting: Partial<PublicSetting> | undefined, channels: ModelChannel[]): PublicSetting {
+function normalizePublic(setting: Partial<PublicSetting> | undefined, privateSetting: PrivateSetting): PublicSetting {
     const channel = setting?.modelChannel;
     const seen = new Set<string>();
     const models: PublicModel[] = [];
-    for (const item of channels.filter((entry) => entry.enabled)) {
+    for (const item of privateSetting.channels.filter((entry) => entry.enabled)) {
         for (const model of item.models) {
             if (seen.has(model.name)) continue;
             seen.add(model.name);
@@ -155,19 +172,29 @@ function normalizePublic(setting: Partial<PublicSetting> | undefined, channels: 
             allowRegister: setting?.auth?.allowRegister !== false,
             linuxDo: { enabled: Boolean(setting?.auth?.linuxDo?.enabled) },
         },
-        storage: { remoteEnabled: setting?.storage?.remoteEnabled !== false },
+        storage: {
+            remoteEnabled: setting?.storage?.remoteEnabled !== false,
+            defaultQuota: Math.max(0, Number(setting?.storage?.defaultQuota) || DEFAULT_STORAGE_QUOTA),
+        },
         capabilities: {
             image: setting?.capabilities?.image !== false,
             text: setting?.capabilities?.text !== false,
             video: setting?.capabilities?.video !== false,
             audio: setting?.capabilities?.audio !== false,
         },
+        agent: {
+            enabled: setting?.agent?.enabled !== false,
+            // 只认 text 能力的模型，否则会把生图模型误当成 agent 主模型。
+            model: models.some((model) => model.name === setting?.agent?.model && model.capability === "text") ? String(setting?.agent?.model).trim() : "",
+            maxRounds: Math.min(50, Math.max(1, Number(setting?.agent?.maxRounds) || 25)),
+            searchEnabled: privateSetting.search.enabled && Boolean(privateSetting.search.apiKey.trim()),
+        },
     };
 }
 
 function normalizeSettings(settings: Partial<Settings>): Settings {
     const privateSetting = normalizePrivate(settings.private);
-    return { private: privateSetting, public: normalizePublic(settings.public, privateSetting.channels) };
+    return { private: privateSetting, public: normalizePublic(settings.public, privateSetting) };
 }
 
 async function readSettings(): Promise<Settings> {
@@ -200,6 +227,7 @@ function hideSecrets(settings: Settings): Settings {
             ...settings.private,
             channels: settings.private.channels.map((channel) => ({ ...channel, apiKey: "" })),
             auth: { linuxDo: { ...settings.private.auth.linuxDo, clientSecret: "" } },
+            search: { ...settings.private.search, apiKey: "" },
         },
     };
 }
@@ -216,12 +244,18 @@ function keepSecrets(next: Settings, saved: Settings): Settings {
         return { ...channel, apiKey: matched?.apiKey || "" };
     });
     const clientSecret = next.private.auth.linuxDo.clientSecret.trim() || saved.private.auth.linuxDo.clientSecret;
-    return { public: next.public, private: { ...next.private, channels, auth: { linuxDo: { ...next.private.auth.linuxDo, clientSecret } } } };
+    const searchApiKey = next.private.search.apiKey.trim() || saved.private.search.apiKey;
+    return {
+        public: next.public,
+        private: { ...next.private, channels, auth: { linuxDo: { ...next.private.auth.linuxDo, clientSecret } }, search: { ...next.private.search, apiKey: searchApiKey } },
+    };
 }
 
 export async function saveSettings(input: Partial<Settings>) {
     const saved = await readSettings();
-    const merged = keepSecrets(normalizeSettings(input), saved);
+    // 补回「留空表示不变」的密钥后要再归一化一次：
+    // agent.searchEnabled 是从搜索 key 推导出来的，先补 key 再算才不会被误判成未配置。
+    const merged = normalizeSettings(keepSecrets(normalizeSettings(input), saved));
     const table = repo(Setting);
     await table.save([
         { key: "public", value: JSON.stringify(merged.public), updatedAt: now() },

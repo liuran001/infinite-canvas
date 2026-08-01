@@ -6,6 +6,7 @@ import { config } from "./config";
 import { errorJson, notFoundJson, ok } from "./lib/response";
 import { adminRouter } from "./routes/admin";
 import { adminReviewRouter } from "./routes/admin-review";
+import { agentRouter } from "./routes/agent";
 import { aiRouter } from "./routes/ai";
 import { adminUserRouter, authRouter } from "./routes/auth";
 import { fileRouter } from "./routes/files";
@@ -40,6 +41,7 @@ export function createApp() {
     api.use(jobRouter);
     api.use(syncRouter);
     api.use(aiRouter);
+    api.use(agentRouter);
     api.use("/admin", adminUserRouter);
     api.use("/admin", adminRouter);
     api.use("/admin", adminReviewRouter);
