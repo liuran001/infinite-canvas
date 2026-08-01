@@ -2,8 +2,15 @@ name: Docker image
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+
+# 连续推送时只保留最新一次构建：并行跑的话完成顺序没有保证，
+# 先推的后完成就会把 latest 覆盖回旧代码。tag 构建单独成组，不被 main 的推送打断。
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 permissions:
   contents: read
