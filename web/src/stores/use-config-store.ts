@@ -19,6 +19,18 @@ export type AiConfig = {
     audioModel: string;
     /** 云端 Agent 的默认模型，新会话用它；留空表示跟随管理员配置的全站默认。 */
     agentModel: string;
+    /**
+     * Agent 调生成工具时的默认参数。模型自己一般只想得起提示词，其余参数不传，
+     * 服务端就按这里配的补齐，用户在偏好里定一次，agent 生的图就一直是他要的规格。
+     * 和上面的 imageModel / quality 等分开存：那几项是工作台与画布节点手动生成用的，
+     * 一份配置两处用会互相打架（工作台常调参数，agent 的默认应当稳定）。
+     */
+    agentImageModel: string;
+    agentImageSize: string;
+    agentImageQuality: string;
+    agentImageCount: string;
+    agentImageBackground: string;
+    agentTextModel: string;
     audioVoice: string;
     audioFormat: string;
     audioSpeed: string;
@@ -47,6 +59,13 @@ export const defaultConfig: AiConfig = {
     textModel: "",
     audioModel: "",
     agentModel: "",
+    // 生成参数一律留空 / auto，表示「跟随服务端默认」；用户没设过就不该替他定死规格。
+    agentImageModel: "",
+    agentImageSize: "auto",
+    agentImageQuality: "auto",
+    agentImageCount: "1",
+    agentImageBackground: "",
+    agentTextModel: "",
     audioVoice: "alloy",
     audioFormat: "mp3",
     audioSpeed: "1",

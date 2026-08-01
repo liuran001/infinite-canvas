@@ -1,5 +1,6 @@
 import { App, Button, Form, Input, Modal, Select } from "antd";
 
+import { imageAspectOptions, imageQualityOptions } from "@/components/image-settings-panel";
 import { ModelPicker } from "@/components/model-picker";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
 import { useConfigStore, useEnabledCapabilities, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
@@ -21,6 +22,12 @@ const modelGroups: ModelGroup[] = [
 function normalizeImageCount(value: string) {
     return String(Math.max(1, Math.min(15, Math.floor(Number(value) || 1))));
 }
+
+/** 透明背景在生图里是个开关，但这里和其它偏好一样用下拉，免得一排下拉里夹一个开关显得突兀。 */
+const agentBackgroundOptions = [
+    { value: "", label: "默认背景" },
+    { value: "transparent", label: "透明背景" },
+];
 
 export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: boolean }) {
     const config = useConfigStore((state) => state.config);
@@ -56,8 +63,49 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
                     <div className="mb-4 rounded-lg border border-stone-200 p-3 text-xs text-stone-500 dark:border-stone-800">服务端还没有配置可用模型，请联系管理员在管理后台添加模型渠道。</div>
                 )}
 
-                <div className="mb-2 text-sm font-semibold">生成偏好</div>
-                <div className="grid gap-4 md:grid-cols-4">
+                {/*
+                 * Agent 自己调生成工具时用的默认参数。模型多半只想得起写提示词，尺寸、画质、张数一概不传，
+                 * 不给默认就只能吃服务端的通用值；在这里配一次，agent 生出来的图才一直是用户要的规格。
+                 */}
+                {agentEnabled ? (
+                    <>
+                        <div className="mb-2 text-sm font-semibold">Agent 生成默认设置</div>
+                        <div className="mb-1 text-xs text-stone-500">「系统模型」调用生成工具时，模型自己没指定的参数按这里补齐；和上面的工作台默认分开，互不影响。</div>
+                        <div className="mb-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                            {capabilities.image ? (
+                                <>
+                                    <Form.Item label="Agent 默认生图模型" className="mb-0">
+                                        <ModelPicker config={config} value={config.agentImageModel} onChange={(model) => updateConfig("agentImageModel", model)} capability="image" ariaLabel="选择 Agent 默认生图模型" fullWidth />
+                                    </Form.Item>
+                                    <Form.Item label="Agent 默认生图尺寸" className="mb-0">
+                                        <Select value={config.agentImageSize} options={imageAspectOptions} onChange={(value) => updateConfig("agentImageSize", value)} />
+                                    </Form.Item>
+                                    <Form.Item label="Agent 默认生图画质" className="mb-0">
+                                        <Select value={config.agentImageQuality} options={imageQualityOptions} onChange={(value) => updateConfig("agentImageQuality", value)} />
+                                    </Form.Item>
+                                    <Form.Item label="Agent 默认生图张数" className="mb-0">
+                                        <Input
+                                            type="number"
+                                            min={1}
+                                            max={15}
+                                            value={config.agentImageCount}
+                                            onChange={(event) => updateConfig("agentImageCount", event.target.value)}
+                                            onBlur={(event) => updateConfig("agentImageCount", normalizeImageCount(event.target.value))}
+                                        />
+                                    </Form.Item>
+                                    <Form.Item label="Agent 默认生图背景" className="mb-0">
+                                        <Select value={config.agentImageBackground} options={agentBackgroundOptions} onChange={(value) => updateConfig("agentImageBackground", value)} />
+                                    </Form.Item>
+                                </>
+                            ) : null}
+                            <Form.Item label="Agent 默认生文模型" extra="Agent 生成文本内容时使用，留空跟随管理员配置。" className="mb-0">
+                                <ModelPicker config={config} value={config.agentTextModel} onChange={(model) => updateConfig("agentTextModel", model)} capability="text" ariaLabel="选择 Agent 默认生文模型" fullWidth />
+                            </Form.Item>
+                        </div>
+                    </>
+                ) : null}
+
+                <div className="mb-2 text-sm font-semibold">生成偏好</div>                <div className="grid gap-4 md:grid-cols-4">
                     {capabilities.image ? (
                         <Form.Item label="画布默认生图张数" extra="新建画布生图和配置节点默认使用，单个节点仍可单独覆盖。" className="mb-4">
                             <Input

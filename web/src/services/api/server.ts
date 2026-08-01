@@ -38,14 +38,22 @@ export type ServerJobInput = {
     context?: Record<string, unknown>;
 };
 
-export type ServerAgentSessionStatus = "idle" | "running" | "failed";
+/** awaiting 表示服务端跑到一半停下来等用户点头，此时循环没结束，也不能再发新消息。 */
+export type ServerAgentSessionStatus = "idle" | "running" | "awaiting" | "failed";
 export type ServerAgentMessageRole = "user" | "assistant" | "tool";
-export type ServerAgentSession = { id: string; projectId: string; title: string; status: ServerAgentSessionStatus; model: string; error: string; lastSeq: number; createdAt: string; updatedAt: string };
+/**
+ * 待用户确认的请求。做成一个带 type 的联合而不是给每种情况各加字段：
+ * 两种请求的交互完全一样（暂停 → 确认卡片 → 批准或拒绝走同一个接口），前端只按 type 换文案。
+ */
+export type ServerAgentPendingAction = { type: "continue"; roundsUsed: number; credits: number } | { type: "rename_canvas"; title: string; reason: string };
+/** pendingAction 跟着会话行走，刷新页面或换设备重新拉一次会话仍然看得到那条待确认请求。 */
+export type ServerAgentSession = { id: string; projectId: string; title: string; status: ServerAgentSessionStatus; model: string; error: string; lastSeq: number; pendingAction?: ServerAgentPendingAction | null; createdAt: string; updatedAt: string };
 /** 用户从画布拖进面板的节点引用。只有 ID、类型、标题；storageKey 仅供前端画缩略图，不会进模型上下文。 */
 export type ServerAgentReference = { nodeId: string; type: string; title: string; storageKey?: string };
 /** seq 是会话内自增游标，断线重连按它拉增量；工具消息会先后推「已调用」和「有结果」两次，seq 相同。 */
 export type ServerAgentMessage = { seq: number; role: ServerAgentMessageRole; content: string; toolName: string; toolArgs: string; toolResult: string; attachments: string[]; references: ServerAgentReference[]; createdAt: string };
-export type ServerAgentEvent = { type: "message"; message: ServerAgentMessage } | { type: "status"; status: ServerAgentSessionStatus; error: string };
+/** status 事件顺带把标题与待确认请求一起推出来：这两样执行过程中都会变，前端不必为它们再拉一次会话。 */
+export type ServerAgentEvent = { type: "message"; message: ServerAgentMessage } | { type: "status"; status: ServerAgentSessionStatus; error: string; title?: string; pendingAction?: ServerAgentPendingAction | null };
 /**
  * 生成任务事件流的事件形状。
  * `job` 是任务快照，seq 是该用户内单调递增的变更序号，断线重连带上最后收到的 seq 就能补齐；
@@ -183,6 +191,8 @@ export const serverApi = {
     /** clientMessageId 是幂等键：断网重发同一个键只会拿回已存在的那条消息，不会重复执行也不会重复扣点。model 是用户在面板上选的模型，留空表示按服务端默认。 */
     sendAgentMessage: (id: string, body: { clientMessageId: string; content: string; model: string; attachmentIds: string[]; references: Array<{ nodeId: string }> }) => serverRequest<ServerAgentMessage>(`/v1/agent/sessions/${id}/messages`, { method: "POST", ...jsonBody(body) }, "发送消息失败"),
     abortAgentSession: (id: string) => serverRequest<ServerAgentSession>(`/v1/agent/sessions/${id}/abort`, { method: "POST" }, "中止 Agent 执行失败"),
+    /** 回应 status 为 awaiting 时挂起的那条请求。批准就接着跑，拒绝就收尾，两种请求共用这一个接口。 */
+    resolveAgentSession: (id: string, approved: boolean) => serverRequest<ServerAgentSession>(`/v1/agent/sessions/${id}/resolve`, { method: "POST", ...jsonBody({ approved }) }, "回应 Agent 请求失败"),
 };
 
 /**

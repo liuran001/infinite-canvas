@@ -39,6 +39,7 @@ import { CanvasMobileHintDialog } from "@/components/canvas/canvas-mobile-hint-d
 import { CanvasSidePanel } from "@/components/canvas/canvas-side-panel";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useAgentStore } from "@/stores/use-agent-store";
+import { IMAGE_FILE_ACCEPT, isImageFile } from "@/lib/image-transcode";
 import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
 import { CLOUD_AGENT_DROP_SELECTOR, CLOUD_AGENT_IMAGE_MIME } from "@/components/agent/cloud-agent-references";
 import { isServerMode, useIsServerMode, useServerStore } from "@/stores/use-server-store";
@@ -1983,7 +1984,7 @@ function InfiniteCanvasPage() {
     const handleImageInputChange = useCallback(
         async (event: ReactChangeEvent<HTMLInputElement>) => {
             const files = Array.from(event.target.files || []).filter(
-                (f) => f.type.startsWith("image/") || f.type.startsWith("video/") || isAudioFile(f),
+                (f) => isImageFile(f) || f.type.startsWith("video/") || isAudioFile(f),
             );
             if (!files.length) {
                 uploadTargetRef.current = null;
@@ -2153,7 +2154,7 @@ function InfiniteCanvasPage() {
                 return;
             }
             const files = Array.from(event.dataTransfer.files).filter(
-                (item) => item.type.startsWith("image/") || item.type.startsWith("video/") || isAudioFile(item),
+                (item) => isImageFile(item) || item.type.startsWith("video/") || isAudioFile(item),
             );
             if (!files.length) return;
 
@@ -3144,7 +3145,7 @@ function InfiniteCanvasPage() {
                     />
                 ) : null}
 
-                <input ref={imageInputRef} type="file" multiple accept="image/*,video/*,audio/mpeg,audio/wav,audio/x-wav,.mp3,.wav" className="hidden" onChange={handleImageInputChange} />
+                <input ref={imageInputRef} type="file" multiple accept={`${IMAGE_FILE_ACCEPT},video/*,audio/mpeg,audio/wav,audio/x-wav,.mp3,.wav`} className="hidden" onChange={handleImageInputChange} />
 
                 <CanvasNodeInfoModal node={infoNode} open={Boolean(infoNode)} onClose={() => setInfoNodeId(null)} />
                 <CanvasPluginManagerModal open={pluginManagerOpen} onClose={() => setPluginManagerOpen(false)} />

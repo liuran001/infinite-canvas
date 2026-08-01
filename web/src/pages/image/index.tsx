@@ -9,6 +9,7 @@ import { ModelPicker } from "@/components/model-picker";
 import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
 import { canvasThemes } from "@/lib/canvas-theme";
+import { IMAGE_FILE_ACCEPT, isImageFile } from "@/lib/image-transcode";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
 import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig, generationCreditCost } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -164,7 +165,10 @@ export default function ImagePage() {
     };
 
     const addReferences = async (files?: FileList | null) => {
-        const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
+        const imageFiles = Array.from(files || []).filter(isImageFile);
+        if (!imageFiles.length) return;
+        // HEIC 之类的格式要先在浏览器里转码，大图可能要几秒，给个明确的进行中状态。
+        const hide = message.loading("正在处理参考图…", 0);
         try {
             const nextReferences = await Promise.all(
                 imageFiles.map(async (file) => {
@@ -174,8 +178,10 @@ export default function ImagePage() {
             );
             setReferences((value) => [...value, ...nextReferences]);
         } catch (error) {
-            // 云空间不足、文件过大等都是服务端给的中文文案，原样提示给用户。
+            // 云空间不足、文件过大、转码失败等都是可直接展示的中文文案，原样提示给用户。
             message.error(error instanceof Error ? error.message : "上传参考图失败");
+        } finally {
+            hide();
         }
     };
 
@@ -563,7 +569,7 @@ export default function ImagePage() {
             <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/*"
+                accept={IMAGE_FILE_ACCEPT}
                 multiple
                 className="hidden"
                 onChange={(event) => {

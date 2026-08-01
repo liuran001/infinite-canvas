@@ -2,7 +2,7 @@ import { nanoid } from "nanoid";
 import { create } from "zustand";
 
 import { buildDraftReference, expandDraftReferences, type CloudAgentDraftReference } from "@/components/agent/cloud-agent-references";
-import { serverAgentStream, serverApi, type ServerAgentEvent, type ServerAgentMessage, type ServerAgentSession, type ServerAgentSessionStatus } from "@/services/api/server";
+import { serverAgentStream, serverApi, type ServerAgentEvent, type ServerAgentMessage, type ServerAgentPendingAction, type ServerAgentSession, type ServerAgentSessionStatus } from "@/services/api/server";
 import { serverFileIdOf, uploadImage } from "@/services/image-storage";
 import { resolveAgentModel, useConfigStore } from "@/stores/use-config-store";
 import { isServerMode, useServerStore } from "@/stores/use-server-store";
@@ -69,6 +69,10 @@ type CloudAgentStore = {
     model: string;
     messages: ServerAgentMessage[];
     status: ServerAgentSessionStatus;
+    /** 服务端停下来等用户点头的那条请求；status 为 awaiting 时必然有值，回应完就清空。 */
+    pendingAction: ServerAgentPendingAction | null;
+    /** 正在回应待确认请求，按钮据此禁用，避免连点批准发出两次。 */
+    resolving: boolean;
     error: string;
     loading: boolean;
     sending: boolean;
@@ -105,6 +109,7 @@ type CloudAgentStore = {
     deleteSession: (sessionId: string) => Promise<void>;
     send: () => Promise<void>;
     abort: () => Promise<void>;
+    resolvePending: (approved: boolean) => Promise<void>;
 };
 
 export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
@@ -117,9 +122,13 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
     const applyEvent = (sessionId: string, event: ServerAgentEvent) => {
         if (get().sessionId !== sessionId) return;
         if (event.type === "status") {
-            set({ status: event.status, error: event.error });
-            // 跑完再兜底刷一次画布，工具事件万一漏收也不会让界面停在旧数据上。
-            if (event.status !== "running") set((state) => ({ canvasReload: state.canvasReload + 1 }));
+            // 待确认请求跟着 status 事件推过来，回到 running / idle 时服务端会带 null 把它清掉。
+            set({ status: event.status, error: event.error, pendingAction: event.pendingAction || null });
+            // 服务端会在跑起来之后自动给会话起标题，也从这个事件推回来；会话列表跟着改，不用等下一次刷新。
+            if (event.title) set((state) => ({ sessions: state.sessions.map((item) => (item.id === sessionId ? { ...item, title: event.title as string } : item)) }));
+            // 真正跑完了再兜底刷一次画布，工具事件万一漏收也不会让界面停在旧数据上；
+            // awaiting 只是停下来等人，画布没有新变化，不用白拉一次。
+            if (event.status === "idle" || event.status === "failed") set((state) => ({ canvasReload: state.canvasReload + 1 }));
             return;
         }
         set((state) => ({ messages: mergeMessages(state.messages, [event.message]) }));
@@ -142,8 +151,9 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
                 console.warn("Agent 事件流断开，准备重连", error);
             }
             if (abort.signal.aborted || token !== streamToken || get().sessionId !== sessionId) return;
-            // 已经跑完就不用再连，服务端也不会再推事件。
-            if (get().status !== "running") return;
+            // 已经跑完就不用再连，服务端也不会再推事件；awaiting 例外，它还在等人回应，
+            // 别的设备批准之后的续跑事件要靠这条连接收回来。
+            if (get().status !== "running" && get().status !== "awaiting") return;
             await new Promise((resolve) => setTimeout(resolve, Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempt))));
             if (abort.signal.aborted || token !== streamToken) return;
         }
@@ -173,6 +183,8 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         model: "",
         messages: [],
         status: "idle",
+        pendingAction: null,
+        resolving: false,
         error: "",
         loading: false,
         sending: false,
@@ -258,7 +270,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (get().projectId !== projectId) {
                 detach();
                 loadedProjectId = "";
-                set({ projectId, sessions: [], sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", draftReferences: [], attachments: [], sending: false, ...clearedHighlight });
+                set({ projectId, sessions: [], sessionId: "", model: "", messages: [], status: "idle", pendingAction: null, resolving: false, error: "", prompt: "", draftReferences: [], attachments: [], sending: false, ...clearedHighlight });
             }
             if (!projectId || loadedProjectId === projectId || !isServerMode() || !useServerStore.getState().settings?.agent.enabled) return;
             loadedProjectId = projectId;
@@ -271,14 +283,15 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (!sessionId) return;
             detach();
             localStorage.setItem(SESSION_KEY, sessionId);
-            set({ sessionId, model: "", messages: [], status: "idle", error: "", loading: true, ...clearedHighlight });
+            set({ sessionId, model: "", messages: [], status: "idle", pendingAction: null, resolving: false, error: "", loading: true, ...clearedHighlight });
             try {
                 // 先补齐历史再挂流：服务端循环不依赖前端连接，断线期间跑完的结果都已经落库。
                 const [session, { items }] = await Promise.all([serverApi.agentSession(sessionId), serverApi.agentMessages(sessionId, 0)]);
                 if (get().sessionId !== sessionId) return;
                 // 每个会话记着自己用的模型，切回来还是当初那个，不会被别的会话的选择带跑。
-                set({ model: session.model, messages: items, status: session.status, error: session.error, loading: false });
-                if (session.status === "running") void attach(sessionId);
+                // 待确认请求落在会话行上，所以刷新页面、换设备重新打开会话时那张卡片还在。
+                set({ model: session.model, messages: items, status: session.status, pendingAction: session.pendingAction || null, error: session.error, loading: false });
+                if (session.status === "running" || session.status === "awaiting") void attach(sessionId);
             } catch (error) {
                 if (get().sessionId !== sessionId) return;
                 set({ loading: false, error: errorText(error) });
@@ -290,7 +303,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             detach();
             localStorage.removeItem(SESSION_KEY);
             // 模型清空，新会话按用户偏好（没设过就按管理员默认）起头。
-            set({ sessionId: "", model: "", messages: [], status: "idle", error: "", prompt: "", draftReferences: [], attachments: [], ...clearedHighlight });
+            set({ sessionId: "", model: "", messages: [], status: "idle", pendingAction: null, resolving: false, error: "", prompt: "", draftReferences: [], attachments: [], ...clearedHighlight });
         },
 
         deleteSession: async (sessionId) => {
@@ -302,7 +315,7 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (get().sessionId === sessionId) {
                 detach();
                 localStorage.removeItem(SESSION_KEY);
-                set({ sessionId: "", model: "", messages: [], status: "idle", error: "", ...clearedHighlight });
+                set({ sessionId: "", model: "", messages: [], status: "idle", pendingAction: null, resolving: false, error: "", ...clearedHighlight });
             }
             set((state) => ({ sessions: state.sessions.filter((item) => item.id !== sessionId) }));
         },
@@ -310,7 +323,8 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         send: async () => {
             const draft = get().prompt.trim();
             const attachments = get().attachments;
-            if ((!draft && !attachments.length) || get().sending || get().status === "running" || !get().projectId || !isServerMode()) return;
+            // awaiting 时循环还没结束，这时候发新消息服务端会拒绝，先让用户把待确认的那条请求处理掉。
+            if ((!draft && !attachments.length) || get().sending || get().status === "running" || get().status === "awaiting" || !get().projectId || !isServerMode()) return;
             // 行内标签在这一步才展开成服务端标记：位置与顺序原样保留，用户删掉的标签自然就不算引用了。
             const { content, references } = expandDraftReferences(draft, get().draftReferences);
             const attachmentIds = attachments.map((item) => item.id);
@@ -348,6 +362,24 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             if (!sessionId) return;
             // 中止结果由服务端循环写回「已中止本次执行」并推 status，这里不抢先改状态。
             await serverApi.abortAgentSession(sessionId).catch((error: unknown) => set({ error: errorText(error) }));
+        },
+
+        /**
+         * 回应服务端挂起的那条请求。批准 / 拒绝之后的状态一律以服务端推回来的 status 为准，
+         * 这里只把卡片收掉：批准后循环要接着跑，得先确保 SSE 挂着，否则后续进度要等重连才看得到。
+         */
+        resolvePending: async (approved) => {
+            const sessionId = get().sessionId;
+            if (!sessionId || !get().pendingAction || get().resolving) return;
+            set({ resolving: true, error: "" });
+            try {
+                const session = await serverApi.resolveAgentSession(sessionId, approved);
+                if (get().sessionId !== sessionId) return;
+                set({ status: session.status, pendingAction: session.pendingAction || null, error: session.error, resolving: false });
+                if (session.status === "running" || session.status === "awaiting") void attach(sessionId);
+            } catch (error) {
+                set({ resolving: false, error: errorText(error) });
+            }
         },
     };
 });

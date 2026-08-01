@@ -14,12 +14,12 @@ import { useMissingCanvasNodeIds } from "@/stores/canvas/use-canvas-store";
 import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
 import { useIsServerMode, useServerStore } from "@/stores/use-server-store";
 import { useThemeStore } from "@/stores/use-theme-store";
-import { AgentChatMessage, AgentWorkingMessage } from "./agent-chat-message";
+import { AgentChatMessage, AgentPendingToolCard, AgentToolGroup, AgentWorkingMessage } from "./agent-chat-message";
 import { AgentModeSwitch } from "./agent-mode-switch";
 import { AgentPanelTabs } from "./agent-panel-tabs";
 import { AgentScrollToBottom } from "./agent-scroll-to-bottom";
 import { CloudAgentComposer, CloudAgentImageStrip } from "./cloud-agent-composer";
-import { cloudAgentActivity, toCloudChatItem } from "./cloud-agent-format";
+import { cloudAgentActivity, cloudAgentTimeline, cloudPendingCard } from "./cloud-agent-format";
 import { splitReferenceContent, stripReferenceMarkers } from "./cloud-agent-references";
 
 const SCROLL_BOTTOM_THRESHOLD = 48;
@@ -38,7 +38,7 @@ export function CloudAgentPanel() {
     const closePanel = useAgentStore((state) => state.closePanel);
     const [tab, setTab] = useState<CloudAgentTab>("chat");
 
-    const { projectId, sessions, sessionId, sessionModel, messages, status, error, loading, sending, attachments } = useCloudAgentStore(
+    const { projectId, sessions, sessionId, sessionModel, messages, status, pendingAction, resolving, error, loading, sending, attachments } = useCloudAgentStore(
         useShallow((state) => ({
             projectId: state.projectId,
             sessions: state.sessions,
@@ -46,6 +46,8 @@ export function CloudAgentPanel() {
             sessionModel: state.model,
             messages: state.messages,
             status: state.status,
+            pendingAction: state.pendingAction,
+            resolving: state.resolving,
             error: state.error,
             loading: state.loading,
             sending: state.sending,
@@ -55,12 +57,16 @@ export function CloudAgentPanel() {
     const setModel = useCloudAgentStore((state) => state.setModel);
     const send = useCloudAgentStore((state) => state.send);
     const abort = useCloudAgentStore((state) => state.abort);
+    const resolvePending = useCloudAgentStore((state) => state.resolvePending);
     const newSession = useCloudAgentStore((state) => state.newSession);
     const openSession = useCloudAgentStore((state) => state.openSession);
     const deleteSession = useCloudAgentStore((state) => state.deleteSession);
     const refreshSessions = useCloudAgentStore((state) => state.refreshSessions);
 
     const running = status === "running";
+    // 等确认时循环并没有结束：不能发新消息，但中止按钮要留着，用户随时可以直接收工。
+    const awaiting = status === "awaiting" && Boolean(pendingAction);
+    const busy = running || sending || awaiting;
     const config = useEffectiveConfig();
     // 会话已经在用的模型优先，其次用户偏好，最后回落管理员默认；settings 与 config 都订阅了，配置变了会重算。
     const model = useMemo(() => resolveAgentModel(sessionModel), [config.agentModel, sessionModel, settings]);
@@ -69,20 +75,25 @@ export function CloudAgentPanel() {
     // 附件要进上下文，模型不支持视觉时上游会直接报一串看不懂的错；这里先明确挡住，服务端仍然会再校验一次。
     const visionWarning = attachments.length && !settings?.modelChannel.models.some((item) => item.name === model && item.vision) ? "当前模型不支持识别图片，请换一个标注了「支持视觉」的模型，或先移除图片" : "";
     // 用户消息里的引用标记是给模型看的，展示时还原成可交互的标签；附件按文件 ID 直接取直链画缩略图。
-    const items = useMemo(
+    // 连续的工具调用先在这里合并成一组，一轮下来十几个工具只占一行，点开才展开完整调用列表。
+    const timeline = useMemo(
         () =>
-            messages.map((message) => {
-                const parts = message.role === "user" ? splitReferenceContent(message.content) : [];
+            cloudAgentTimeline(messages).map((entry) => {
+                if (entry.kind !== "message") return entry;
+                const parts = entry.message.role === "user" ? splitReferenceContent(entry.message.content) : [];
                 return {
-                    view:
-                        message.role === "user"
-                            ? { ...toCloudChatItem(message), text: stripReferenceMarkers(message.content), body: parts.some((part) => part.nodeId) ? <CloudAgentMessageText parts={parts} /> : undefined }
-                            : toCloudChatItem(message),
-                    images: (message.attachments || []).map((id) => ({ id, name: "图片", url: serverFileUrl(id), storageKey: serverStorageKey(id), width: 0, height: 0 })),
+                    ...entry,
+                    item:
+                        entry.message.role === "user"
+                            ? { ...entry.item, text: stripReferenceMarkers(entry.message.content), body: parts.some((part) => part.nodeId) ? <CloudAgentMessageText parts={parts} /> : undefined }
+                            : entry.item,
+                    images: (entry.message.attachments || []).map((id) => ({ id, name: "图片", url: serverFileUrl(id), storageKey: serverStorageKey(id), width: 0, height: 0 })),
                 };
             }),
         [messages],
     );
+    // 工具还在跑时那一组自己会显示「正在联网搜索」，再挂一条等待提示就是同一句话说两遍。
+    const toolRunning = messages[messages.length - 1]?.role === "tool" && !messages[messages.length - 1]?.toolResult;
     // 等待提示按实际进度说话：在跑工具就报工具名，其余情况说「正在思考」。
     const activity = useMemo(() => cloudAgentActivity(messages), [messages]);
     // 服务端执行失败时会把同一句中文既写进对话又放进 session.error，对话里已经有了就不再重复弹一条。
@@ -108,7 +119,7 @@ export function CloudAgentPanel() {
     useEffect(() => {
         const frame = requestAnimationFrame(() => (followRef.current ? scrollToBottom("auto") : updateScrollState()));
         return () => cancelAnimationFrame(frame);
-    }, [items, running, scrollToBottom, updateScrollState]);
+    }, [timeline, running, scrollToBottom, updateScrollState]);
 
     // 面板关掉时组件被卸载，这时候必须收回引用高亮，否则画布上会留下一个再也取消不掉的亮节点。
     useEffect(() => () => useCloudAgentStore.getState().highlightReference(""), []);
@@ -145,7 +156,7 @@ export function CloudAgentPanel() {
                 }}
                 right={
                     <>
-                        <Button size="small" type="text" disabled={!isServerMode || running} icon={<Plus className="size-3.5" />} onClick={newSession}>
+                        <Button size="small" type="text" disabled={!isServerMode || busy} icon={<Plus className="size-3.5" />} onClick={newSession}>
                             新会话
                         </Button>
                         <Tooltip title="收起对话">
@@ -184,7 +195,7 @@ export function CloudAgentPanel() {
                             <div className="min-w-0 flex-1">
                                 <div className="truncate text-sm font-medium leading-5">{session.title || "未命名会话"}</div>
                                 <div className="truncate text-[11px] leading-4 opacity-65">
-                                    {session.status === "running" ? "执行中 · " : session.status === "failed" ? `${session.error || "执行失败"} · ` : ""}
+                                    {session.status === "running" ? "执行中 · " : session.status === "awaiting" ? "等待确认 · " : session.status === "failed" ? `${session.error || "执行失败"} · ` : ""}
                                     {new Date(session.updatedAt).toLocaleString()}
                                 </div>
                             </div>
@@ -207,17 +218,24 @@ export function CloudAgentPanel() {
                 <>
                     <div className="relative min-h-0 flex-1">
                         <div ref={listRef} className="thin-scrollbar h-full select-text space-y-4 overflow-y-auto px-4 pt-4" onScroll={updateScrollState}>
-                            {items.length ? (
-                                items.map(({ view, images }) => (
-                                    <div key={view.id}>
-                                        <AgentChatMessage item={view} theme={theme} />
-                                        {images.length ? <CloudAgentImageStrip images={images} alignRight={view.role === "user"} /> : null}
-                                    </div>
-                                ))
+                            {timeline.length ? (
+                                timeline.map((entry) =>
+                                    entry.kind === "tools" ? (
+                                        <AgentToolGroup key={entry.id} items={entry.items} label={entry.label} running={entry.running} theme={theme} />
+                                    ) : (
+                                        <div key={entry.id}>
+                                            <AgentChatMessage item={entry.item} theme={theme} />
+                                            {entry.images.length ? <CloudAgentImageStrip images={entry.images} alignRight={entry.item.role === "user"} /> : null}
+                                        </div>
+                                    ),
+                                )
                             ) : (
                                 <CloudAgentIntro theme={theme} model={model} ready={isServerMode && Boolean(projectId)} />
                             )}
-                            {running || sending ? <AgentWorkingMessage text={activity} activityKey={`${sessionId}-${messages.length}-${activity}`} theme={theme} /> : null}
+                            {pendingAction ? (
+                                <AgentPendingToolCard {...cloudPendingCard(pendingAction)} theme={theme} deciding={resolving} onApprove={() => void resolvePending(true)} onReject={() => void resolvePending(false)} />
+                            ) : null}
+                            {(running || sending) && !toolRunning ? <AgentWorkingMessage text={activity} activityKey={`${sessionId}-${messages.length}-${activity}`} theme={theme} /> : null}
                         </div>
                         {showScrollToBottom ? <AgentScrollToBottom theme={theme} title="查看最新消息" onClick={() => scrollToBottom()} /> : null}
                     </div>
@@ -238,8 +256,8 @@ export function CloudAgentPanel() {
 
                     <CloudAgentComposer
                         disabled={!isServerMode || !projectId}
-                        sending={running || sending}
-                        placeholder={projectId ? "让系统模型帮你读取或修改当前画布，可以把画布节点拖进来作为引用" : "请先打开一个画布"}
+                        sending={busy}
+                        placeholder={awaiting ? "上面有一条请求在等你确认，处理完才能继续对话" : projectId ? "让系统模型帮你读取或修改当前画布，可以把画布节点拖进来作为引用" : "请先打开一个画布"}
                         theme={theme}
                         visionWarning={visionWarning}
                         onSubmit={() => void send()}
@@ -250,7 +268,7 @@ export function CloudAgentPanel() {
                                 config={config}
                                 value={model}
                                 capability="text"
-                                disabled={running || sending}
+                                disabled={busy}
                                 ariaLabel="选择系统模型"
                                 className="h-9 max-w-44 rounded-full border-0 bg-transparent px-2.5 text-xs font-medium shadow-none hover:bg-black/5 dark:hover:bg-white/10"
                                 onChange={setModel}

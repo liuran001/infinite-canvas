@@ -140,7 +140,7 @@ export function AgentChatMessage({ item, theme, onRejectTool, onApproveTool }: {
     );
 }
 
-export function AgentPendingToolCard({ summary, detail, theme, onReject, onApprove }: { summary: string; detail?: unknown; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; onReject?: () => void; onApprove?: () => void }) {
+export function AgentPendingToolCard({ summary, detail, theme, title = "等待确认", deciding, onReject, onApprove }: { summary: string; detail?: unknown; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; title?: string; deciding?: boolean; onReject?: () => void; onApprove?: () => void }) {
     const view = userDetail(detail);
     return (
         <div className="min-w-0 rounded-xl border px-3 py-3" style={{ borderColor: "rgba(217,119,6,.28)", background: "rgba(217,119,6,.025)", color: theme.node.text }}>
@@ -148,7 +148,7 @@ export function AgentPendingToolCard({ summary, detail, theme, onReject, onAppro
                 <summary className={`list-none ${view ? "cursor-pointer" : "cursor-default"}`} onClick={(event) => { if (!view) event.preventDefault(); }}>
                     <div className="flex min-w-0 items-center gap-2 text-sm font-medium leading-5">
                         <CircleAlert className="size-4 shrink-0 text-amber-600" />
-                        <span className="min-w-0 flex-1">等待确认</span>
+                        <span className="min-w-0 flex-1">{title}</span>
                         {view ? <ChevronDown className="size-3.5 shrink-0 transition-transform group-open:rotate-180" style={{ color: theme.node.muted }} /> : null}
                     </div>
                     <div className="mt-1 pl-6 text-sm leading-5" style={{ color: theme.node.muted }}>{summary}</div>
@@ -157,10 +157,10 @@ export function AgentPendingToolCard({ summary, detail, theme, onReject, onAppro
             </details>
             {onReject || onApprove ? (
                 <div className="mt-3 flex justify-end gap-2 border-t pt-3" style={{ borderColor: theme.node.stroke }}>
-                    <Button danger type="text" className="!h-8" icon={<XCircle className="size-3.5" />} onClick={() => onReject?.()}>
+                    <Button danger type="text" className="!h-8" disabled={deciding} icon={<XCircle className="size-3.5" />} onClick={() => onReject?.()}>
                         拒绝执行
                     </Button>
-                    <Button type="text" className="!h-8" icon={<CheckCircle2 className="size-3.5" />} style={{ color: "#16a34a" }} onClick={() => onApprove?.()}>
+                    <Button type="text" className="!h-8" disabled={deciding} loading={deciding} icon={<CheckCircle2 className="size-3.5" />} style={{ color: "#16a34a" }} onClick={() => onApprove?.()}>
                         批准执行
                     </Button>
                 </div>
@@ -276,6 +276,32 @@ export function AgentCommandGroup({ items, theme }: { items: AgentCommandItem[];
                 ? <AgentSingleCommand item={items[0]} theme={theme} />
                 : <div className="ml-6 mt-1">{items.map((item, index) => <AgentCommandEntry key={item.id} item={item} index={index} theme={theme} />)}</div>
             }
+        </details>
+    );
+}
+
+/**
+ * 一组工具调用折叠成的一行。和上面的命令分组是同一套交互（点一行展开、箭头右转下转、默认收起），
+ * 云端与本地两种模式在同一个面板里切换，展开收起的手感必须一致，所以只换图标和文案，不另造一套。
+ * 展开后每一项仍旧用原来的工具卡片渲染，参数、结果、状态一个都不少。
+ */
+export function AgentToolGroup({ items, label, running, theme }: { items: AgentChatMessageItem[]; label: string; running: boolean; theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {
+    const failed = items.some((item) => commandViewState(item.detail).failed);
+    const color = running ? "#d97706" : failed ? "#dc2626" : theme.node.muted;
+    return (
+        <details className="group min-w-0 text-left">
+            <summary className="cursor-pointer list-none py-1">
+                <div className="flex min-w-0 items-center gap-2 text-sm" style={{ color }}>
+                    {running ? <LoaderCircle className="size-4 shrink-0 animate-spin" /> : <Wrench className="size-4 shrink-0" />}
+                    <span className="font-medium">{label}</span>
+                    <ChevronRight className="size-3.5 shrink-0 transition-transform group-open:rotate-90" />
+                </div>
+            </summary>
+            <div className="ml-6 mt-1 space-y-2">
+                {items.map((item) => (
+                    <AgentToolCard key={item.id} title={item.title || "工具调用"} text={item.text} detail={item.detail} theme={theme} />
+                ))}
+            </div>
         </details>
     );
 }

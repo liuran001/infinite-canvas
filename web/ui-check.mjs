@@ -95,14 +95,24 @@ async function main() {
     }
 
     // 系统模型模式由后台开关控制，关掉时面板只剩本地 Agent，下面的断言都要跟着实际配置走。
-    const cloudAgentEnabled = await page.evaluate(async (api) => {
+    const agentSettings = await page.evaluate(async (api) => {
         const response = await fetch(`${api}/api/settings`);
-        return Boolean((await response.json()).data?.agent?.enabled);
+        const data = (await response.json()).data;
+        return { enabled: Boolean(data?.agent?.enabled), image: data?.capabilities?.image !== false };
     }, API);
+    const cloudAgentEnabled = agentSettings.enabled;
     if (cloudAgentEnabled) {
         // 「Agent 默认模型」是独立的偏好项：面板里的即时切换只管当前会话，新建会话起手用的是这里，且跟随账号云端同步。
         await visit("/config");
         check("偏好设置里有 Agent 默认模型", (await page.getByText("Agent 默认模型").count()) > 0);
+        // Agent 自己调生成工具时用的默认参数：模型不传就按这里补齐，和工作台的默认分开配。
+        check("偏好设置里有 Agent 生成默认设置", (await page.getByText("Agent 生成默认设置").count()) > 0);
+        check("偏好设置里有 Agent 默认生文模型", (await page.getByRole("combobox", { name: "选择 Agent 默认生文模型" }).count()) > 0);
+        if (agentSettings.image) {
+            check("偏好设置里有 Agent 默认生图模型", (await page.getByRole("combobox", { name: "选择 Agent 默认生图模型" }).count()) > 0);
+            const imageFields = await Promise.all(["Agent 默认生图尺寸", "Agent 默认生图画质", "Agent 默认生图张数", "Agent 默认生图背景"].map((label) => page.getByText(label, { exact: true }).count()));
+            check("偏好设置里有 Agent 默认生图参数", imageFields.every((count) => count > 0), `各项匹配数 ${JSON.stringify(imageFields)}`);
+        }
         check("偏好设置无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
     }
 

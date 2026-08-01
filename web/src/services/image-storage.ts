@@ -1,3 +1,4 @@
+import { prepareImageForUpload } from "@/lib/image-transcode";
 import { readImageMeta } from "@/lib/image-utils";
 import { serverApi, serverFileUrl } from "@/services/api/server";
 
@@ -27,7 +28,10 @@ export function isServerStorageKey(storageKey?: string) {
 
 /** 上传到服务端并引用直链；失败直接抛错，由调用方提示用户。 */
 export async function uploadImage(input: string | Blob): Promise<UploadedImage> {
-    const blob = typeof input === "string" ? await (await fetch(input)).blob() : input;
+    const source = typeof input === "string" ? await (await fetch(input)).blob() : input;
+    // 所有上传入口最终都走到这里，转码放在这一层，新增入口不用再各自处理一遍 HEIC。
+    // 宽高、体积、MIME 一律按转码后的 blob 算：配额是按体积计的，沿用原文件会算错。
+    const blob = await prepareImageForUpload(source);
     const localUrl = URL.createObjectURL(blob);
     const meta = await readImageMeta(localUrl);
     URL.revokeObjectURL(localUrl);
