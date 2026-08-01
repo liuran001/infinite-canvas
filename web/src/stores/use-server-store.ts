@@ -34,7 +34,8 @@ export type ServerSettings = {
         systemPrompt: string;
         allowCustomChannel: boolean;
     };
-    auth: { allowRegister: boolean; linuxDo: { enabled: boolean } };
+    /** requireInvite 开启后注册与第三方首次建号都要填邀请码，前端据此决定要不要多显示一个输入框。 */
+    auth: { allowRegister: boolean; requireInvite: boolean; linuxDo: { enabled: boolean } };
     /** searchEnabled 由后台「搜索开关 + 是否配了 key」推导，没配 key 时后端不会把联网搜索给 agent。 */
     agent: { enabled: boolean; model: string; maxRounds: number; searchEnabled: boolean };
     /** defaultQuota 是新账号的云空间上限（字节）。 */

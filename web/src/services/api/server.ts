@@ -126,8 +126,14 @@ export const serverApi = {
     settings: () => serverRequest<ServerSettings>("/settings", {}, "读取服务端配置失败"),
     me: () => serverRequest<ServerUser>("/auth/me", {}, "读取用户信息失败"),
     login: (username: string, password: string) => serverRequest<{ token: string; user: ServerUser }>("/auth/login", { method: "POST", ...jsonBody({ username, password }) }, "登录失败"),
-    register: (username: string, password: string) => serverRequest<{ token: string; user: ServerUser }>("/auth/register", { method: "POST", ...jsonBody({ username, password }) }, "注册失败"),
+    /** inviteCode 只在服务端开启「注册需要邀请码」时才有值，关闭时传空串，服务端照旧忽略。 */
+    register: (username: string, password: string, inviteCode = "") => serverRequest<{ token: string; user: ServerUser }>("/auth/register", { method: "POST", ...jsonBody({ username, password, inviteCode }) }, "注册失败"),
     linuxDoAuthorizeUrl: (redirect: string) => `${serverApiUrl("/auth/linux-do/authorize")}?redirect=${encodeURIComponent(redirect)}`,
+    /**
+     * 第三方登录的建号补全：新用户且服务端要求邀请码时，回调只带回 pendingToken 表示「身份已验证但还没建号」，
+     * 必须再拿邀请码换一次才会有登录令牌。pendingToken 有有效期，过期后这里会返回中文原因。
+     */
+    completeLinuxDo: (pendingToken: string, inviteCode: string) => serverRequest<{ token: string; user: ServerUser }>("/auth/linux-do/complete", { method: "POST", ...jsonBody({ pendingToken, inviteCode }) }, "完成注册失败"),
     changePassword: (oldPassword: string, newPassword: string) => serverRequest<boolean>("/auth/password", { method: "POST", ...jsonBody({ oldPassword, newPassword }) }, "修改密码失败"),
     linuxDoBindUrl: (redirect: string) => serverRequest<{ url: string }>(`/auth/linux-do/bind?redirect=${encodeURIComponent(redirect)}`, {}, "获取授权地址失败"),
     unbindLinuxDo: () => serverRequest<ServerUser>("/auth/linux-do/unbind", { method: "POST" }, "解绑 Linux.do 失败"),

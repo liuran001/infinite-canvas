@@ -340,6 +340,10 @@ export default function AdminSettingsPage() {
                         <span className="text-sm">开放注册</span>
                     </div>
                     <div className="flex items-center gap-2">
+                        <Switch checked={Boolean(auth.requireInvite)} onChange={(requireInvite) => patchAuth({ requireInvite })} />
+                        <span className="text-sm">注册需要邀请码</span>
+                    </div>
+                    <div className="flex items-center gap-2">
                         <Switch checked={auth.linuxDo.enabled} onChange={(enabled) => patchAuth({ linuxDo: { enabled } })} />
                         <span className="text-sm">启用 Linux.do 登录</span>
                     </div>

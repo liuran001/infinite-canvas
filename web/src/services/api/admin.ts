@@ -153,6 +153,23 @@ export type AdminJobDetail = AdminJob & { clientJobId: string; params: Record<st
 
 export type AdminProject = AdminOwner & { projectId: string; title: string; nodeCount: number; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 
+/** 注册邀请码。usedCount 到 maxUses 就自动作废，credits 是兑换成功后额外赠送的算力点。 */
+export type AdminInvite = {
+    code: string;
+    maxUses: number;
+    usedCount: number;
+    credits: number;
+    enabled: boolean;
+    note: string;
+    createdAt: string;
+};
+
+/** 一次兑换记录。usedAt 就是用掉的时刻；credits 是当时实际送出去的点数，码上的 credits 后来改过也不影响这份留档。 */
+export type AdminInviteUse = { code: string; userId: string; username: string; displayName: string; credits: number; usedAt: string };
+
+/** 批量生成的入参，count 是这次要生成几个码，其余字段所有新码共用。 */
+export type AdminInviteBatch = { count: number; maxUses: number; credits: number; note: string };
+
 export type AdminProjectDetail = AdminProject & { data: { nodes?: CanvasNodeData[] } };
 
 function search(query: AdminQuery) {
@@ -208,4 +225,13 @@ export const adminApi = {
     projects: (query: AdminReviewQuery) => serverRequest<{ items: AdminProject[]; total: number }>(`/admin/projects${search(query)}`, {}, "读取画布列表失败"),
     project: (userId: string, projectId: string) => serverRequest<AdminProjectDetail>(`/admin/projects/${encodeURIComponent(userId)}/${encodeURIComponent(projectId)}`, {}, "读取画布详情失败"),
     files: (query: AdminReviewQuery) => serverRequest<{ items: Array<AdminFile & AdminOwner>; total: number }>(`/admin/files${search(query)}`, {}, "读取用户文件失败"),
+
+    invites: (query: AdminQuery) => serverRequest<{ items: AdminInvite[]; total: number }>(`/admin/invites${search(query)}`, {}, "读取邀请码失败"),
+    /** 一次生成多个码，返回的就是这批新码，前端拿去给管理员复制。 */
+    createInvites: (batch: AdminInviteBatch) => serverRequest<AdminInvite[]>("/admin/invites", post(batch), "生成邀请码失败"),
+    /** 只改传进来的字段，PATCH 语义：没传的保持原样。 */
+    saveInvite: (code: string, patch: Partial<Pick<AdminInvite, "enabled" | "maxUses" | "credits" | "note">>) =>
+        serverRequest<AdminInvite>(`/admin/invites/${encodeURIComponent(code)}`, { method: "PATCH", body: JSON.stringify(patch) }, "保存邀请码失败"),
+    deleteInvite: (code: string) => serverRequest<boolean>(`/admin/invites/${encodeURIComponent(code)}`, remove, "删除邀请码失败"),
+    inviteUses: (code: string) => serverRequest<{ items: AdminInviteUse[]; total: number }>(`/admin/invites/${encodeURIComponent(code)}/uses`, {}, "读取邀请码使用记录失败"),
 };

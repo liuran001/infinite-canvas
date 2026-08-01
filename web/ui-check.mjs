@@ -195,6 +195,7 @@ async function main() {
 
     for (const [path, label] of [
         ["/admin/users", "用户管理"],
+        ["/admin/invites", "邀请码"],
         ["/admin/credit-logs", "算力点流水"],
         ["/admin/settings", "系统设置"],
         ["/admin/prompts", "提示词"],
