@@ -6,6 +6,7 @@ import { config } from "./config";
 import { errorJson, notFoundJson, ok } from "./lib/response";
 import { adminRouter } from "./routes/admin";
 import { adminReviewRouter } from "./routes/admin-review";
+import { adminTeamRouter } from "./routes/admin-teams";
 import { agentRouter } from "./routes/agent";
 import { aiRouter } from "./routes/ai";
 import { adminUserRouter, authRouter } from "./routes/auth";
@@ -61,6 +62,8 @@ export function createApp() {
     api.use("/admin", adminUserRouter);
     api.use("/admin", adminRouter);
     api.use("/admin", adminReviewRouter);
+    // 平台团队后台与团队前台是两套完全独立的权限语义，路由文件与中间件都不共享。
+    api.use("/admin", adminTeamRouter);
 
     app.use("/api", api);
     app.use("/api", notFoundJson);
