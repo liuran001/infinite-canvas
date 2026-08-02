@@ -68,6 +68,13 @@ export class CreditLog {
     @Column({ type: "int", default: 0 }) amount!: number;
     @Column({ type: "int", default: 0 }) balance!: number;
     @Column(short) relatedId!: string;
+    /**
+     * 这条退款针对的原始扣费流水 ID，只有退款行才有值，其余一律为 null。
+     * 唯一索引就是防重复退款的最后一道闸：进程崩在「退款已提交、任务行还没清干净」之间，
+     * 重启后再退一次会直接撞这条约束而整笔事务回滚，钱不会被退第二遍。
+     * 三种驱动都允许多行 NULL，所以非退款流水不受影响。
+     */
+    @Index({ unique: true }) @Column({ type: "varchar", length: 64, nullable: true }) refundOf!: string | null;
     @Column(short) remark!: string;
     @Column({ type: "text", nullable: true }) extra!: string;
     @Index() @Column(short) createdAt!: string;
@@ -341,6 +348,13 @@ export class AgentSession {
     /** 同 Job：会话创建时固化付费方，同一会话所有轮次沿用它。 */
     @Column({ type: "varchar", length: 16, default: "user" }) payerKind!: PayerKind;
     @Column(short) payerTeamId!: string;
+    /**
+     * 当前这段执行「已经扣掉、还没结清」的那一笔回执。执行成功或退款之后必须清零，
+     * 否则进程崩在中间时重启就找不回它，用户白花一次钱；而落库之前崩掉同样白花，
+     * 所以扣费一成功就立刻写这两列，退款一律以它们为准并靠 refundOf 幂等。
+     */
+    @Column(short) payerLogId!: string;
+    @Column({ type: "int", default: 0 }) payerCredits!: number;
     @Column(short) createdAt!: string;
     @Index() @Column(short) updatedAt!: string;
 }
@@ -515,6 +529,8 @@ export class TeamCreditLog {
     @Column({ type: "int", default: 0 }) balance!: number;
     @Column(short) model!: string;
     @Column(short) relatedId!: string;
+    /** 同 CreditLog.refundOf：唯一索引保证同一笔团队扣费只可能被退一次。 */
+    @Index({ unique: true }) @Column({ type: "varchar", length: 64, nullable: true }) refundOf!: string | null;
     @Column(short) remark!: string;
     @Column({ type: "text", nullable: true }) extra!: string;
     @Index() @Column(short) createdAt!: string;

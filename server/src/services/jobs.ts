@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { In, MoreThan } from "typeorm";
 
 import { config } from "../config";
-import { repo } from "../db/data-source";
+import { repo, serialTransaction } from "../db/data-source";
 import { Job, StoredFile, type JobKind, type JobStatus } from "../db/entities";
 import { fail, newId, now, SafeError } from "../lib/errors";
 import { charge, payerOfJob, payerOfProject, receiptOfJob, refund } from "./billing";
@@ -207,9 +207,18 @@ export function listJobsSince(userId: string, sinceSeq: number) {
     });
 }
 
+/**
+ * 只更新 patch 里的列，再把整行读回来。
+ * 整行覆写（save）会把内存里那份可能已经过期的快照连同没改过的列一起写回去：
+ * 取消发生在扣费之后时，取消那条路径手里的 job 快照还是扣费之前的，
+ * 一次 save 就会把 payerLogId 与 credits 抹成空，那笔已经扣掉的钱从此没人退得了。
+ */
 async function patchJob(job: Job, patch: Partial<Job>) {
-    Object.assign(job, patch, { updatedAt: now(), seq: await nextJobSeq(job.userId) });
-    await jobs().save(job);
+    const seq = await nextJobSeq(job.userId);
+    const next = { ...patch, updatedAt: now(), seq };
+    await jobs().update({ id: job.id }, next as never);
+    // 读回库里的真实行：并发路径改过的列也要带进内存，之后的判断才不会基于陈旧值。
+    Object.assign(job, (await jobs().findOneBy({ id: job.id })) || next);
     // 先落库再广播：订阅方收到的快照一定已经能从库里读到，断线重连按 seq 补齐时不会出现「推过但库里没有」的空档。
     jobBus.emit(job.userId, { type: "job", seq: job.seq, job: await toJobView(job) } satisfies JobEvent);
     return job;
@@ -325,10 +334,21 @@ async function runJob(job: Job) {
     try {
         await patchJob(job, { status: "running", progress: 10, text: "" });
         // 扣点在实际调用上游之前，失败路径统一返还，避免任务重试重复扣费。
+        // 扣费与「把回执写回任务行」必须同一个事务：分两步做的话，进程崩在中间就是钱扣了、
+        // 任务行上却查不到那笔流水，重启后既退不掉也没人认领。charge 内部的事务会复用这里的外层 manager。
         if (!job.credits && credits > 0) {
-            const receipt = await charge(payerOfJob(job), credits, { model: job.model, path: `/jobs/${job.kind}` });
-            // 团队池不足回落到个人时，实际付款方已经变成个人，必须把它写回任务行：
-            // 否则重启后按旧的 payerKind 退款，钱会退进团队池，个人那边白花一笔。
+            const receipt = await serialTransaction(async (manager) => {
+                const paid = await charge(payerOfJob(job), credits, { model: job.model, path: `/jobs/${job.kind}` });
+                // 团队池不足回落到个人时，实际付款方已经变成个人，必须把它写回任务行：
+                // 否则重启后按旧的 payerKind 退款，钱会退进团队池，个人那边白花一笔。
+                await manager.getRepository(Job).update({ id: job.id }, {
+                    credits,
+                    payerKind: paid.payer.kind,
+                    payerTeamId: paid.payer.kind === "team" ? paid.payer.teamId : "",
+                    payerLogId: paid.logId,
+                });
+                return paid;
+            });
             await patchJob(job, { credits, payerKind: receipt.payer.kind, payerTeamId: receipt.payer.kind === "team" ? receipt.payer.teamId : "", payerLogId: receipt.logId });
         }
         const text = job.kind === "text" ? await runTextJob(job, controller.signal) : "";
@@ -343,7 +363,7 @@ async function runJob(job: Job) {
         // 已经流出来的半截文本照常保留在任务里，用户不花钱也能留住它。
         // 退款按任务行上固化的 payer 走，不重新解析：用户可能已经被移出团队，
         // 重新解析会把当初从团队池扣的钱退进他的个人余额。
-        if (job.credits > 0) await refund(receiptOfJob(job), { model: job.model, path: `/jobs/${job.kind}` }).catch(() => undefined);
+        if (job.credits > 0 && job.payerLogId) await refund(receiptOfJob(job), { model: job.model, path: `/jobs/${job.kind}` }).catch(() => undefined);
         const message = error instanceof SafeError ? error.message : "生成失败，请稍后重试";
         if (!canceled) console.error(`job ${job.id} failed:`, error);
         await patchJob(job, { status: canceled ? "canceled" : "failed", credits: 0, payerLogId: "", text: runningTexts.get(job.id) ?? job.text ?? "", error: canceled ? "任务已取消" : message, finishedAt: now() });
@@ -374,11 +394,28 @@ async function tick() {
 }
 
 /**
+ * 把上一次进程留下的 running 任务放回队列。
+ * 放回之前必须先把「已扣未结」的那一笔退掉并清零：
+ * 不退，用户就为一次没跑完的任务白付了钱；不清零，重跑时 `!job.credits` 判定为假，
+ * 整个任务就成了免费的——而这两件事都不能靠内存里的回执，只能从任务行上读回来。
+ * 退款本身是幂等的（refundOf 唯一索引），所以崩在退款与清零之间、重启后再走一遍也不会退第二次。
+ */
+export async function resetRunningJobs() {
+    const stale = await jobs().find({ where: { status: "running" } });
+    for (const job of stale) {
+        if (job.credits > 0 && job.payerLogId) await refund(receiptOfJob(job), { model: job.model, path: `/jobs/${job.kind}` }).catch(() => undefined);
+        await jobs().update({ id: job.id }, { status: "pending", credits: 0, payerLogId: "", updatedAt: now() });
+    }
+    // 上面按行处理的是有回执的；没有回执的（还没走到扣费）一并放回队列。
+    await jobs().update({ status: "running" }, { status: "pending", credits: 0, payerLogId: "", updatedAt: now() });
+}
+
+/**
  * 进程重启后把 running 任务放回队列。视频任务已经把上游任务 ID 落库，
  * 重新执行时会跳过创建、直接续查，不会重复生成。
  */
 export async function startJobWorker() {
-    await jobs().update({ status: "running" }, { status: "pending", updatedAt: now() });
+    await resetRunningJobs();
     setInterval(() => void tick(), 2000).unref();
     void tick();
 }

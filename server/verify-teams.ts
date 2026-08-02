@@ -11,7 +11,7 @@ const env = prepareEnv("verify-teams");
 async function main() {
     const { check, rejects, finish } = createChecker();
     const { initDatabase, repo } = await import("./src/db/data-source");
-    const { AgentSession, Job, Team, TeamCreditLog, TeamInvite, TeamInviteUse, TeamMember } = await import("./src/db/entities");
+    const { AgentSession, Job, Project, Team, TeamCreditLog, TeamInvite, TeamInviteUse, TeamMember } = await import("./src/db/entities");
     const { newId, now } = await import("./src/lib/errors");
 
     await initDatabase();
@@ -357,8 +357,16 @@ async function main() {
     const leftoverInviteId = leftover.id;
     const leftoverInviteToken = leftover.token;
 
+    // 解散前先挂两张画布上去：解散若不把 teamId 收回来，画布的付费方解析会永远卡在「团队不可用」，
+    // 而画布的主人既不能在上面花钱，也没有任何入口把它解绑，等于被永久锁死。
+    await repo(Project).insert({ userId: "user-c", projectId: "pd-1", title: "解散前画布", data: "{}", revision: 1, deleted: false, teamId: fresh.id, createdAt: now(), updatedAt: now() });
+    await repo(Project).insert({ userId: "user-b", projectId: "pd-2", title: "别人的画布", data: "{}", revision: 1, deleted: false, teamId: fresh.id, createdAt: now(), updatedAt: now() });
+
     await disbandTeam(fresh.id, "user-c");
     check("解散后团队标记为 disbanded", (await repo(Team).findOneByOrFail({ id: fresh.id })).status, "disbanded");
+    check("解散后画布收回个人名下", await repo(Project).countBy({ teamId: fresh.id }), 0);
+    check("解散后画布本身还在", (await repo(Project).findOneByOrFail({ userId: "user-c", projectId: "pd-1" })).teamId, "");
+    check("解散后画布仍能解析出个人付费方", (await (await import("./src/services/billing")).payerOfProject("user-c", "pd-1")).kind, "user");
     check("解散后成员全部清空", await repo(TeamMember).countBy({ teamId: fresh.id }), 0);
     check(
         "解散后不出现在任何人的团队列表",

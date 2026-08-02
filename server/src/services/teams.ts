@@ -1,7 +1,7 @@
 import { In } from "typeorm";
 
 import { repo, serialTransaction } from "../db/data-source";
-import { Team, TeamInvite, TeamMember, type TeamRole } from "../db/entities";
+import { Project, Team, TeamInvite, TeamMember, type TeamRole } from "../db/entities";
 import { fail, newId, now } from "../lib/errors";
 import { assertCanManageMember, canTeamAction, requireTeamRole } from "./team-access";
 import { closeTeamConnectionsOf, publishTeamMember } from "./team-realtime";
@@ -188,11 +188,14 @@ export async function transferOwner(teamId: string, actorId: string, targetId: s
 /**
  * 解散。成员与邀请全部清掉，团队本身只置为 disbanded：
  * TeamCreditLog 要留着供审计，而流水行上的 teamId 必须还能查回团队名。
+ * 挂在这个团队名下的画布必须同事务收回个人：teamId 留着的话，画布的付费方解析会一直卡在
+ * 「团队不可用」，画布的主人从此既不能在上面花钱、也没有任何入口把它解绑，等于被永久锁死。
  */
 export async function disbandTeam(teamId: string, actorId: string) {
     await requireTeamRole(actorId, teamId, "team.disband", { write: true });
     await serialTransaction(async (manager) => {
         await manager.getRepository(Team).update({ id: teamId }, { status: "disbanded", updatedAt: now() });
+        await manager.getRepository(Project).update({ teamId }, { teamId: "", updatedAt: now() });
         await manager.getRepository(TeamMember).delete({ teamId });
         await manager.getRepository(TeamInvite).update({ teamId }, { enabled: false });
     });

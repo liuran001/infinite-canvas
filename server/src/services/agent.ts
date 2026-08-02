@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { MoreThan } from "typeorm";
 
-import { repo } from "../db/data-source";
+import { repo, serialTransaction } from "../db/data-source";
 import { AgentMessage, AgentSession, type AgentMessageRole, type AgentPendingAction, type AgentSessionStatus } from "../db/entities";
 import { fail, newId, now, SafeError } from "../lib/errors";
 import { upstreamJson } from "../lib/upstream";
@@ -198,6 +198,8 @@ export async function createAgentSession(userId: string, input: { sessionId: str
         deleted: false,
         payerKind: payer.kind,
         payerTeamId: payer.kind === "team" ? payer.teamId : "",
+        payerLogId: "",
+        payerCredits: 0,
         createdAt: saved?.createdAt || now(),
         updatedAt: now(),
     } as AgentSession);
@@ -506,19 +508,53 @@ async function runLoop(session: AgentSession, signal: AbortSignal) {
     return true;
 }
 
+/**
+ * 会话行上「已扣未结」的那一笔。退款只认它，不认内存里的回执：
+ * 循环可能跨进程重启才走到退款，那时内存里的回执早没了，而钱是必须退的。
+ */
+function outstandingReceipt(session: AgentSession): ChargeReceipt {
+    return { payer: payerOfSession(session), credits: session.payerCredits || 0, logId: session.payerLogId || "" };
+}
+
+/**
+ * 扣费并把回执落到会话行上，两件事同一个事务：
+ * 分两步做的话，进程崩在中间就是钱扣了、会话行上却查不到那笔流水，重启时既退不掉也没人认领。
+ */
+async function chargeSession(session: AgentSession, model: string, credits: number) {
+    return serialTransaction(async (manager) => {
+        const receipt = await charge(payerOfSession(session), credits, { model, path: "/agent" });
+        await manager.getRepository(AgentSession).update({ userId: session.userId, sessionId: session.sessionId }, { payerLogId: receipt.logId, payerCredits: receipt.credits });
+        session.payerLogId = receipt.logId;
+        session.payerCredits = receipt.credits;
+        return receipt;
+    });
+}
+
+/** 结清：执行成功、或退款成功之后，都必须把这两列清掉，否则下一次重启会把同一笔当成未结的再处理一遍。 */
+async function clearOutstanding(session: AgentSession) {
+    if (!session.payerLogId && !session.payerCredits) return;
+    session.payerLogId = "";
+    session.payerCredits = 0;
+    await sessions().update({ userId: session.userId, sessionId: session.sessionId }, { payerLogId: "", payerCredits: 0 });
+}
+
 /** 失败或中止时把这条消息扣的那一次点原路返还；跑了多少轮都只返还这一次。 */
-async function runSession(session: AgentSession, model: string, receipt: ChargeReceipt) {
+async function runSession(session: AgentSession, model: string) {
     const key = busKey(session.userId, session.sessionId);
     const controller = new AbortController();
     running.set(key, controller);
     try {
         // 停下来等确认时状态已经是 awaiting，这里不能再覆写成 idle，否则前端刚弹出的确认框会立刻消失。
-        if (!(await runLoop(session, controller.signal))) await patchSession(session, { status: "idle", error: "" });
+        const awaiting = await runLoop(session, controller.signal);
+        // 跑到这里就是这一段执行已经交付了（要么收工、要么停在等确认），那笔钱不再退。
+        await clearOutstanding(session).catch(() => undefined);
+        if (!awaiting) await patchSession(session, { status: "idle", error: "" });
     } catch (error) {
         const aborted = controller.signal.aborted;
         if (!aborted) console.error(`agent session ${session.sessionId} failed:`, error);
-        // 退款只认回执：这一轮跑的过程中用户可能已经被移出团队，重新解析会把团队的钱退进个人余额。
-        await refund(receipt, { model, path: "/agent" }).catch(() => undefined);
+        // 退款只认会话行上固化的回执：这一轮跑的过程中用户可能已经被移出团队，重新解析会把团队的钱退进个人余额。
+        await refund(outstandingReceipt(session), { model, path: "/agent" }).catch(() => undefined);
+        await clearOutstanding(session).catch(() => undefined);
         const message = error instanceof SafeError ? error.message : "Agent 执行失败，请稍后重试";
         await appendMessage(session, "assistant", { content: aborted ? "已中止本次执行。" : message }).catch(() => undefined);
         await patchSession(session, { status: aborted ? "idle" : "failed", error: aborted ? "" : message, pendingAction: null }).catch(() => undefined);
@@ -547,17 +583,17 @@ export async function resolveAgentSession(userId: string, sessionId: string, app
         await appendMessage(session, "assistant", { content: `已把画布标题改成「${action.title}」。` });
         // 轮数不重置：改个标题不该顺带送一整轮预算，接着用剩下的额度把原来的事做完。
         await patchSession(session, { status: "running", error: "", pendingAction: null });
-        // 改标题不扣费，所以这里给的是一张零额回执：refund 见到 credits 为 0 直接返回，不会凭空退出一笔钱。
-        void runSession(session, session.model, { payer: payerOfSession(session), credits: 0, logId: "" });
+        // 改标题不扣费，会话行上的 outstanding 也已经在上一段执行收尾时清空，这里不需要再扣一次。
+        void runSession(session, session.model);
         return toSessionView(session);
     }
 
     // 续跑是用户明确要求的新一段执行，所以按当前模型单价重新扣一次点；余额不够就明确拒绝，不偷偷放行。
     const credits = await modelCost(session.model);
-    const receipt = await charge(payerOfSession(session), credits, { model: session.model, path: "/agent" });
+    await chargeSession(session, session.model, credits);
     await appendMessage(session, "assistant", { content: "好的，继续执行。" });
     await patchSession(session, { status: "running", error: "", pendingAction: null, rounds: 0 });
-    void runSession(session, session.model, receipt);
+    void runSession(session, session.model);
     return toSessionView(session);
 }
 
@@ -669,19 +705,20 @@ export async function sendAgentMessage(userId: string, sessionId: string, input:
     // 扣费在真正开始执行之前：余额不足就直接拒绝，连循环都不启动。
     // 付费方取会话创建时固化的那个，不按当前团队成员关系重算：一段会话中途换池子付款是对不上账的。
     const credits = await modelCost(model);
-    const receipt = await charge(payerOfSession(session), credits, { model, path: "/agent" });
+    const receipt = await chargeSession(session, model, credits);
     const first = !session.lastSeq;
     try {
         // rounds 清零：轮数预算是按「一条用户消息」给的，不是按会话累计的。
         await patchSession(session, { model, status: "running", error: "", rounds: 0, title: first ? (content || "图片消息").slice(0, 30) : session.title });
         const row = await appendMessage(session, "user", { content, clientMessageId, attachments, references });
-        void runSession(session, model, receipt);
+        void runSession(session, model);
         // 起标题和执行并行跑，接口不等它：拿到了就通过 SSE 把新标题推出去，拿不到就一直用上面的截断兜底。
         if (first) void generateSessionTitle(session, content).catch(() => undefined);
         return toMessageView(row);
     } catch (error) {
         // 还没开始跑就失败了，扣掉的那一次要还回去，否则用户白花一次钱。
         await refund(receipt, { model, path: "/agent" }).catch(() => undefined);
+        await clearOutstanding(session).catch(() => undefined);
         throw error;
     }
 }
@@ -690,8 +727,16 @@ export async function sendAgentMessage(userId: string, sessionId: string, input:
  * 进程重启后内存里的循环已经没了，把残留的 running 标成失败，免得前端一直转圈等一个不存在的任务。
  * awaiting 一并清掉：那条待确认请求属于上一次执行，而那次执行的轮数预算与已经扣掉的算力点都随进程一起没了，
  * 留着让用户回来点同意，等于拿一份对不上账的上下文接着跑；不如直接失效，让他重新发一条消息。
+ *
+ * 置为失败之前必须逐行把「已扣未结」的那一笔退掉：这段执行永远不会再交付了，
+ * 钱留在那儿就是用户白付。退款幂等，崩在退款与清零之间、重启后再走一遍也不会退第二次。
  */
 export async function resetRunningAgentSessions() {
+    const stale = await sessions().find({ where: [{ status: "running" }, { status: "awaiting" }] });
+    for (const session of stale) {
+        if (session.payerCredits > 0 && session.payerLogId) await refund(outstandingReceipt(session), { model: session.model, path: "/agent" }).catch(() => undefined);
+        await clearOutstanding(session).catch(() => undefined);
+    }
     await sessions().update({ status: "running" }, { status: "failed", error: "服务已重启，请重新发送消息", pendingAction: null, updatedAt: now() });
     await sessions().update({ status: "awaiting" }, { status: "failed", error: "服务已重启，待确认的请求已失效，请重新发送消息", pendingAction: null, updatedAt: now() });
 }

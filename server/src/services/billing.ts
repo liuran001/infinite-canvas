@@ -1,5 +1,8 @@
+import { type EntityManager } from "typeorm";
+
 import { repo, serialTransaction } from "../db/data-source";
 import { AgentSession, CreditLog, Job, Project, Team, TeamCreditLog, TeamMember, User, type CreditLogType, type TeamLimitWindow } from "../db/entities";
+import { isUniqueViolation } from "../lib/db-errors";
 import { fail, newId, now } from "../lib/errors";
 import { getPreferences } from "./preferences";
 import { canTeamAction } from "./team-access";
@@ -38,10 +41,13 @@ function windowStart(window: TeamLimitWindow) {
  * 成员在本窗口已经花掉多少，按团队流水实时聚合，不落任何冗余计数列：
  * 冗余列只要漏改一条路径（退款、管理员调整、并发回滚）就会永久漂移，而漂移的额度是查不出来的。
  * 退款一并计入（amount 为正），否则失败重试几次就能把额度白白耗光。
+ * 必须传入扣费事务自己的 manager：聚合与扣费分处两个事务时，两笔并发调用会读到同一份「已用量」，
+ * 各自都判定没超额，额度就被突破了。同一事务内做聚合才让「读到的用量」和「写进去的这一笔」串起来。
  */
-async function usedByMember(teamId: string, userId: string, window: TeamLimitWindow) {
+async function usedByMember(manager: EntityManager, teamId: string, userId: string, window: TeamLimitWindow) {
     const start = windowStart(window);
-    const query = repo(TeamCreditLog)
+    const query = manager
+        .getRepository(TeamCreditLog)
         .createQueryBuilder("log")
         .select("SUM(log.amount)", "total")
         .where("log.teamId = :teamId AND log.userId = :userId", { teamId, userId })
@@ -52,10 +58,10 @@ async function usedByMember(teamId: string, userId: string, window: TeamLimitWin
 }
 
 /** 团队消费的资格：团队在用、成员在册且状态正常、角色允许花钱。三者缺一都不能动团队池。 */
-async function assertCanSpend(teamId: string, memberId: string) {
-    const team = await repo(Team).findOneBy({ id: teamId });
+async function assertCanSpend(manager: EntityManager, teamId: string, memberId: string) {
+    const team = await manager.getRepository(Team).findOneBy({ id: teamId });
     if (!team || team.status !== "active") throw fail("团队不可用", 403, TEAM_SPEND_FORBIDDEN);
-    const member = await repo(TeamMember).findOneBy({ teamId, userId: memberId });
+    const member = await manager.getRepository(TeamMember).findOneBy({ teamId, userId: memberId });
     if (!member || member.status !== "active") throw fail("你不是该团队的正常成员", 403, TEAM_SPEND_FORBIDDEN);
     if (!canTeamAction(member.role, "credits.spend")) throw fail("你在该团队中没有消费权限", 403, TEAM_SPEND_FORBIDDEN);
     return member;
@@ -66,70 +72,80 @@ async function assertCanSpend(teamId: string, memberId: string) {
  * 三步分开做的话，进程在中间挂掉就是「钱扣了没流水」；并发下各自单独读一次余额，
  * 两条流水还会记到同一个 balance 上，对账时流水累加永远回不到 users.credits。
  * 事务只负责「三件事要么全成要么全不成」，不扣成负数仍然由 `WHERE credits >= :amount` 这个条件更新本身保证。
+ * refundOf 只有退款行才传，靠列上的唯一索引把「同一笔扣费退第二次」挡在数据库层。
  */
-async function moveUserCredits(userId: string, delta: number, type: CreditLogType, remark: string, extra: unknown, relatedId = "") {
-    return serialTransaction(async (manager) => {
-        const users = manager.getRepository(User);
-        const result = await users
-            .createQueryBuilder()
-            .update(User)
-            .set({ credits: () => (delta < 0 ? "credits - :amount" : "credits + :amount"), updatedAt: now() })
-            .where(delta < 0 ? "id = :userId AND credits >= :amount" : "id = :userId", { userId })
-            .setParameter("amount", Math.abs(delta))
-            .execute();
-        if (!result.affected) throw fail(delta < 0 ? "算力点不足" : "用户不存在");
-        const user = await users.findOneBy({ id: userId });
-        const logId = newId("credit");
-        await manager.getRepository(CreditLog).insert({
-            id: logId,
-            userId,
-            type,
-            amount: delta,
-            balance: user?.credits || 0,
-            relatedId,
-            remark,
-            extra: extra ? JSON.stringify(extra) : "",
-            createdAt: now(),
-        });
-        return logId;
+async function moveUserCredits(manager: EntityManager, userId: string, delta: number, type: CreditLogType, remark: string, extra: unknown, relatedId = "", refundOf: string | null = null) {
+    const users = manager.getRepository(User);
+    const result = await users
+        .createQueryBuilder()
+        .update(User)
+        .set({ credits: () => (delta < 0 ? "credits - :amount" : "credits + :amount"), updatedAt: now() })
+        .where(delta < 0 ? "id = :userId AND credits >= :amount" : "id = :userId", { userId })
+        .setParameter("amount", Math.abs(delta))
+        .execute();
+    if (!result.affected) throw fail(delta < 0 ? "算力点不足" : "用户不存在");
+    const user = await users.findOneBy({ id: userId });
+    const logId = newId("credit");
+    await manager.getRepository(CreditLog).insert({
+        id: logId,
+        userId,
+        type,
+        amount: delta,
+        balance: user?.credits || 0,
+        relatedId,
+        refundOf,
+        remark,
+        extra: extra ? JSON.stringify(extra) : "",
+        createdAt: now(),
     });
+    return logId;
 }
 
-/** 团队池的同一套动作。条件更新挡住并发超扣，流水与余额同事务，balance 记的是团队池而不是谁的个人余额。 */
-async function moveTeamCredits(teamId: string, memberId: string, delta: number, type: "ai_consume" | "ai_refund", meta: ChargeMeta, remark: string, relatedId = "") {
-    return serialTransaction(async (manager) => {
-        const teams = manager.getRepository(Team);
-        const result = await teams
-            .createQueryBuilder()
-            .update(Team)
-            .set({ credits: () => (delta < 0 ? "credits - :amount" : "credits + :amount"), updatedAt: now() })
-            .where(delta < 0 ? "id = :teamId AND credits >= :amount" : "id = :teamId", { teamId })
-            .setParameter("amount", Math.abs(delta))
-            .execute();
-        if (!result.affected) return "";
-        const team = await teams.findOneBy({ id: teamId });
-        const logId = newId("team-credit");
-        await manager.getRepository(TeamCreditLog).insert({
-            id: logId,
-            teamId,
-            userId: memberId,
-            type,
-            amount: delta,
-            balance: team?.credits || 0,
-            model: meta.model,
-            relatedId,
-            remark,
-            extra: JSON.stringify({ model: meta.model, path: meta.path }),
-            createdAt: now(),
-        });
-        return logId;
+/**
+ * 团队池的同一套动作。条件更新挡住并发超扣，流水与余额同事务，balance 记的是团队池而不是谁的个人余额。
+ * 扣费时余额不够返回空串（由调用方决定是留痕还是回落）；退款时目标团队不存在必须抛错——
+ * 静默返回等于把「钱没退回去」伪装成一次成功的退款，而这条路径上没有任何人会再去核对。
+ */
+async function moveTeamCredits(manager: EntityManager, teamId: string, memberId: string, delta: number, type: "ai_consume" | "ai_refund", meta: ChargeMeta, remark: string, relatedId = "", refundOf: string | null = null) {
+    const teams = manager.getRepository(Team);
+    const result = await teams
+        .createQueryBuilder()
+        .update(Team)
+        .set({ credits: () => (delta < 0 ? "credits - :amount" : "credits + :amount"), updatedAt: now() })
+        .where(delta < 0 ? "id = :teamId AND credits >= :amount" : "id = :teamId", { teamId })
+        .setParameter("amount", Math.abs(delta))
+        .execute();
+    if (!result.affected) {
+        if (delta > 0) throw fail("退款失败：团队不存在");
+        return "";
+    }
+    const team = await teams.findOneBy({ id: teamId });
+    const logId = newId("team-credit");
+    await manager.getRepository(TeamCreditLog).insert({
+        id: logId,
+        teamId,
+        userId: memberId,
+        type,
+        amount: delta,
+        balance: team?.credits || 0,
+        model: meta.model,
+        relatedId,
+        refundOf,
+        remark,
+        extra: JSON.stringify({ model: meta.model, path: meta.path }),
+        createdAt: now(),
     });
+    return logId;
 }
 
-/** 团队池不足的留痕。金额 0，只为让成员和管理员事后查得出「这里被拒过一次」。 */
-async function logInsufficient(teamId: string, memberId: string, credits: number, meta: ChargeMeta) {
-    const team = await repo(Team).findOneBy({ id: teamId });
-    await repo(TeamCreditLog).insert({
+/**
+ * 团队池不足的留痕。金额 0，只为让成员和管理员事后查得出「这里被拒过一次」。
+ * 必须在扣费失败的那个事务里写：另开一次事务读余额，读到的可能已经是别人充值之后的数字，
+ * 留痕上的余额就与「当时为什么不够」对不上了。
+ */
+async function logInsufficient(manager: EntityManager, teamId: string, memberId: string, credits: number, meta: ChargeMeta, fallback: boolean) {
+    const team = await manager.getRepository(Team).findOneBy({ id: teamId });
+    await manager.getRepository(TeamCreditLog).insert({
         id: newId("team-credit"),
         teamId,
         userId: memberId,
@@ -138,8 +154,9 @@ async function logInsufficient(teamId: string, memberId: string, credits: number
         balance: team?.credits || 0,
         model: meta.model,
         relatedId: "",
+        refundOf: null,
         remark: `团队算力点不足，本次需要 ${credits}`,
-        extra: JSON.stringify({ model: meta.model, path: meta.path, needed: credits }),
+        extra: JSON.stringify({ model: meta.model, path: meta.path, needed: credits, fallback }),
         createdAt: now(),
     });
 }
@@ -149,29 +166,39 @@ async function logInsufficient(teamId: string, memberId: string, credits: number
  * 团队池不足默认直接拒绝：悄悄改扣个人余额等于替用户做了一次付款决定，
  * 只有用户本人在偏好里显式打开 billingFallbackToPersonal 才回落，而且回落后的回执 payer 就是个人，
  * 退款照样退回个人——两本账从头到尾没有互相担保过。
+ *
+ * 团队分支的资格校验、额度聚合、池子扣减、留痕全部落在同一个事务里：
+ * 拆开做的话，两笔并发调用会各自读到同一份「已用量」，双双判定没超额，额度形同虚设。
  */
 export async function charge(payer: Payer, credits: number, meta: ChargeMeta): Promise<ChargeReceipt> {
     if (credits <= 0) return { payer, credits: 0, logId: "" };
     if (payer.kind === "user") {
-        const logId = await moveUserCredits(payer.userId, -credits, "ai_consume", `调用模型 ${meta.model}`, { model: meta.model, path: meta.path });
+        const logId = await serialTransaction((manager) => moveUserCredits(manager, payer.userId, -credits, "ai_consume", `调用模型 ${meta.model}`, { model: meta.model, path: meta.path }));
         return { payer, credits, logId };
     }
 
-    const member = await assertCanSpend(payer.teamId, payer.memberId);
-    if (member.creditLimit > 0) {
-        const used = await usedByMember(payer.teamId, payer.memberId, member.limitWindow);
-        if (used + credits > member.creditLimit) throw fail(`已超出你在该团队的额度：${used}/${member.creditLimit}`, 403, TEAM_MEMBER_LIMIT_EXCEEDED);
-    }
-
-    const logId = await moveTeamCredits(payer.teamId, payer.memberId, -credits, "ai_consume", meta, `调用模型 ${meta.model}`);
+    // 回落与否要看用户偏好，而它决定的是留痕里写什么，所以在进事务之前先读出来。
+    const preferences = await getPreferences(payer.memberId);
+    const fallbackAllowed = preferences.billingFallbackToPersonal === true;
+    const logId = await serialTransaction(async (manager) => {
+        const member = await assertCanSpend(manager, payer.teamId, payer.memberId);
+        if (member.creditLimit > 0) {
+            const used = await usedByMember(manager, payer.teamId, payer.memberId, member.limitWindow);
+            if (used + credits > member.creditLimit) throw fail(`已超出你在该团队的额度：${used}/${member.creditLimit}`, 403, TEAM_MEMBER_LIMIT_EXCEEDED);
+        }
+        const teamLogId = await moveTeamCredits(manager, payer.teamId, payer.memberId, -credits, "ai_consume", meta, `调用模型 ${meta.model}`);
+        // 留痕与扣费失败必须同事务：抛错会把留痕一起回滚，所以这里只返回空串，由外面决定抛不抛。
+        if (!teamLogId) await logInsufficient(manager, payer.teamId, payer.memberId, credits, meta, fallbackAllowed);
+        return teamLogId;
+    });
     if (logId) return { payer, credits, logId };
 
-    await logInsufficient(payer.teamId, payer.memberId, credits, meta);
-    const preferences = await getPreferences(payer.memberId);
-    if (preferences.billingFallbackToPersonal !== true) throw fail("团队算力点不足", 403, TEAM_CREDITS_EXHAUSTED);
+    if (!fallbackAllowed) throw fail("团队算力点不足", 403, TEAM_CREDITS_EXHAUSTED);
     // 回落是另一笔账：付费方从此就是个人，回执里再也看不到团队，退款自然也回不到团队池。
     const personal: Payer = { kind: "user", userId: payer.memberId };
-    const fallbackLogId = await moveUserCredits(payer.memberId, -credits, "ai_consume", `调用模型 ${meta.model}`, { model: meta.model, path: meta.path, fallbackFromTeamId: payer.teamId });
+    const fallbackLogId = await serialTransaction((manager) =>
+        moveUserCredits(manager, payer.memberId, -credits, "ai_consume", `调用模型 ${meta.model}`, { model: meta.model, path: meta.path, fallbackFromTeamId: payer.teamId }),
+    );
     return { payer: personal, credits, logId: fallbackLogId };
 }
 
@@ -179,14 +206,37 @@ export async function charge(payer: Payer, credits: number, meta: ChargeMeta): P
  * 原路退款。只读回执，回执金额为 0 时什么都不做。
  * 团队停用、成员已被移出都照退不误：钱是当初从那个池子里扣走的，
  * 退款是把它放回原处，不是一次需要重新鉴权的新消费。
+ *
+ * 非零退款必须带着原始扣费流水的 ID，并且在事务里把那条流水查出来核对付款方与金额：
+ * 少了这一步，任何一个「我大概扣过 N 点」的调用点都能凭空造出一笔退款，而退款是直接加钱的。
+ * 重复退款靠流水表上的 refundOf 唯一索引挡住，返回 false 表示这笔已经退过，调用方据此收尾即可。
  */
-export async function refund(receipt: ChargeReceipt, meta: ChargeMeta) {
-    if (receipt.credits <= 0) return;
-    if (receipt.payer.kind === "user") {
-        await moveUserCredits(receipt.payer.userId, receipt.credits, "ai_refund", `模型调用失败返还 ${meta.model}`, { model: meta.model, path: meta.path }, receipt.logId);
-        return;
+export async function refund(receipt: ChargeReceipt, meta: ChargeMeta): Promise<boolean> {
+    if (receipt.credits <= 0) return false;
+    if (!receipt.logId) throw fail("退款缺少原始扣费流水 ID");
+    try {
+        return await serialTransaction(async (manager) => {
+            if (receipt.payer.kind === "user") {
+                const origin = await manager.getRepository(CreditLog).findOneBy({ id: receipt.logId });
+                if (!origin || origin.type !== "ai_consume") throw fail("退款失败：找不到原始扣费流水");
+                if (origin.userId !== receipt.payer.userId) throw fail("退款失败：付款方与原始扣费不符");
+                if (origin.amount !== -receipt.credits) throw fail("退款失败：退款金额与原始扣费不符");
+                await moveUserCredits(manager, receipt.payer.userId, receipt.credits, "ai_refund", `模型调用失败返还 ${meta.model}`, { model: meta.model, path: meta.path }, receipt.logId, receipt.logId);
+                return true;
+            }
+            const origin = await manager.getRepository(TeamCreditLog).findOneBy({ id: receipt.logId });
+            if (!origin || origin.type !== "ai_consume") throw fail("退款失败：找不到原始扣费流水");
+            if (origin.teamId !== receipt.payer.teamId) throw fail("退款失败：付款方与原始扣费不符");
+            if (origin.amount !== -receipt.credits) throw fail("退款失败：退款金额与原始扣费不符");
+            // 退款记在原始扣费的那个成员名下，而不是此刻发起退款的人：额度聚合按成员算，记错人等于把额度还给了别人。
+            await moveTeamCredits(manager, receipt.payer.teamId, origin.userId, receipt.credits, "ai_refund", meta, `模型调用失败返还 ${meta.model}`, receipt.logId, receipt.logId);
+            return true;
+        });
+    } catch (error) {
+        // 唯一索引撞上说明这笔已经退过了：崩溃重启后的重放本就该是空操作，不是错误。
+        if (isUniqueViolation(error)) return false;
+        throw error;
     }
-    await moveTeamCredits(receipt.payer.teamId, receipt.payer.memberId, receipt.credits, "ai_refund", meta, `模型调用失败返还 ${meta.model}`, receipt.logId);
 }
 
 /** 任务上固化的付费方。存量任务读出来的 payerKind 就是 user，因此老任务的行为一字不变。 */
@@ -215,7 +265,7 @@ export function receiptOfJob(job: Pick<Job, "userId" | "payerKind" | "payerTeamI
 export async function payerOfProject(userId: string, projectId: string): Promise<Payer> {
     const project = await repo(Project).findOneBy({ userId, projectId });
     if (!project || project.deleted || !project.teamId) return { kind: "user", userId };
-    await assertCanSpend(project.teamId, userId);
+    await serialTransaction((manager) => assertCanSpend(manager, project.teamId, userId));
     return { kind: "team", teamId: project.teamId, memberId: userId };
 }
 
@@ -261,6 +311,7 @@ export async function setUserCredits(userId: string, credits: number) {
                 amount: next - user.credits,
                 balance: next,
                 relatedId: "",
+                refundOf: null,
                 remark: "后台手动调整",
                 extra: "",
                 createdAt: now(),

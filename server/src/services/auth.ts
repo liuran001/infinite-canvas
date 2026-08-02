@@ -8,7 +8,7 @@ import { repo } from "../db/data-source";
 import { CreditLog, DEFAULT_STORAGE_QUOTA, User, type CreditLogType, type UserRole, type UserStatus } from "../db/entities";
 import { fail, firstNonEmpty, newAffCode, newId, now } from "../lib/errors";
 import type { Query } from "../lib/response";
-import { charge, refund, setUserCredits } from "./billing";
+import { setUserCredits } from "./billing";
 import { claimInviteCode, recordInviteUse, releaseInviteCode } from "./invites";
 import { usedBytesOf } from "./quota";
 import { getSettings } from "./settings";
@@ -247,17 +247,6 @@ export async function adjustUserQuota(id: string, quota: number) {
     return { ...(await users.save(user)), password: "" };
 }
 
-/**
- * 扣点与退款的实现都在 billing.ts（扣费、读回余额、写流水同事务）。
- * 这两个是保留给现有调用点的薄封装，签名与语义一字不变。
- */
-export async function consumeUserCredits(userId: string, model: string, credits: number, path: string) {
-    await charge({ kind: "user", userId }, credits, { model, path });
-}
-
-export async function refundUserCredits(userId: string, model: string, credits: number, path: string) {
-    await refund({ payer: { kind: "user", userId }, credits, logId: "" }, { model, path });
-}
 
 export async function listCreditLogs(query: Query) {
     const like = query.keyword ? Like(`%${query.keyword}%`) : undefined;

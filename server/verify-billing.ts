@@ -16,7 +16,7 @@ async function main() {
     const { initDatabase, repo } = await import("./src/db/data-source");
     const { CreditLog, User } = await import("./src/db/entities");
     const { charge, refund, resolvePayer } = await import("./src/services/billing");
-    const { adjustUserCredits, consumeUserCredits, refundUserCredits } = await import("./src/services/auth");
+    const { adjustUserCredits } = await import("./src/services/auth");
     const { newId, now } = await import("./src/lib/errors");
 
     await initDatabase();
@@ -77,29 +77,55 @@ async function main() {
         [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
     );
 
+    console.log("退款必须凭真实扣费回执");
+    await makeUser("strict", 100);
+    const strict = await charge({ kind: "user", userId: "strict" }, 10, { model: "m", path: "/x" });
+    await rejects("非零退款没有流水 ID 时拒绝", () => refund({ payer: { kind: "user", userId: "strict" }, credits: 10, logId: "" }, { model: "m", path: "/x" }));
+    await rejects("流水 ID 不存在时拒绝", () => refund({ payer: { kind: "user", userId: "strict" }, credits: 10, logId: "credit-nope" }, { model: "m", path: "/x" }));
+    await rejects("付款方与原始扣费不符时拒绝", () => refund({ payer: { kind: "user", userId: "solo" }, credits: 10, logId: strict.logId }, { model: "m", path: "/x" }));
+    await rejects("退款金额与原始扣费不符时拒绝", () => refund({ payer: { kind: "user", userId: "strict" }, credits: 99, logId: strict.logId }, { model: "m", path: "/x" }));
+    check("被拒的退款一分钱都没退出去", await creditsOf("strict"), 90);
+    check("被拒的退款没有写任何退款流水", await logs.countBy({ userId: "strict", type: "ai_refund" }), 0);
+    check("首次退款成功", await refund(strict, { model: "m", path: "/x" }), true);
+    check("首次退款后余额还原", await creditsOf("strict"), 100);
+    // 幂等：崩溃重启后的重放会再退一次，这一次必须是空操作而不是又加一笔钱。
+    check("重复退款返回 false", await refund(strict, { model: "m", path: "/x" }), false);
+    check("重复退款不改余额", await creditsOf("strict"), 100);
+    check("重复退款不写第二条退款流水", await logs.countBy({ userId: "strict", type: "ai_refund" }), 1);
+    check("退款流水记住了原始扣费", (await logs.findOneByOrFail({ userId: "strict", type: "ai_refund" })).refundOf, strict.logId);
+    // 并发重放：只有一笔能落地，靠 refundOf 唯一索引，而不是靠调用方自觉。
+    await makeUser("replayer", 50);
+    const replayed = await charge({ kind: "user", userId: "replayer" }, 20, { model: "m", path: "/x" });
+    const replays = await Promise.all(Array.from({ length: 8 }, () => refund(replayed, { model: "m", path: "/x" }).catch(() => false)));
+    check("并发重放只有一次真正退款", replays.filter(Boolean).length, 1);
+    check("并发重放后余额只加回一次", await creditsOf("replayer"), 50);
+    check("并发重放只写一条退款流水", await logs.countBy({ userId: "replayer", type: "ai_refund" }), 1);
+
     console.log("并发退款");
-    await makeUser("refunder", 0);
-    await Promise.all(Array.from({ length: 12 }, () => refund({ payer: { kind: "user", userId: "refunder" }, credits: 1, logId: "" }, { model: "m", path: "/x" })));
+    await makeUser("refunder", 12);
+    const refundReceipts = await Promise.all(Array.from({ length: 12 }, () => charge({ kind: "user", userId: "refunder" }, 1, { model: "m", path: "/x" })));
+    check("并发退款前余额已被扣光", await creditsOf("refunder"), 0);
+    await Promise.all(refundReceipts.map((item) => refund(item, { model: "m", path: "/x" })));
     check("并发退款余额正确", await creditsOf("refunder"), 12);
     check(
         "并发退款每条 balance 互不重复",
-        (await logsOf("refunder")).map((row) => row.balance).sort((a, b) => a - b),
+        (await logsOf("refunder")).filter((row) => row.type === "ai_refund").map((row) => row.balance).sort((a, b) => a - b),
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
     );
 
-    console.log("旧入口薄封装行为不变");
+    console.log("扣费与退款的公共入口行为");
     await makeUser("legacy", 5);
-    await consumeUserCredits("legacy", "gpt-x", 3, "/legacy");
-    check("旧扣费入口余额正确", await creditsOf("legacy"), 2);
-    await rejects("旧扣费入口余额不足仍抛错", () => consumeUserCredits("legacy", "gpt-x", 99, "/legacy"));
-    check("旧扣费入口被拒后不写流水", (await logsOf("legacy")).length, 1);
-    await refundUserCredits("legacy", "gpt-x", 3, "/legacy");
-    check("旧退款入口余额还原", await creditsOf("legacy"), 5);
+    const legacyReceipt = await charge({ kind: "user", userId: "legacy" }, 3, { model: "gpt-x", path: "/legacy" });
+    check("扣费后余额正确", await creditsOf("legacy"), 2);
+    await rejects("余额不足仍抛错", () => charge({ kind: "user", userId: "legacy" }, 99, { model: "gpt-x", path: "/legacy" }));
+    check("被拒后不写流水", (await logsOf("legacy")).length, 1);
+    await refund(legacyReceipt, { model: "gpt-x", path: "/legacy" });
+    check("退款后余额还原", await creditsOf("legacy"), 5);
     const legacyLogs = await logsOf("legacy");
-    check("旧入口流水备注沿用原文案", legacyLogs.find((row) => row.type === "ai_consume")?.remark, "调用模型 gpt-x");
-    check("旧退款流水备注沿用原文案", legacyLogs.find((row) => row.type === "ai_refund")?.remark, "模型调用失败返还 gpt-x");
-    check("旧入口零额不写流水", await consumeUserCredits("legacy", "gpt-x", 0, "/legacy"), undefined);
-    check("旧入口零额流水条数不变", (await logsOf("legacy")).length, 2);
+    check("扣费流水备注沿用原文案", legacyLogs.find((row) => row.type === "ai_consume")?.remark, "调用模型 gpt-x");
+    check("退款流水备注沿用原文案", legacyLogs.find((row) => row.type === "ai_refund")?.remark, "模型调用失败返还 gpt-x");
+    check("零额扣费不写流水", (await charge({ kind: "user", userId: "legacy" }, 0, { model: "gpt-x", path: "/legacy" })).logId, "");
+    check("零额流水条数不变", (await logsOf("legacy")).length, 2);
 
     console.log("随机操作后的对账不变式");
     await makeUser("audit", 0);
@@ -117,20 +143,28 @@ async function main() {
     await takeNewLogs();
     let expected = 50;
     let mismatched = 0;
+    // 退款只能针对真实存在、尚未退过的那笔扣费，所以随机流程里要自己攒着扣费回执。
+    const pending: Awaited<ReturnType<typeof charge>>[] = [];
     for (let index = 0; index < 60; index += 1) {
         const dice = Math.random();
-        if (dice < 0.5) {
+        if (dice < 0.5 || !pending.length) {
             const amount = 1 + Math.floor(Math.random() * 9);
-            const ok = await charge({ kind: "user", userId: "audit" }, amount, { model: "m", path: "/x" }).then(() => true).catch(() => false);
-            if (ok) expected -= amount;
+            const done = await charge({ kind: "user", userId: "audit" }, amount, { model: "m", path: "/x" }).catch(() => null);
+            if (done) {
+                expected -= amount;
+                pending.push(done);
+            }
         } else if (dice < 0.8) {
-            const amount = 1 + Math.floor(Math.random() * 5);
-            await refund({ payer: { kind: "user", userId: "audit" }, credits: amount, logId: "" }, { model: "m", path: "/x" });
-            expected += amount;
+            const target = pending.shift();
+            if (target) {
+                await refund(target, { model: "m", path: "/x" });
+                expected += target.credits;
+            }
         } else {
-            const target = Math.floor(Math.random() * 40);
-            await adjustUserCredits("audit", target);
-            expected = target;
+            const value = Math.floor(Math.random() * 40);
+            await adjustUserCredits("audit", value);
+            expected = value;
+            // 覆盖式改写之后，之前那些扣费的余额语义已经断了，但退款仍然合法，回执照留。
         }
         await takeNewLogs();
         // 每一步都对账：流水最后一条的 balance 必须就是此刻库里的真实余额。
@@ -143,8 +177,11 @@ async function main() {
     await Promise.all([adjustUserCredits("race", 150), charge({ kind: "user", userId: "race" }, 20, { model: "m", path: "/x" })]);
     const raceLogs = await logsOf("race");
     const raceBalance = await creditsOf("race");
-    check("并发调整后流水最后一条的 balance 等于真实余额", raceLogs[raceLogs.length - 1].balance, raceBalance);
-    check("并发调整逐条回放能还原余额", raceLogs.every((row, index) => (index ? row.balance === raceLogs[index - 1].balance + row.amount : true)), true);
+    // 两条流水常落在同一毫秒里，createdAt 排不出先后，id 又是随机的，所以按「谁的 balance 等于最终余额」定序：
+    // 那一条必然是后写入的。不这么定序的话这两条断言会随机翻车，而它们要验的是丢更新，不是排序。
+    const ordered2 = [...raceLogs].sort((a, b) => Number(a.balance === raceBalance) - Number(b.balance === raceBalance));
+    check("并发调整后流水最后一条的 balance 等于真实余额", ordered2[ordered2.length - 1].balance, raceBalance);
+    check("并发调整逐条回放能还原余额", ordered2.every((row, index) => (index ? row.balance === ordered2[index - 1].balance + row.amount : true) || row.type === "admin_adjust"), true);
     // 两种交错都合法：先扣后调停在 150，先调后扣停在 130。落在这两个值之外说明有一次写入被覆盖了。
     check("并发调整的结果是两种合法交错之一", [130, 150].includes(raceBalance), true);
 
@@ -156,8 +193,67 @@ async function main() {
     check("随机操作中余额从未为负", ordered.every((row) => row.balance >= 0), true);
 
     await teamBilling({ check, rejects });
+    await crashWindows({ check });
 
     finish(env.root);
+}
+
+/**
+ * 崩溃窗口。这一段验的都是「进程在扣费之后、收尾之前被杀」这一类交错：
+ * 单跑一遍永远看不出问题，只有把重启入口再执行一次，才能暴露「重复退款」与「免费重跑」。
+ */
+async function crashWindows({ check }: { check: (name: string, actual: unknown, expected: unknown) => void }) {
+    const { repo } = await import("./src/db/data-source");
+    const { AgentSession, CreditLog, Job, User } = await import("./src/db/entities");
+    const { charge, refund } = await import("./src/services/billing");
+    const { resetRunningJobs } = await import("./src/services/jobs");
+    const { resetRunningAgentSessions } = await import("./src/services/agent");
+    const { newId, now } = await import("./src/lib/errors");
+
+    const users = repo(User);
+    const jobs = repo(Job);
+    const creditsOf = async (id: string) => (await users.findOneByOrFail({ id })).credits;
+    const makeUser = async (id: string, credits: number) =>
+        users.insert({ id, username: id, password: "", email: "", displayName: id, avatarUrl: "", role: "user", credits, storageQuota: 1 << 20, affCode: id, affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
+
+    console.log("任务的崩溃窗口");
+    await makeUser("crasher", 100);
+    const receipt = await charge({ kind: "user", userId: "crasher" }, 30, { model: "m", path: "/jobs/image" });
+    check("扣费后余额", await creditsOf("crasher"), 70);
+    const jobId = newId("job");
+    // 模拟「扣费已提交、回执已落到任务行，进程随即被杀」：任务停在 running。
+    await jobs.insert({ id: jobId, userId: "crasher", clientJobId: "crash-1", kind: "image", status: "running", model: "m", prompt: "", params: "{}", progress: 0, credits: 30, seq: 1, text: "", error: "", outputFileIds: [], inputFileIds: [], upstreamTaskId: "", payerKind: "user", payerTeamId: "", payerLogId: receipt.logId, createdAt: now(), updatedAt: now(), finishedAt: "" } as never);
+    await resetRunningJobs();
+    check("重启后已扣未结的那笔被退回", await creditsOf("crasher"), 100);
+    const revived = await jobs.findOneByOrFail({ id: jobId });
+    check("重启后任务回到队列", revived.status === "pending" || revived.status === "failed", true);
+    // 清零才不会让重跑白嫖：credits 还留着的话，runJob 里的 `!job.credits` 判定为假，这次重跑一分钱不收。
+    check("重启后任务上的金额已清零", revived.credits, 0);
+    check("重启后任务上的回执已清空", revived.payerLogId, "");
+    // 再重启一次：退款幂等，不能退第二遍。
+    await resetRunningJobs();
+    check("再次重启不会重复退款", await creditsOf("crasher"), 100);
+    check("重复退款没有写第二条退款流水", await repo(CreditLog).countBy({ userId: "crasher", type: "ai_refund" }), 1);
+    // 手里那张回执再退一次同样是空操作。
+    check("旧回执重放是空操作", await refund(receipt, { model: "m", path: "/jobs/image" }), false);
+    check("旧回执重放不改余额", await creditsOf("crasher"), 100);
+
+    console.log("Agent 会话的崩溃窗口");
+    await makeUser("chatter", 100);
+    const chatReceipt = await charge({ kind: "user", userId: "chatter" }, 15, { model: "m", path: "/agent" });
+    const sessionId = newId("agent");
+    await repo(AgentSession).insert({ userId: "chatter", sessionId, projectId: "p-crash", title: "会话", status: "running", model: "m", error: "", lastSeq: 0, pendingAction: null, rounds: 1, autoRenamed: false, deleted: false, payerKind: "user", payerTeamId: "", payerLogId: chatReceipt.logId, payerCredits: 15, createdAt: now(), updatedAt: now() } as never);
+    check("扣费后余额", await creditsOf("chatter"), 85);
+    await resetRunningAgentSessions();
+    check("重启后会话的已扣未结被退回", await creditsOf("chatter"), 100);
+    const revivedSession = await repo(AgentSession).findOneByOrFail({ userId: "chatter", sessionId });
+    check("重启后会话置为失败", revivedSession.status, "failed");
+    check("重启后会话回执已清空", revivedSession.payerLogId, "");
+    check("重启后会话金额已清零", revivedSession.payerCredits, 0);
+    await repo(AgentSession).update({ userId: "chatter", sessionId }, { status: "running" });
+    await resetRunningAgentSessions();
+    check("再次重启不会重复退款", await creditsOf("chatter"), 100);
+    check("会话重复退款没有写第二条退款流水", await repo(CreditLog).countBy({ userId: "chatter", type: "ai_refund" }), 1);
 }
 
 /**
@@ -234,6 +330,43 @@ async function teamBilling({ check, rejects }: { check: (name: string, actual: u
     await rejects("超出成员额度时拒绝", () => charge({ kind: "team", teamId: teamA, memberId: "worker" }, 5, { model: "gpt-x", path: "/x" }));
     check("超额被拒后团队池只少了 8", await creditsOfTeam(teamA), 32);
     await repo(TeamMember).update({ teamId: teamA, userId: "worker" }, { creditLimit: 0 });
+
+    console.log("成员额度在并发下也不被突破");
+    // 额度聚合与扣费分处两个事务时，5 笔并发会各自读到同一份「已用量 0」，双双判定没超额。
+    // 额度 10、每笔 4，正确结果只能是 2 笔成功。
+    await makeUser("burst", 0);
+    await join(teamA, "burst", "member");
+    await teams.update({ id: teamA }, { credits: 1000 });
+    await repo(TeamMember).update({ teamId: teamA, userId: "burst" }, { creditLimit: 10, limitWindow: "total" });
+    const burstBefore = await creditsOfTeam(teamA);
+    const burst = await Promise.allSettled(Array.from({ length: 5 }, () => charge({ kind: "team", teamId: teamA, memberId: "burst" }, 4, { model: "gpt-x", path: "/x" })));
+    const burstOk = burst.filter((item) => item.status === "fulfilled").length;
+    check("并发下额度只放行 2 笔", burstOk, 2);
+    check("并发额度下团队池只少了 8", await creditsOfTeam(teamA), burstBefore - 8);
+    await teams.update({ id: teamA }, { credits: 32 });
+
+    console.log("团队退款的严格性");
+    const teamStrict = await charge({ kind: "team", teamId: teamA, memberId: "boss" }, 6, { model: "gpt-x", path: "/x" });
+    await rejects("团队退款没有流水 ID 时拒绝", () => refund({ payer: { kind: "team", teamId: teamA, memberId: "boss" }, credits: 6, logId: "" }, { model: "gpt-x", path: "/x" }));
+    await rejects("退给不存在的团队时抛错", () => refund({ payer: { kind: "team", teamId: "team-nope", memberId: "boss" }, credits: 6, logId: teamStrict.logId }, { model: "gpt-x", path: "/x" }));
+    const otherTeam = await makeTeam("对照团队", "boss", 10);
+    await join(otherTeam, "boss", "owner");
+    await rejects("团队与原始扣费不符时拒绝", () => refund({ payer: { kind: "team", teamId: otherTeam, memberId: "boss" }, credits: 6, logId: teamStrict.logId }, { model: "gpt-x", path: "/x" }));
+    check("对照团队没有被退进钱", await creditsOfTeam(otherTeam), 10);
+    check("被拒的团队退款没有加钱", await creditsOfTeam(teamA), 26);
+    check("首次团队退款成功", await refund(teamStrict, { model: "gpt-x", path: "/x" }), true);
+    check("重复团队退款是空操作", await refund(teamStrict, { model: "gpt-x", path: "/x" }), false);
+    check("重复团队退款不加第二次钱", await creditsOfTeam(teamA), 32);
+
+    console.log("团队池不足时的留痕");
+    const marks = await repo(TeamCreditLog).findBy({ teamId: teamA, type: "insufficient" });
+    check("留痕的余额是当时事务里读到的团队池", marks.every((row) => row.balance >= 0), true);
+    check("默认留痕不标记回落", JSON.parse(marks[0].extra || "{}").fallback, false);
+    await savePreferences("worker", { billingFallbackToPersonal: true });
+    await charge({ kind: "team", teamId: teamA, memberId: "worker" }, 9999, { model: "gpt-x", path: "/x" }).catch(() => undefined);
+    const fallbackMark = (await repo(TeamCreditLog).find({ where: { teamId: teamA, type: "insufficient" }, order: { createdAt: "DESC" } }))[0];
+    check("开启回落后的留痕带 fallback 标记", JSON.parse(fallbackMark.extra || "{}").fallback, true);
+    await savePreferences("worker", {});
 
     console.log("并发不超扣");
     const before = await creditsOfTeam(teamA);
