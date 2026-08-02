@@ -1575,6 +1575,71 @@ check "已存在的第三方用户不被要求邀请码" "$(echo "$EXISTING_CB" 
 invite_settings false
 check "关掉开关后第三方登录不再签待注册凭据" "$(oauth_callback_code "$(oauth_state)" invite-code-flow | grep -c 'pendingToken=')" "0"
 
+echo "团队与团队计费"
+MEMBER_TOKEN=$(curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' -d '{"username":"team-member","password":"member-pass"}' | jq -r .data.token)
+OUTSIDER_TOKEN=$(curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' -d '{"username":"team-outsider","password":"outsider-pass"}' | jq -r .data.token)
+OUTSIDER_CREDITS_BEFORE=$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $OUTSIDER_TOKEN" | jq -r .data.credits)
+check "团队冒烟用的两个账号都拿到令牌" "$([ -n "$MEMBER_TOKEN" ] && [ "$MEMBER_TOKEN" != "null" ] && [ -n "$OUTSIDER_TOKEN" ] && [ "$OUTSIDER_TOKEN" != "null" ] && echo yes || echo no)" "yes"
+
+TEAM=$(curl -s -X POST "$BASE/v1/teams" -H "Authorization: Bearer $USER_TOKEN" \
+    -H 'Content-Type: application/json' -d '{"name":"冒烟团队","description":"smoke"}')
+TEAM_ID=$(echo "$TEAM" | jq -r .data.id)
+check "创建团队成功" "$(echo "$TEAM" | jq -r .data.name)" "冒烟团队"
+check "创建者角色为 owner" "$(curl -s "$BASE/v1/teams" -H "Authorization: Bearer $USER_TOKEN" | jq -r --arg id "$TEAM_ID" '.data[] | select(.id==$id) | .myRole')" "owner"
+check "新团队积分池为 0" "$(curl -s "$BASE/v1/teams/$TEAM_ID" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)" "0"
+
+INVITE=$(curl -s -X POST "$BASE/v1/teams/$TEAM_ID/invites" -H "Authorization: Bearer $USER_TOKEN" \
+    -H 'Content-Type: application/json' -d '{"kind":"link","role":"member","maxUses":0}')
+INVITE_TOKEN=$(echo "$INVITE" | jq -r .data.token)
+check "邀请链接 token 长度 >= 32" "$([ "$(printf '%s' "$INVITE_TOKEN" | wc -c | tr -d ' ')" -ge 32 ] && echo yes || echo no)" "yes"
+check "邀请列表不返回明文 token" "$(curl -s "$BASE/v1/teams/$TEAM_ID/invites" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data[0].token // "absent"')" "absent"
+
+CODE_INVITE=$(curl -s -X POST "$BASE/v1/teams/$TEAM_ID/invites" -H "Authorization: Bearer $USER_TOKEN" \
+    -H 'Content-Type: application/json' -d '{"kind":"code","role":"viewer","maxUses":1}')
+JOIN_CODE=$(echo "$CODE_INVITE" | jq -r .data.code)
+check "手输码长度为 10" "$(printf '%s' "$JOIN_CODE" | wc -c | tr -d ' ')" "10"
+
+check "第二个用户用链接加入" "$(curl -s -X POST "$BASE/v1/team-invites/$INVITE_TOKEN/accept" -H "Authorization: Bearer $MEMBER_TOKEN" | jq -r .data.role)" "member"
+check "成员列表有两个人" "$(curl -s "$BASE/v1/teams/$TEAM_ID/members" -H "Authorization: Bearer $USER_TOKEN" | jq '.data | length')" "2"
+check "member 无权看全员流水" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams/$TEAM_ID/credit-logs" -H "Authorization: Bearer $MEMBER_TOKEN")" "403"
+check "member 可以看自己的流水" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams/$TEAM_ID/credit-logs/mine" -H "Authorization: Bearer $MEMBER_TOKEN")" "200"
+check "member 无权改团队信息" "$(curl -s -o /dev/null -w '%{http_code}' -X PATCH "$BASE/v1/teams/$TEAM_ID" -H "Authorization: Bearer $MEMBER_TOKEN" -H 'Content-Type: application/json' -d '{"name":"改名"}')" "403"
+check "非成员看团队返回 404" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams/$TEAM_ID" -H "Authorization: Bearer $OUTSIDER_TOKEN")" "404"
+check "不存在的团队也返回 404" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams/team-does-not-exist" -H "Authorization: Bearer $USER_TOKEN")" "404"
+check "owner 不能退出团队" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/teams/$TEAM_ID/leave" -H "Authorization: Bearer $USER_TOKEN")" "400"
+check "未登录访问团队接口返回 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams")" "401"
+
+echo "平台团队后台"
+check "管理员可列出全平台团队" "$(curl -s "$BASE/admin/teams" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r --arg id "$TEAM_ID" '.data.items[] | select(.id==$id) | .name')" "冒烟团队"
+check "普通用户访问平台团队后台返回 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/admin/teams" -H "Authorization: Bearer $USER_TOKEN")" "401"
+check "团队 owner 也访问不了平台后台" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $USER_TOKEN")" "401"
+
+TOPUP=$(curl -s -X POST "$BASE/admin/teams/$TEAM_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H 'Content-Type: application/json' -d '{"credits":500,"remark":"冒烟充值"}')
+check "管理员调整团队积分" "$(echo "$TOPUP" | jq -r .data.credits)" "500"
+check "调整写入团队流水" "$(curl -s "$BASE/v1/teams/$TEAM_ID/credit-logs" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items[0].type')" "admin_adjust"
+check "团队流水不污染个人流水页" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="冒烟充值")] | length')" "0"
+check "全平台团队流水查得到这一笔" "$(curl -s "$BASE/admin/team-credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="冒烟充值")] | length')" "1"
+
+check "管理员可停用团队" "$(curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"status":"disabled"}' | jq -r .data.status)" "disabled"
+check "停用后成员仍可只读" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams/$TEAM_ID" -H "Authorization: Bearer $USER_TOKEN")" "200"
+check "停用后禁止写入" "$(curl -s -o /dev/null -w '%{http_code}' -X PATCH "$BASE/v1/teams/$TEAM_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"name":"改名"}')" "403"
+curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"status":"active"}' >/dev/null
+
+echo "团队实时同步"
+STREAM_LOG="$WORK/team-stream.log"
+curl -sN --max-time 3 "$BASE/v1/teams/$TEAM_ID/realtime" -H "Authorization: Bearer $USER_TOKEN" >"$STREAM_LOG" &
+STREAM_PID=$!
+sleep 1
+curl -s -X POST "$BASE/admin/teams/$TEAM_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":600,"remark":"实时验证"}' >/dev/null
+wait $STREAM_PID 2>/dev/null
+check "SSE 推送团队余额变化" "$(grep -c 'team.credits' "$STREAM_LOG")" "1"
+check "非成员无法订阅团队 SSE" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$BASE/v1/teams/$TEAM_ID/realtime" -H "Authorization: Bearer $OUTSIDER_TOKEN")" "404"
+
+echo "存量个人账户兼容"
+check "无团队用户生成仍按个人扣费" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $OUTSIDER_TOKEN" | jq -r .data.credits)" "$OUTSIDER_CREDITS_BEFORE"
+check "无团队用户团队列表为空" "$(curl -s "$BASE/v1/teams" -H "Authorization: Bearer $OUTSIDER_TOKEN" | jq '.data | length')" "0"
+
 echo "服务重启"
 # 重启会把内存里的推理循环全丢掉。running 会话早就有兜底，awaiting 也必须一起收尾：
 # 那条待确认请求属于上一次执行，留着只会变成一个点了也没人接的确认框。

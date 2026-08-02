@@ -243,7 +243,7 @@ async function main() {
     check("回滚后外层写入也没留下", (await repo(Team).findOneByOrFail({ id: teamId })).name, "嵌套改名");
 
     console.log("团队生命周期与 owner 不变量");
-    const { createTeam, disbandTeam, leaveTeam, listMyTeams, removeMember, transferOwner, updateMemberRole, updateTeam } = await import("./src/services/teams");
+    const { createTeam, disbandTeam, getTeam, leaveTeam, listMyTeams, removeMember, transferOwner, updateMemberRole, updateTeam } = await import("./src/services/teams");
 
     const fresh = await createTeam("user-boss", { name: "新团队" });
     check(
@@ -660,6 +660,97 @@ async function main() {
     check("转让广播新 owner 的 roleChanged", relayEvents.filter((event) => event.type === "member.roleChanged" && event.userId === "user-relay-b" && event.role === "owner").length, 1);
     check("转让广播旧 owner 降为 admin", relayEvents.filter((event) => event.type === "member.roleChanged" && event.userId === "user-relay-a" && event.role === "admin").length, 1);
     stopRelay();
+
+    console.log("团队实时总线");
+    const { publishTeamCredits } = await import("./src/services/team-realtime");
+    const creditEvents: Array<{ type: string; credits?: number }> = [];
+    const creditOther: unknown[] = [];
+    const stopCredits = subscribeTeam(host.id, "user-credits", (event) => creditEvents.push(event));
+    const stopCreditsOther = subscribeTeam(fresh.id, "user-credits", (event) => creditOther.push(event));
+
+    publishTeamCredits(host.id, 123);
+    check("订阅者收到余额事件", creditEvents.length, 1);
+    check("余额事件带最新余额", creditEvents[0].credits, 123);
+    check("余额事件类型是 team.credits", creditEvents[0].type, "team.credits");
+    check("其他团队的订阅者不受余额事件影响", creditOther.length, 0);
+
+    publishTeamMember(host.id, { type: "member.joined", userId: "user-x", role: "member" });
+    check("同一条订阅也收成员事件", creditEvents.length, 2);
+
+    let creditClosed = false;
+    subscribeTeam(host.id, "user-kick", () => undefined, () => {
+        creditClosed = true;
+    });
+    check("被移除成员的连接被主动关闭", (closeTeamConnectionsOf(host.id, "user-kick"), creditClosed), true);
+
+    stopCredits();
+    stopCreditsOther();
+    publishTeamCredits(host.id, 456);
+    check("退订后不再收到余额事件", creditEvents.length, 2);
+    check("余额订阅退订后总线归零", teamListenerCount(host.id), 0);
+
+    // 扣费与管理员调整都必须把最新余额广播出去，否则界面上的团队余额要等用户自己刷新。
+    const { charge, setTeamCredits } = await import("./src/services/billing");
+    const busTeam = await createTeam("user-bus-owner", { name: "余额广播团队" });
+    await repo(Team).update({ id: busTeam.id }, { credits: 100 });
+    const busEvents: Array<{ type: string; credits?: number }> = [];
+    const stopBus = subscribeTeam(busTeam.id, "user-bus-owner", (event) => busEvents.push(event));
+    await charge({ kind: "team", teamId: busTeam.id, memberId: "user-bus-owner" }, 30, { model: "gpt-x", path: "/x" });
+    check("团队扣费后广播最新余额", busEvents.filter((event) => event.type === "team.credits" && event.credits === 70).length, 1);
+    await setTeamCredits(busTeam.id, 500, "验证充值");
+    check("管理员调整后广播最新余额", busEvents.filter((event) => event.type === "team.credits" && event.credits === 500).length, 1);
+    check("调整写入团队 admin_adjust 流水", await repo(TeamCreditLog).countBy({ teamId: busTeam.id, type: "admin_adjust" }), 1);
+    // 平台管理员不是团队成员，这条流水的 userId 必须留空，否则成员额度聚合会把充值算到某个人头上。
+    check("平台调整的流水不挂在任何成员名下", (await repo(TeamCreditLog).findOneByOrFail({ teamId: busTeam.id, type: "admin_adjust" })).userId, "");
+    check("调整后团队池就是目标值", (await repo(Team).findOneByOrFail({ id: busTeam.id })).credits, 500);
+    stopBus();
+
+    console.log("降级与挂起后断流");
+    const { updateMember } = await import("./src/services/teams");
+    const guard = await createTeam("user-guard-owner", { name: "断流团队" });
+    await repo(TeamMember).insert({ teamId: guard.id, userId: "user-guard-m", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-guard-owner", joinedAt: now(), updatedAt: now() });
+    let demoted = false;
+    subscribeTeam(guard.id, "user-guard-m", () => undefined, () => {
+        demoted = true;
+    });
+    await updateMember(guard.id, "user-guard-owner", "user-guard-m", { role: "viewer" });
+    check("降级后主动断开该成员的连接", demoted, true);
+    check("降级确实落库", (await repo(TeamMember).findOneByOrFail({ teamId: guard.id, userId: "user-guard-m" })).role, "viewer");
+
+    let suspended = false;
+    subscribeTeam(guard.id, "user-guard-m", () => undefined, () => {
+        suspended = true;
+    });
+    await updateMember(guard.id, "user-guard-owner", "user-guard-m", { status: "suspended" });
+    check("挂起后主动断开该成员的连接", suspended, true);
+    // 挂起的人连读都过不了 requireTeamRole，SSE 自然也进不来。
+    await rejects("挂起后无法再订阅团队", () => getTeam("user-guard-m", guard.id));
+    await updateMember(guard.id, "user-guard-owner", "user-guard-m", { status: "active" });
+    check("恢复后又能读团队", (await getTeam("user-guard-m", guard.id)).myRole, "viewer");
+    check("额度与周期能一起改", JSON.stringify(await updateMember(guard.id, "user-guard-owner", "user-guard-m", { creditLimit: 20, limitWindow: "day" })).includes('"creditLimit":20'), true);
+    await rejects("非法额度周期被拒", () => updateMember(guard.id, "user-guard-owner", "user-guard-m", { limitWindow: "week" }));
+    await rejects("不能挂起 owner", () => updateMember(guard.id, "user-guard-owner", "user-guard-owner", { status: "suspended" }));
+
+    let disbandClosed = false;
+    subscribeTeam(guard.id, "user-guard-m", () => undefined, () => {
+        disbandClosed = true;
+    });
+    await disbandTeam(guard.id, "user-guard-owner");
+    check("解散后断开全部成员连接", disbandClosed, true);
+    check("解散后总线上不留 listener", teamListenerCount(guard.id), 0);
+
+    console.log("团队流水的可见范围");
+    const ledger = await createTeam("user-ledger-owner", { name: "流水团队" });
+    await repo(TeamMember).insert({ teamId: ledger.id, userId: "user-ledger-m", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-ledger-owner", joinedAt: now(), updatedAt: now() });
+    await repo(Team).update({ id: ledger.id }, { credits: 100 });
+    const { listMyTeamCreditLogs, listTeamCreditLogs } = await import("./src/services/teams");
+    await charge({ kind: "team", teamId: ledger.id, memberId: "user-ledger-m" }, 10, { model: "gpt-x", path: "/x" });
+    await charge({ kind: "team", teamId: ledger.id, memberId: "user-ledger-owner" }, 5, { model: "gpt-x", path: "/x" });
+    const page = { keyword: "", tags: [], category: "", type: "", page: 1, pageSize: 20, offset: 0 };
+    check("owner 能看全员流水", (await listTeamCreditLogs("user-ledger-owner", ledger.id, page)).total, 2);
+    await rejects("member 看不了全员流水", () => listTeamCreditLogs("user-ledger-m", ledger.id, page));
+    check("member 只能看自己的流水", (await listMyTeamCreditLogs("user-ledger-m", ledger.id, page)).total, 1);
+    await rejects("非成员看流水按不存在处理", () => listMyTeamCreditLogs("user-ledger-outsider", ledger.id, page));
 
     console.log("邀请状态校验");
     // 停用与过期各用一条独立的、名额充足的邀请：共用一条的话后一个用例会被前一个吃掉的名额掩盖，

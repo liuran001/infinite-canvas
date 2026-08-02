@@ -193,6 +193,7 @@ async function main() {
     check("随机操作中余额从未为负", ordered.every((row) => row.balance >= 0), true);
 
     await teamBilling({ check, rejects });
+    await legacyCompatibility({ check, rejects });
     await crashWindows({ check });
     await refundConflictShapes({ check });
     await insufficientThroughCallers({ check, rejects });
@@ -686,6 +687,48 @@ async function teamBilling({ check, rejects }: { check: (name: string, actual: u
     // 这条是纯还原断言，用的是一个假流水 ID；留着它会让之后每次启动扫描都去退一笔退不掉的钱，
     // 在验证输出里刷出一堆与被测性质无关的噪声，所以用完就把这行任务的回执收掉。
     await jobs.update({ id: teamJobId }, { credits: 0, payerLogId: "" });
+}
+
+/**
+ * 存量个人账户的兼容回归。这一段是本批的硬性验收：
+ * 团队功能上线后，一个不属于任何团队的用户，扣费路径必须与改造前一字不差——
+ * 同一张 CreditLog、同样的 type、balance 仍是个人余额，且一行团队流水都不该被写出来。
+ *
+ * 简报里写的是 `consumeUserCredits` / `refundUserCredits`，那两个函数在本批之前就已经被
+ * `charge` / `refund` 取代（付费方由服务端解析一次并固化）。这里断言的是同一件事，
+ * 只是走的是现在真实存在的那个入口；对着一个不存在的函数写测试只会得到一个永远跑不起来的回归。
+ */
+async function legacyCompatibility({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { repo } = await import("./src/db/data-source");
+    const { CreditLog, Team, TeamCreditLog, TeamMember, User } = await import("./src/db/entities");
+    const { charge, refund, resolvePayer } = await import("./src/services/billing");
+    const { now } = await import("./src/lib/errors");
+
+    console.log("存量个人账户完全兼容");
+    const users = repo(User);
+    await users.insert({ id: "legacy-solo", username: "legacy-solo", password: "", email: "", displayName: "legacy", avatarUrl: "", role: "user", credits: 200, storageQuota: 1 << 20, affCode: "legacy-solo", affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
+    check("新用户不属于任何团队", await repo(TeamMember).countBy({ userId: "legacy-solo" }), 0);
+    check("不会被自动建团队", await repo(Team).countBy({ ownerId: "legacy-solo" }), 0);
+    check("无团队用户 payer 恒为个人", (await resolvePayer("legacy-solo", {})).kind, "user");
+    // 连「我在哪张画布里」都给上，只要那张画布没挂团队，付费方依旧是个人。
+    check("无归属画布也解析为个人", (await resolvePayer("legacy-solo", { projectId: "no-such-project" })).kind, "user");
+
+    const receipt = await charge({ kind: "user", userId: "legacy-solo" }, 40, { model: "gpt-x", path: "/v1/ai/chat/completions" });
+    check("旧路径扣费余额正确", (await users.findOneByOrFail({ id: "legacy-solo" })).credits, 160);
+    const consumeLog = await repo(CreditLog).findOneOrFail({ where: { userId: "legacy-solo" }, order: { createdAt: "DESC" } });
+    check("旧路径流水 type 不变", consumeLog.type, "ai_consume");
+    check("旧路径流水金额为负", consumeLog.amount, -40);
+    check("旧路径流水 balance 是个人余额", consumeLog.balance, 160);
+    check("旧路径不写团队流水", await repo(TeamCreditLog).countBy({ userId: "legacy-solo" }), 0);
+
+    await refund(receipt, { model: "gpt-x", path: "/v1/ai/chat/completions" });
+    check("旧路径退款余额还原", (await users.findOneByOrFail({ id: "legacy-solo" })).credits, 200);
+    check("旧路径退款流水 type 不变", (await repo(CreditLog).findOneOrFail({ where: { userId: "legacy-solo" }, order: { createdAt: "DESC" } })).type, "ai_refund");
+    check("旧路径退款也不写团队流水", await repo(TeamCreditLog).countBy({ userId: "legacy-solo" }), 0);
+
+    await rejects("旧路径余额不足仍然抛错", () => charge({ kind: "user", userId: "legacy-solo" }, 9999, { model: "gpt-x", path: "/x" }));
+    check("失败后余额未变", (await users.findOneByOrFail({ id: "legacy-solo" })).credits, 200);
+    check("失败后不写任何流水", await repo(CreditLog).countBy({ userId: "legacy-solo", type: "ai_consume" }), 1);
 }
 
 main().catch((error) => {
