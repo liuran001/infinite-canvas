@@ -521,7 +521,8 @@ async function main() {
     const { insertWithUniqueCode, isUniqueViolation } = await import("./src/services/team-invites");
     const scripted = ["AAAAAAAAAA", "AAAAAAAAAA", "BBBBBBBBBB"];
     let picked = 0;
-    const conflict = () => Object.assign(new Error("UNIQUE constraint failed"), { code: "SQLITE_CONSTRAINT_UNIQUE" });
+    // 错误文案照抄驱动真实输出：重试判定要认出「撞的是 code 这条约束」，认不出主键冲突就会被当成码耗尽。
+    const conflict = () => Object.assign(new Error("UNIQUE constraint failed: team_invites.code"), { code: "SQLITE_CONSTRAINT_UNIQUE" });
     check(
         "写入撞唯一约束后换一个新码重试",
         await insertWithUniqueCode(
@@ -554,6 +555,11 @@ async function main() {
     );
     check("非唯一冲突只尝试一次", attempts, 1);
     check("识别 SQLite 唯一冲突", isUniqueViolation(conflict()), true);
+    const { isInviteCodeUniqueViolation } = await import("./src/services/team-invites");
+    check("识别到撞的是 code 约束", isInviteCodeUniqueViolation(conflict()), true);
+    // 主键冲突也是唯一冲突，但换码重试解决不了，必须落到「原样抛出」那条分支。
+    check("主键冲突不算码冲突", isInviteCodeUniqueViolation(Object.assign(new Error("UNIQUE constraint failed: team_invites.id"), { code: "SQLITE_CONSTRAINT_PRIMARYKEY" })), false);
+    check("识别 MySQL 的 code 约束名", isInviteCodeUniqueViolation({ code: "ER_DUP_ENTRY", message: "Duplicate entry 'ABC' for key 'uq_team_invites_code'" }), true);
     check("识别 MySQL 唯一冲突", isUniqueViolation({ code: "ER_DUP_ENTRY" }), true);
     check("识别 Postgres 唯一冲突", isUniqueViolation({ driverError: { code: "23505" } }), true);
     check("普通错误不算唯一冲突", isUniqueViolation(new Error("boom")), false);

@@ -5,6 +5,7 @@ import { dataSource, repo, serialTransaction } from "../db/data-source";
 import { Team, TeamInvite, TeamInviteUse, TeamMember, type TeamInviteKind, type TeamRole } from "../db/entities";
 import { canonicalExpiresAt } from "../db/upgrade";
 import { fail, newId, now } from "../lib/errors";
+import { isInviteCodeUniqueViolation, isUniqueViolation } from "../lib/db-errors";
 // 手输码的字母表与长度只此一份：复制第二份的下场是某天有人改了形近字规则，另一处还在发旧格式的码。
 import { newInviteCode, normalizeInviteCode } from "../lib/invite-code";
 import { requireTeamRole } from "./team-access";
@@ -58,21 +59,16 @@ export async function insertWithUniqueCode(generate: () => string, insert: (code
             await insert(code);
             return code;
         } catch (error) {
-            // 只有唯一冲突值得换个码重来。列长度、外键、连接断开这些换几次码也是一样的结果，
-            // 吞掉它们只会把真正的故障拖成一条「邀请码生成失败」的假线索。
-            if (attempt + 1 >= CODE_RETRIES || !isUniqueViolation(error)) throw error;
+            // 只有「码」这条唯一约束的冲突值得换个码重来。列长度、外键、连接断开换几次码也是一样的结果；
+            // 主键 id 冲突更要原样抛——重试八次仍然会撞，最后被伪装成「邀请码生成失败」，真故障就没了。
+            if (attempt + 1 >= CODE_RETRIES || !isInviteCodeUniqueViolation(error)) throw error;
         }
     }
     throw fail("邀请码生成失败，请重试", 500, "TEAM_INVITE_CODE_EXHAUSTED");
 }
 
-/** 三种驱动报唯一冲突的方式各不相同，这里按各自的稳定标识判断，不去猜中文/英文错误文案。 */
-export function isUniqueViolation(error: unknown) {
-    const carrier = error as { code?: unknown; errno?: unknown; driverError?: { code?: unknown } } | null;
-    const code = String(carrier?.driverError?.code ?? carrier?.code ?? "");
-    // SQLite: SQLITE_CONSTRAINT_UNIQUE / SQLITE_CONSTRAINT；MySQL: ER_DUP_ENTRY(1062)；Postgres: 23505。
-    return code.startsWith("SQLITE_CONSTRAINT") || code === "ER_DUP_ENTRY" || String(carrier?.errno ?? "") === "1062" || code === "23505";
-}
+/** 唯一冲突判定统一放在 lib，files 那边也用同一套；这里再导出一次是为了不改现有调用方。 */
+export { isInviteCodeUniqueViolation, isUniqueViolation };
 
 /** 列表视图只回前缀：链接明文只在创建响应里出现一次，之后服务端自己也拿不回来。 */
 export function teamInviteView(invite: TeamInvite) {

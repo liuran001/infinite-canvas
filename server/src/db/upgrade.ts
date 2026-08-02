@@ -62,9 +62,22 @@ export async function prepareTeamInviteUpgrade(source: DataSource) {
     const runner = source.createQueryRunner();
     try {
         await runner.connect();
-        // 上一次升级写到一半被打断，备份表还在，直接进入回填。
-        if (await runner.hasTable(BACKUP)) return true;
-        if (!(await runner.hasTable(TABLE))) return false;
+        const hasBackup = await runner.hasTable(BACKUP);
+        const hasTable = await runner.hasTable(TABLE);
+        if (hasBackup) {
+            // 备份表还在，说明上一次升级写到一半被打断。断点有两种，必须分清：
+            //   a) CTAS 完成、DROP 之前崩溃 —— 原表仍是旧结构旧数据，留着它 synchronize 照样建不出唯一索引，
+            //      于是新版本这一次启动仍然起不来，而且永远卡在这里；必须把它删掉。
+            //   b) 回填写到一半崩溃 —— 此时的原表已经是新结构，里面是回填出来的行，删掉就是真丢数据。
+            // 判据就是 blocksUniqueIndex 本身：旧表当初正是因为它为真才走到重建，现在仍然为真；
+            // 而新表的链接类邀请存的是 NULL、手输码上带唯一索引，不可能为真。
+            if (hasTable && (await blocksUniqueIndex(source, runner))) {
+                await runner.query(`DROP TABLE ${quote(source, TABLE)}`);
+                console.warn(`[upgrade] 上次升级在删表前中断，已删除残留的旧 ${TABLE}。`);
+            }
+            return true;
+        }
+        if (!hasTable) return false;
         if (!(await blocksUniqueIndex(source, runner))) return false;
         // CTAS 三种方言写法一致，且复制出来的备份表不带索引与约束，正好是我们要的。
         await runner.query(`CREATE TABLE ${quote(source, BACKUP)} AS SELECT * FROM ${quote(source, TABLE)}`);
@@ -76,6 +89,12 @@ export async function prepareTeamInviteUpgrade(source: DataSource) {
     }
 }
 
+/**
+ * 回填。整个过程必须可以从任意一行中断处重跑：备份表要等最后一行落库才删，
+ * 所以「写到一半崩溃再启动」是常态而不是意外——按 id 先查后写（存在就 update，不存在才 insert），
+ * 三种方言都只用普通 SELECT/UPDATE/INSERT，不依赖各写一套的 upsert 语法。
+ * 归一化结果只由备份表内容决定，因此重跑一遍得到的是同一批值，重复执行不会漂移。
+ */
 async function restoreLegacyInvites(source: DataSource) {
     const runner = source.createQueryRunner();
     let rows: Array<Record<string, unknown>>;
@@ -88,21 +107,29 @@ async function restoreLegacyInvites(source: DataSource) {
     }
     // 手输码的归一化规则只此一份，与运行时写入共用同一个 lib 函数。
     const invites = source.getRepository(TeamInvite);
-    const seen = new Set<string>();
+    const existing = await invites.find({ select: { id: true, code: true } });
+    const backupIds = new Set(rows.map((row) => String(row.id)));
+    const known = new Map(existing.map((invite) => [invite.id, invite]));
+    // 表里那些不来自备份的行（正常写入的新邀请）已经占住了自己的码，
+    // 后面回填时撞上它就得按「撞码」处理，否则这一条 insert 会撞唯一索引把整个启动流程再打断一次。
+    const seen = new Set(existing.filter((invite) => invite.code && !backupIds.has(invite.id)).map((invite) => String(invite.code)));
     const ordered = [...rows].sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")) || String(left.id).localeCompare(String(right.id)));
     for (const row of ordered) {
+        const id = String(row.id);
         const code = normalizeInviteCode(String(row.code || ""));
         // 旧库允许两条邀请共用一个码，按码查询本来就只会命中其中一条，另一条的领取路径早已是死的。
         // 保留最早的一条，后来的降级成「没有码且已停用」——不能悄悄让它继续存在却查不到。
         const duplicated = Boolean(code) && seen.has(code);
         if (code && !duplicated) seen.add(code);
-        if (duplicated) console.warn(`[upgrade] 邀请 ${String(row.id)} 与更早的邀请共用手输码 ${code}，已停用并清空该码。`);
+        if (duplicated) console.warn(`[upgrade] 邀请 ${id} 与更早的邀请共用手输码 ${code}，已停用并清空该码。`);
         const expiresAt = canonicalExpiresAt(row.expiresAt);
-        if (expiresAt === null) console.warn(`[upgrade] 邀请 ${String(row.id)} 的过期时间 ${String(row.expiresAt)} 无法解析，原样保留。`);
-        await invites.insert({
-            id: String(row.id),
+        // 解析不了的过期时间不能原样保留：留着它，assertUsable 会把 NaN 判成「没过期」而放行，
+        // 于是一个本该被当作坏数据的值变成了一张永久有效的邀请。停用 + 清空是唯一安全的读法——
+        // 管理员仍然能看到这条邀请并自己决定重开，而不是在不知情的情况下继续被领取。
+        if (expiresAt === null) console.warn(`[upgrade] 邀请 ${id} 的过期时间 ${String(row.expiresAt)} 无法解析，已停用并清空该字段。`);
+        const payload = {
             teamId: String(row.teamId || ""),
-            kind: row.kind === "code" ? "code" : "link",
+            kind: (row.kind === "code" ? "code" : "link") as TeamInvite["kind"],
             tokenHash: String(row.tokenHash || ""),
             tokenPrefix: String(row.tokenPrefix || ""),
             // 链接类邀请在新表里存 NULL：空串会互相冲突，唯一约束与「链接不占码」只有 NULL 能同时成立。
@@ -110,12 +137,14 @@ async function restoreLegacyInvites(source: DataSource) {
             role: String(row.role || "member") as TeamInvite["role"],
             maxUses: Number(row.maxUses || 0),
             usedCount: Number(row.usedCount || 0),
-            enabled: duplicated ? false : Boolean(row.enabled),
-            expiresAt: expiresAt ?? String(row.expiresAt || ""),
+            enabled: duplicated || expiresAt === null ? false : Boolean(row.enabled),
+            expiresAt: expiresAt ?? "",
             createdBy: String(row.createdBy || ""),
             note: String(row.note || ""),
             createdAt: String(row.createdAt || ""),
-        });
+        };
+        if (known.has(id)) await invites.update({ id }, payload);
+        else await invites.insert({ id, ...payload });
     }
     await source.query(`DROP TABLE ${quote(source, BACKUP)}`);
     console.warn(`[upgrade] ${rows.length} 条旧邀请已回填，${BACKUP} 已删除。`);
@@ -127,7 +156,14 @@ async function normalizeStoredExpiresAt(source: DataSource) {
     const rows = await invites.createQueryBuilder("invite").select(["invite.id", "invite.expiresAt"]).where(`invite.expiresAt <> ''`).getMany();
     for (const row of rows) {
         const canonical = canonicalExpiresAt(row.expiresAt);
-        if (canonical === null || canonical === row.expiresAt) continue;
+        if (canonical === row.expiresAt) continue;
+        // 解析不了的值不能留着：assertUsable 走 Date.parse 会得到 NaN 并判成「没过期」，
+        // 于是坏数据静默变成一张永不过期的邀请。停用 + 清空让它可见且不可领。
+        if (canonical === null) {
+            console.warn(`[upgrade] 邀请 ${row.id} 的过期时间 ${row.expiresAt} 无法解析，已停用并清空该字段。`);
+            await invites.update({ id: row.id }, { expiresAt: "", enabled: false });
+            continue;
+        }
         await invites.update({ id: row.id }, { expiresAt: canonical });
     }
 }

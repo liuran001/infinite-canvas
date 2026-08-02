@@ -4,6 +4,7 @@ import mime from "mime-types";
 
 import { dataSource, repo, serialTransaction } from "../db/data-source";
 import { PhysicalBlob, StoredFile } from "../db/entities";
+import { isBlobChecksumConflict } from "../lib/db-errors";
 import { fail, newId, now } from "../lib/errors";
 import { markBlobPending, reviveBlob } from "./blob-gc";
 import { assertQuota } from "./quota";
@@ -76,11 +77,14 @@ export async function saveFile(userId: string, body: Buffer, mimeType: string, m
             const path = objectKey(id, type);
             await putObject(path, body, type, storage);
             const candidate = repo(PhysicalBlob).create({ checksum, bytes: body.length, kind, mimeType: type, width: meta.width || imageMeta.width || 0, height: meta.height || imageMeta.height || 0, durationMs: meta.durationMs || 0, storage, path, refCount: 0, state: "active", pendingSince: "", createdAt: now() });
-            // 这个 catch 只允许吞「别人抢先插进去了」这一种情况：紧接着的 findOneByOrFail 会重新读一次，
-            // 读得到说明确实是并发落选，读不到就在那里抛错。所以真实故障（列长度、连接断开）不会被这层吞掉，
-            // 只是把报错点从 insert 挪到了下一行——不能把 catch 去掉换成判断错误码，
-            // 三种驱动的唯一冲突标识各不相同，而这里的正确性本来就不依赖区分错误类型。
-            await repo(PhysicalBlob).insert(candidate).catch(() => undefined);
+            // 只吞「别人抢先按同一个 checksum 插进去了」这一种冲突：紧接着的 findOneByOrFail 会重新读一次。
+            // 其余错误（列长度、连接断开）必须原样抛——吞掉的话，故障会被翻译成下一行那条
+            // 毫无线索的「找不到记录」，排查时根本看不出真正坏在哪。
+            await repo(PhysicalBlob)
+                .insert(candidate)
+                .catch((error) => {
+                    if (!isBlobChecksumConflict(error)) throw error;
+                });
             blob = await repo(PhysicalBlob).findOneByOrFail({ checksum });
             // 多实例同时首传时只有一个 insert 能赢。输家写出的对象没人引用，必须回收；
             // 但只允许删自己刚写的那个 key，胜出 blob 的 path 一个字节都不能碰。
