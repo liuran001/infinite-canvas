@@ -4,79 +4,77 @@ import { repo } from "../db/data-source";
 import { Project, UserAsset, UserPlugin } from "../db/entities";
 import { fail, now } from "../lib/errors";
 import { releaseFiles } from "./cleanup";
+import { publishProjectDeleted, publishProjectSaved } from "./project-realtime";
 
-export type ProjectInput = { id: string; title: string; data: unknown; revision?: number };
+export type ProjectInput = { id: string; title: string; data: unknown; revision: number; clientId: string };
 export type UserAssetInput = { id: string; kind: string; title: string; data: unknown; revision?: number };
 export type UserPluginInput = { id: string; data: unknown; revision?: number };
-
-/** 与 web/src/types/canvas.ts 对齐，只声明服务端会读写的字段，其余画布字段原样保留。 */
 export type CanvasNodeData = { id: string; type: string; title: string; position: { x: number; y: number }; width: number; height: number; metadata?: Record<string, unknown> };
 export type CanvasConnectionData = { id: string; fromNodeId: string; toNodeId: string };
 export type CanvasProjectData = { nodes: CanvasNodeData[]; connections: CanvasConnectionData[] } & Record<string, unknown>;
 
 const MAX_SYNC_ITEMS = 500;
+const PROJECT_UPDATE_RETRIES = 3;
 
 function parseData(value: string) {
-    try {
-        return JSON.parse(value || "null") as unknown;
-    } catch {
-        return null;
-    }
+    try { return JSON.parse(value || "null") as unknown; } catch { return null; }
 }
 
-function toProjectView(row: Project) {
+export function toProjectView(row: Project) {
     return { id: row.projectId, title: row.title, data: parseData(row.data), revision: row.revision, deleted: row.deleted, createdAt: row.createdAt, updatedAt: row.updatedAt };
 }
+function toAssetView(row: UserAsset) { return { id: row.assetId, kind: row.kind, title: row.title, data: parseData(row.data), revision: row.revision, deleted: row.deleted, createdAt: row.createdAt, updatedAt: row.updatedAt }; }
+function toPluginView(row: UserPlugin) { return { id: row.pluginId, data: parseData(row.data), revision: row.revision, deleted: row.deleted, createdAt: row.createdAt, updatedAt: row.updatedAt }; }
 
-function toAssetView(row: UserAsset) {
-    return { id: row.assetId, kind: row.kind, title: row.title, data: parseData(row.data), revision: row.revision, deleted: row.deleted, createdAt: row.createdAt, updatedAt: row.updatedAt };
-}
-
-/** since 为空时返回全量，否则只返回该时间点之后变更的记录，含软删除标记。 */
 export async function listProjects(userId: string, since: string) {
-    const rows = await repo(Project).find({
-        where: since ? { userId, updatedAt: MoreThan(since) } : { userId },
-        order: { updatedAt: "DESC" },
-        take: MAX_SYNC_ITEMS,
-    });
-    return rows.map(toProjectView);
+    return (await repo(Project).find({ where: since ? { userId, updatedAt: MoreThan(since) } : { userId }, order: { updatedAt: "DESC" }, take: MAX_SYNC_ITEMS })).map(toProjectView);
 }
-
 export async function getProject(userId: string, id: string) {
     const row = await repo(Project).findOneBy({ userId, projectId: id });
-    if (!row || row.deleted) throw fail("画布项目不存在");
+    if (!row || row.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
     return toProjectView(row);
 }
+function conflict(row: Project) { return fail("画布项目在其他设备上已更新，请先同步", 409, "REVISION_CONFLICT", toProjectView(row)); }
 
-/**
- * 保存画布项目。带上客户端已知的 revision 时做乐观锁校验，
- * 服务端版本更新则拒绝写入，由客户端决定合并策略。
- */
+/** revision 是必填 CAS 基线；同版本并发保存只允许一个成功。 */
 export async function saveProject(userId: string, input: ProjectInput) {
     const id = input.id?.trim();
     if (!id) throw fail("缺少画布项目 ID");
     const projects = repo(Project);
     const saved = await projects.findOneBy({ userId, projectId: id });
-    if (saved && input.revision !== undefined && input.revision < saved.revision) throw fail("画布项目在其他设备上已更新，请先同步");
-    const row = await projects.save({
-        projectId: id,
-        userId,
-        title: input.title || saved?.title || "未命名画布",
-        data: JSON.stringify(input.data ?? {}),
-        revision: (saved?.revision || 0) + 1,
-        deleted: false,
-        createdAt: saved?.createdAt || now(),
-        updatedAt: now(),
-    } as Project);
+    if (!saved) {
+        if (input.revision !== 0) throw fail("画布项目在其他设备上已更新，请先同步", 409, "REVISION_CONFLICT");
+        const row = projects.create({ projectId: id, userId, title: input.title || "未命名画布", data: JSON.stringify(input.data ?? {}), revision: 1, deleted: false, createdAt: now(), updatedAt: now() });
+        try { await projects.insert(row); } catch {
+            const current = await projects.findOneBy({ userId, projectId: id });
+            if (current) throw conflict(current);
+            throw fail("保存画布项目失败", 500);
+        }
+        publishProjectSaved(userId, id, 1, input.clientId);
+        return toProjectView(row);
+    }
+    if (saved.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
+    if (input.revision !== saved.revision) throw conflict(saved);
+    const updatedAt = now();
+    const result = await projects.update({ userId, projectId: id, revision: input.revision, deleted: false }, { title: input.title || saved.title, data: JSON.stringify(input.data ?? {}), revision: input.revision + 1, updatedAt });
+    if (result.affected !== 1) {
+        const current = await projects.findOneBy({ userId, projectId: id });
+        if (!current || current.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
+        throw conflict(current);
+    }
+    const row = { ...saved, title: input.title || saved.title, data: JSON.stringify(input.data ?? {}), revision: input.revision + 1, updatedAt } as Project;
+    publishProjectSaved(userId, id, row.revision, input.clientId);
     return toProjectView(row);
 }
 
-/** 软删除，让其他设备也能同步到删除动作；引用的文件没人再用就真删，释放云空间。 */
-export async function deleteProject(userId: string, id: string) {
+export async function deleteProject(userId: string, id: string, clientId = "") {
     const projects = repo(Project);
     const saved = await projects.findOneBy({ userId, projectId: id });
-    if (!saved) return;
-    await projects.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() });
+    if (!saved || saved.deleted) return;
+    const revision = saved.revision + 1;
+    const result = await projects.update({ userId, projectId: id, revision: saved.revision, deleted: false }, { deleted: true, data: "", revision, updatedAt: now() });
+    if (result.affected !== 1) return;
+    publishProjectDeleted(userId, id, revision, clientId);
     await releaseFiles(userId, saved.data);
 }
 
@@ -84,110 +82,66 @@ function toCanvasData(value: string): CanvasProjectData {
     const data = (parseData(value) || {}) as Partial<CanvasProjectData>;
     return { ...data, nodes: Array.isArray(data.nodes) ? data.nodes : [], connections: Array.isArray(data.connections) ? data.connections : [] };
 }
-
 export async function readProjectCanvas(userId: string, id: string) {
     const row = await repo(Project).findOneBy({ userId, projectId: id });
-    if (!row || row.deleted) throw fail("画布项目不存在");
+    if (!row || row.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
     return { title: row.title, revision: row.revision, data: toCanvasData(row.data) };
 }
 
-/**
- * 服务端直接改画布（Agent 工具用）：读出当前数据就地修改再写回。
- * 这里不做乐观锁校验——服务端读到的就是最新版本，但 revision 照常递增，
- * 前端现有的增量同步才能拉到这次变更，客户端的过期写入也会被原有乐观锁挡下。
- */
+/** Agent 写画布也走 CAS；冲突时重新读最新 JSON 后重放 mutate。 */
 export async function updateProjectCanvas<T>(userId: string, id: string, mutate: (data: CanvasProjectData) => T): Promise<T> {
-    const projects = repo(Project);
-    const saved = await projects.findOneBy({ userId, projectId: id });
-    if (!saved || saved.deleted) throw fail("画布项目不存在");
-    const data = toCanvasData(saved.data);
-    const result = mutate(data);
-    data.updatedAt = now();
-    await projects.save({ ...saved, data: JSON.stringify(data), revision: saved.revision + 1, updatedAt: now() });
-    return result;
+    for (let attempt = 0; attempt < PROJECT_UPDATE_RETRIES; attempt += 1) {
+        const projects = repo(Project);
+        const saved = await projects.findOneBy({ userId, projectId: id });
+        if (!saved || saved.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
+        const data = toCanvasData(saved.data);
+        const value = mutate(data);
+        data.updatedAt = now();
+        const result = await projects.update({ userId, projectId: id, revision: saved.revision, deleted: false }, { data: JSON.stringify(data), revision: saved.revision + 1, updatedAt: now() });
+        if (result.affected === 1) {
+            publishProjectSaved(userId, id, saved.revision + 1, "agent");
+            return value;
+        }
+    }
+    throw fail("画布正在被其他设备修改，请稍后重试", 409, "PROJECT_BUSY");
 }
-
-/** Agent 重命名画布：只改标题，revision 照常递增，前端现有的增量同步才能拉到这次变更。 */
 export async function renameProjectCanvas(userId: string, id: string, title: string) {
-    const projects = repo(Project);
-    const saved = await projects.findOneBy({ userId, projectId: id });
-    if (!saved || saved.deleted) throw fail("画布项目不存在");
-    await projects.save({ ...saved, title, revision: saved.revision + 1, updatedAt: now() });
-    return { projectId: id, title, revision: saved.revision + 1 };
+    for (let attempt = 0; attempt < PROJECT_UPDATE_RETRIES; attempt += 1) {
+        const projects = repo(Project);
+        const saved = await projects.findOneBy({ userId, projectId: id });
+        if (!saved || saved.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
+        const result = await projects.update({ userId, projectId: id, revision: saved.revision, deleted: false }, { title, revision: saved.revision + 1, updatedAt: now() });
+        if (result.affected === 1) {
+            publishProjectSaved(userId, id, saved.revision + 1, "agent");
+            return { projectId: id, title, revision: saved.revision + 1 };
+        }
+    }
+    throw fail("画布正在被其他设备修改，请稍后重试", 409, "PROJECT_BUSY");
 }
 
 export async function listUserAssets(userId: string, since: string) {
-    const rows = await repo(UserAsset).find({
-        where: since ? { userId, updatedAt: MoreThan(since) } : { userId },
-        order: { updatedAt: "DESC" },
-        take: MAX_SYNC_ITEMS,
-    });
-    return rows.map(toAssetView);
+    return (await repo(UserAsset).find({ where: since ? { userId, updatedAt: MoreThan(since) } : { userId }, order: { updatedAt: "DESC" }, take: MAX_SYNC_ITEMS })).map(toAssetView);
 }
-
 export async function saveUserAsset(userId: string, input: UserAssetInput) {
-    const id = input.id?.trim();
-    if (!id) throw fail("缺少素材 ID");
-    const assets = repo(UserAsset);
-    const saved = await assets.findOneBy({ userId, assetId: id });
+    const id = input.id?.trim(); if (!id) throw fail("缺少素材 ID");
+    const assets = repo(UserAsset); const saved = await assets.findOneBy({ userId, assetId: id });
     if (saved && input.revision !== undefined && input.revision < saved.revision) throw fail("素材在其他设备上已更新，请先同步");
-    const row = await assets.save({
-        assetId: id,
-        userId,
-        kind: input.kind || saved?.kind || "image",
-        title: input.title || saved?.title || "",
-        data: JSON.stringify(input.data ?? {}),
-        revision: (saved?.revision || 0) + 1,
-        deleted: false,
-        createdAt: saved?.createdAt || now(),
-        updatedAt: now(),
-    } as UserAsset);
-    return toAssetView(row);
+    return toAssetView(await assets.save({ assetId: id, userId, kind: input.kind || saved?.kind || "image", title: input.title || saved?.title || "", data: JSON.stringify(input.data ?? {}), revision: (saved?.revision || 0) + 1, deleted: false, createdAt: saved?.createdAt || now(), updatedAt: now() } as UserAsset));
 }
-
 export async function deleteUserAsset(userId: string, id: string) {
-    const assets = repo(UserAsset);
-    const saved = await assets.findOneBy({ userId, assetId: id });
-    if (!saved) return;
-    await assets.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() });
-    await releaseFiles(userId, saved.data);
+    const assets = repo(UserAsset); const saved = await assets.findOneBy({ userId, assetId: id }); if (!saved) return;
+    await assets.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() }); await releaseFiles(userId, saved.data);
 }
-
-function toPluginView(row: UserPlugin) {
-    return { id: row.pluginId, data: parseData(row.data), revision: row.revision, deleted: row.deleted, createdAt: row.createdAt, updatedAt: row.updatedAt };
-}
-
-/** 已安装的画布节点插件，换设备登录后照样带着走。 */
 export async function listUserPlugins(userId: string, since: string) {
-    const rows = await repo(UserPlugin).find({
-        where: since ? { userId, updatedAt: MoreThan(since) } : { userId },
-        order: { updatedAt: "DESC" },
-        take: MAX_SYNC_ITEMS,
-    });
-    return rows.map(toPluginView);
+    return (await repo(UserPlugin).find({ where: since ? { userId, updatedAt: MoreThan(since) } : { userId }, order: { updatedAt: "DESC" }, take: MAX_SYNC_ITEMS })).map(toPluginView);
 }
-
 export async function saveUserPlugin(userId: string, input: UserPluginInput) {
-    const id = input.id?.trim();
-    if (!id) throw fail("缺少插件 ID");
-    const plugins = repo(UserPlugin);
-    const saved = await plugins.findOneBy({ userId, pluginId: id });
+    const id = input.id?.trim(); if (!id) throw fail("缺少插件 ID");
+    const plugins = repo(UserPlugin); const saved = await plugins.findOneBy({ userId, pluginId: id });
     if (saved && input.revision !== undefined && input.revision < saved.revision) throw fail("插件在其他设备上已更新，请先同步");
-    const row = await plugins.save({
-        pluginId: id,
-        userId,
-        data: JSON.stringify(input.data ?? {}),
-        revision: (saved?.revision || 0) + 1,
-        deleted: false,
-        createdAt: saved?.createdAt || now(),
-        updatedAt: now(),
-    } as UserPlugin);
-    return toPluginView(row);
+    return toPluginView(await plugins.save({ pluginId: id, userId, data: JSON.stringify(input.data ?? {}), revision: (saved?.revision || 0) + 1, deleted: false, createdAt: saved?.createdAt || now(), updatedAt: now() } as UserPlugin));
 }
-
 export async function deleteUserPlugin(userId: string, id: string) {
-    const plugins = repo(UserPlugin);
-    const saved = await plugins.findOneBy({ userId, pluginId: id });
-    if (!saved) return;
+    const plugins = repo(UserPlugin); const saved = await plugins.findOneBy({ userId, pluginId: id }); if (!saved) return;
     await plugins.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() });
 }

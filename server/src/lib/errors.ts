@@ -1,12 +1,21 @@
 import { randomUUID } from "node:crypto";
 
-/** 携带用户可见文案的业务错误，未标记的错误一律对外收敛为「操作失败」。 */
+/** 携带用户可见文案和协议字段的业务错误，未标记的错误一律对外收敛为「操作失败」。 */
 export class SafeError extends Error {
     readonly safe = true;
+
+    constructor(
+        message: string,
+        readonly status = 400,
+        readonly code: string | number = 1,
+        readonly data: unknown = null,
+    ) {
+        super(message);
+    }
 }
 
-export function fail(message: string) {
-    return new SafeError(message);
+export function fail(message: string, status = 400, code: string | number = 1, data: unknown = null) {
+    return new SafeError(message, status, code, data);
 }
 
 export function safeMessage(error: unknown) {

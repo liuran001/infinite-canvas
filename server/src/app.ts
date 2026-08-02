@@ -26,7 +26,7 @@ export function createApp() {
     // 前端可以部署在别的域名（例如 Vercel）后再连自建服务端。
     app.use((req, res, next) => {
         res.setHeader("Access-Control-Allow-Origin", config.corsOrigin);
-        res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept");
+        res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-Client-Id");
         res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS");
         if (req.method === "OPTIONS") return res.sendStatus(204);
         return next();

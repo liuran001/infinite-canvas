@@ -107,15 +107,39 @@ SAME_ID=$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $USER_TOKEN
 check "相同内容重复上传复用记录" "$SAME_ID" "$FILE_ID"
 
 echo "画布项目同步"
-curl -s -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"我的画布","data":{"nodes":[1,2,3]}}' >/dev/null
+curl -s -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"我的画布","revision":0,"clientId":"smoke-client","data":{"nodes":[1,2,3]}}' >/dev/null
 check "首次保存 revision 为 1" "$(curl -s "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.revision)" "1"
 check "项目数据完整回读" "$(curl -s "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.data.nodes | length')" "3"
-curl -s -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"我的画布","data":{"nodes":[1]},"revision":1}' >/dev/null
+check "缺 revision 返回 400" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"clientId":"smoke-client"}')" "400"
+curl -s -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"我的画布","data":{"nodes":[1]},"revision":1,"clientId":"smoke-client"}' >/dev/null
 check "再次保存 revision 递增" "$(curl -s "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.revision)" "2"
-check "旧版本写入被乐观锁拦截" "$(curl -s -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":1}' | jq -r .msg)" "画布项目在其他设备上已更新，请先同步"
+CONFLICT=$(curl -s -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":1,"clientId":"smoke-other"}')
+check "旧版本写入返回 409" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":1,"clientId":"smoke-other"}')" "409"
+check "冲突有稳定错误码" "$(echo "$CONFLICT" | jq -r .code)" "REVISION_CONFLICT"
+check "冲突带当前快照" "$(echo "$CONFLICT" | jq -r .data.revision)" "2"
+CAS_PIDS=""
+for suffix in a b; do
+    curl -s -o "$WORK/cas-$suffix.json" -w '%{http_code}' -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "{\"title\":\"$suffix\",\"data\":{\"winner\":\"$suffix\"},\"revision\":2,\"clientId\":\"smoke-cas-$suffix\"}" >"$WORK/cas-$suffix.status" &
+    CAS_PIDS="$CAS_PIDS $!"
+done
+for pid in $CAS_PIDS; do wait "$pid"; done
+check "并发 CAS 恰好一个成功" "$(grep -h '^200$' "$WORK"/cas-*.status | wc -l | tr -d ' ')" "1"
+check "并发 CAS 恰好一个冲突" "$(grep -h '^409$' "$WORK"/cas-*.status | wc -l | tr -d ' ')" "1"
+timeout 4 curl -sN "$BASE/v1/projects/p1/realtime?clientId=smoke-viewer&sinceRevision=3" -H "Authorization: Bearer $USER_TOKEN" >"$WORK/project-stream.txt" &
+PROJECT_STREAM_PID=$!
+sleep 1
+curl -s -X POST "$BASE/v1/projects/p1/presence" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientId":"smoke-viewer","nodeIds":["n1"],"activity":"editing"}' >/dev/null
+curl -s -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"实时画布","data":{"nodes":[]},"revision":3,"clientId":"smoke-writer"}' >/dev/null
+wait "$PROJECT_STREAM_PID" || true
+check "项目流收到 ready" "$(grep -c '"type":"ready"' "$WORK/project-stream.txt")" "1"
+check "项目流收到保存广播" "$(grep -c '"type":"project.saved"' "$WORK/project-stream.txt")" "1"
+check "保存广播带 writerClientId" "$(grep -c '"writerClientId":"smoke-writer"' "$WORK/project-stream.txt")" "1"
+check "项目流收到 Presence" "$([ "$(grep -c '"type":"presence.sync"' "$WORK/project-stream.txt")" -ge 1 ] && echo yes || echo no)" "yes"
+check "他人无法订阅项目流" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/p1/realtime?clientId=smoke-other-user&sinceRevision=0" -H "Authorization: Bearer $ADMIN_TOKEN")" "404"
+check "他人无法上报 Presence" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/projects/p1/presence" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"clientId":"smoke-other-user","nodeIds":[],"activity":"idle"}')" "404"
 check "他人无法读取该项目" "$(curl -s "$BASE/v1/projects/p1" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .msg)" "画布项目不存在"
-curl -s -X DELETE "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
-check "删除后仍能同步到删除标记" "$(curl -s "$BASE/v1/projects" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items[0].deleted')" "true"
+curl -s -X DELETE "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H "X-Client-Id: smoke-client" >/dev/null
+check "删除后仍能同步到删除标记" "$(curl -s "$BASE/v1/projects" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.items[] | select(.id=="p1")][0].deleted')" "true"
 
 echo "生成任务幂等"
 JOB1=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"key-1","kind":"image","model":"gpt-image-2","prompt":"一只猫","params":{"count":1},"inputFileIds":[],"context":{"source":"canvas","projectId":"p1","nodeId":"n1"}}' | jq -r .data.id)
@@ -405,7 +429,7 @@ check "未完成任务列表里没有已完成的任务" "$(curl -s "$BASE/v1/jo
 
 echo "后台内容审查"
 ADMIN_ID=$(curl -s "$BASE/admin/users?keyword=admin" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].id')
-curl -s -X PUT "$BASE/v1/projects/p2" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"审查用画布","data":{"nodes":[{"id":"n1","type":"image","metadata":{"storageKey":"server:'"$OUT_ID"'"}},{"id":"n2","type":"text"}]}}' >/dev/null
+curl -s -X PUT "$BASE/v1/projects/p2" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"审查用画布","revision":0,"clientId":"smoke-client","data":{"nodes":[{"id":"n1","type":"image","metadata":{"storageKey":"server:'"$OUT_ID"'"}},{"id":"n2","type":"text"}]}}' >/dev/null
 check "普通用户查生成记录被拒绝" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/admin/jobs" -H "Authorization: Bearer $USER_TOKEN")" "401"
 check "普通用户查画布列表被拒绝" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/admin/projects" -H "Authorization: Bearer $USER_TOKEN")" "401"
 check "普通用户查文件列表被拒绝" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/admin/files" -H "Authorization: Bearer $USER_TOKEN")" "401"
@@ -422,7 +446,7 @@ check "任务详情带出失败原因" "$(curl -s "$BASE/admin/jobs/$JOB1" -H "A
 check "按用户筛选画布生效" "$(curl -s "$BASE/admin/projects?userId=$USER_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "2"
 check "换个用户筛不出画布" "$(curl -s "$BASE/admin/projects?userId=$ADMIN_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "0"
 check "画布列表带出节点数" "$(curl -s --get "$BASE/admin/projects" --data-urlencode 'keyword=审查用画布' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].nodeCount')" "2"
-check "画布列表带出软删除标记" "$(curl -s --get "$BASE/admin/projects" --data-urlencode 'keyword=我的画布' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].deleted')" "true"
+check "画布列表带出软删除标记" "$(curl -s --get "$BASE/admin/projects" --data-urlencode 'keyword=实时画布' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].deleted')" "true"
 check "画布详情返回完整数据" "$(curl -s "$BASE/admin/projects/$USER_ID/p2" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.data.nodes | length')" "2"
 check "画布详情带出图片节点引用" "$(curl -s "$BASE/admin/projects/$USER_ID/p2" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.data.nodes[0].metadata.storageKey')" "server:$OUT_ID"
 check "按用户筛选文件生效" "$(curl -s "$BASE/admin/files?userId=$USER_ID&kind=image" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "2"
@@ -532,8 +556,8 @@ curl -s -X DELETE "$BASE/v1/user-assets/a2" -H "Authorization: Bearer $USER_TOKE
 check "仍被其它素材引用的文件不回收" "$(curl -s "$BASE/v1/files/$KEPT_FILE" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.id)" "$KEPT_FILE"
 # 画布数据里的 server:<fileId> 同样要被扫出来，删画布时连带回收。
 PROJECT_FILE=$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $USER_TOKEN" -F "file=@$WORK/upstream.js;type=image/png" | jq -r .data.id)
-curl -s -X PUT "$BASE/v1/projects/p2" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "{\"title\":\"配额画布\",\"data\":{\"nodes\":[{\"metadata\":{\"storageKey\":\"server:$PROJECT_FILE\"}},{\"metadata\":{\"storageKey\":\"server:$KEPT_FILE\"}}]}}" >/dev/null
-curl -s -X DELETE "$BASE/v1/projects/p2" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
+curl -s -X PUT "$BASE/v1/projects/quota-p2" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "{\"title\":\"配额画布\",\"revision\":0,\"clientId\":\"smoke-client\",\"data\":{\"nodes\":[{\"metadata\":{\"storageKey\":\"server:$PROJECT_FILE\"}},{\"metadata\":{\"storageKey\":\"server:$KEPT_FILE\"}}]}}" >/dev/null
+curl -s -X DELETE "$BASE/v1/projects/quota-p2" -H "Authorization: Bearer $USER_TOKEN" -H "X-Client-Id: smoke-client" >/dev/null
 check "删除画布回收只有它引用的文件" "$(curl -s "$BASE/v1/files/$PROJECT_FILE" -H "Authorization: Bearer $USER_TOKEN" | jq -r .msg)" "文件不存在"
 check "删除画布不影响素材还在用的文件" "$(curl -s "$BASE/v1/files/$KEPT_FILE" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.id)" "$KEPT_FILE"
 
@@ -659,7 +683,7 @@ check "搜索密钥不会下发给前端" "$(curl -s "$BASE/settings" | jq -r '.
 check "后台读取时没配服务就是空列表" "$(curl -s "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.private.search.services | length')" "0"
 check "未登录访问会话列表返回 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/agent/sessions")" "401"
 
-curl -s -X PUT "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"Agent 画布","data":{"nodes":[],"connections":[]}}' >/dev/null
+curl -s -X PUT "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"Agent 画布","revision":0,"clientId":"smoke-client","data":{"nodes":[],"connections":[]}}' >/dev/null
 check "会话必须绑定存在的画布" "$(curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"projectId":"不存在的画布"}' | jq -r .msg)" "画布项目不存在"
 SESSION=$(curl -s -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"projectId":"agent-p1","title":"冒烟会话"}' | jq -r .data.id)
 check "创建会话成功" "$([ -n "$SESSION" ] && [ "$SESSION" != "null" ] && echo yes || echo no)" "yes"
@@ -895,7 +919,7 @@ check "关掉开关后联网搜索不可用" "$(curl -s "$BASE/settings" | jq -r
 agent_settings "$SEARCH_EMPTY" '""'
 curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
 REF_FILE=$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $USER_TOKEN" -F "file=@$WORK/tiny.png;type=image/png" | jq -r .data.id)
-curl -s -X PUT "$BASE/v1/projects/agent-ref" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"引用画布","data":{"nodes":[
+curl -s -X PUT "$BASE/v1/projects/agent-ref" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"引用画布","revision":0,"clientId":"smoke-client","data":{"nodes":[
   {"id":"ref-a","type":"image","title":"图A","position":{"x":0,"y":0},"width":200,"height":200,"metadata":{"storageKey":"server:'"$REF_FILE"'"}},
   {"id":"ref-b","type":"image","title":"图B","position":{"x":300,"y":0},"width":200,"height":200,"metadata":{"storageKey":"server:'"$REF_FILE"'"}},
   {"id":"ref-c","type":"text","title":"说明","position":{"x":600,"y":0},"width":200,"height":120,"metadata":{"content":"一段文字"}}
@@ -1057,7 +1081,7 @@ check "没配标题模型时也用截断" "$(agent_settings "$SEARCH_EMPTY" '""'
 
 # 轮数耗尽不再直接收工，而是暂停下来向用户申请继续。maxRounds 压到 2，冒烟里才跑得快。
 agent_settings "$SEARCH_EMPTY" '""' "$AGENT_CHANNELS" '""' 2
-curl -s -X PUT "$BASE/v1/projects/agent-rounds" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"轮数画布","data":{"nodes":[],"connections":[]}}' >/dev/null
+curl -s -X PUT "$BASE/v1/projects/agent-rounds" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"轮数画布","revision":0,"clientId":"smoke-client","data":{"nodes":[],"connections":[]}}' >/dev/null
 curl -s -X POST "$BASE/admin/users/$USER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":100}' >/dev/null
 ROUND_SESSION=$(new_agent_session '{"projectId":"agent-rounds","title":"轮数会话"}')
 ROUND_BEFORE=$(credits_now)
@@ -1100,7 +1124,7 @@ check "中止后待确认请求被清掉" "$(agent_session "$ROUND_SESSION" | jq
 
 # 画布标题：还是系统默认标题时允许主动改一次，之后一律要确认。
 agent_settings "$SEARCH_EMPTY" '""'
-curl -s -X PUT "$BASE/v1/projects/agent-title" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"无限画布 3","data":{"nodes":[],"connections":[]}}' >/dev/null
+curl -s -X PUT "$BASE/v1/projects/agent-title" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"无限画布 3","revision":0,"clientId":"smoke-client","data":{"nodes":[],"connections":[]}}' >/dev/null
 TITLE_CANVAS=$(new_agent_session '{"projectId":"agent-title","title":"标题会话"}')
 agent_message "$TITLE_CANVAS" "ct-m1" "帮我改画布标题"
 check "默认标题下主动改名立刻生效" "$(curl -s "$BASE/v1/projects/agent-title" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.title)" "猫咪画册"
@@ -1120,7 +1144,7 @@ wait_agent_idle "$TITLE_CANVAS"
 check "批准后画布标题才真的改掉" "$(curl -s "$BASE/v1/projects/agent-title" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.title)" "猫咪画册二版"
 
 # 「无限画布精选」只是前缀像默认标题，用户自己起的名字一样不能被擅自改掉。
-curl -s -X PUT "$BASE/v1/projects/agent-title2" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"无限画布精选","data":{"nodes":[],"connections":[]}}' >/dev/null
+curl -s -X PUT "$BASE/v1/projects/agent-title2" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"无限画布精选","revision":0,"clientId":"smoke-client","data":{"nodes":[],"connections":[]}}' >/dev/null
 TITLE_CANVAS2=$(new_agent_session '{"projectId":"agent-title2","title":"标题会话2"}')
 agent_message "$TITLE_CANVAS2" "ct-m3" "帮我改画布标题"
 check "非默认标题第一次改名就要确认" "$(agent_status "$TITLE_CANVAS2")" "awaiting"
