@@ -1,3 +1,4 @@
+import { notifyTeamCreditsExhausted } from "@/services/team-realtime";
 import { serverApi, serverJobStream, type ServerJob, type ServerJobEvent, type ServerJobStatus } from "./server";
 
 /**
@@ -94,6 +95,9 @@ function applyJob(waiter: Waiter, job: ServerJob) {
     waiter.options.onJob?.(job);
     // 快照里的文本是服务端权威值，比本地长才覆盖；实时增量已经先到时不要用旧快照把它顶回去。
     if (job.text.length > waiter.text.length) applyText(waiter, 0, job.text);
+    // 团队积分被扣光是所有生成路径的共同结局，弹窗挂在这里而不是各个页面：
+    // 画布、生图、视频、Agent 都从这条流拿终态，写在页面里就得复制四份，漏一处那条路径就只剩一句干巴巴的红字。
+    if (job.status === "failed") notifyTeamCreditsExhausted(job.error);
     if (FINISHED.includes(job.status)) settle(waiter, job);
 }
 

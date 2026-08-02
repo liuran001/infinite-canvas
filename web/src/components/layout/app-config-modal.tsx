@@ -1,4 +1,4 @@
-import { App, Button, Form, Input, Modal, Select } from "antd";
+import { App, Button, Form, Input, Modal, Select, Switch } from "antd";
 
 import { imageAspectOptions, imageQualityOptions } from "@/components/image-settings-panel";
 import { ModelPicker } from "@/components/model-picker";
@@ -62,7 +62,6 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
                 ) : (
                     <div className="mb-4 rounded-lg border border-stone-200 p-3 text-xs text-stone-500 dark:border-stone-800">服务端还没有配置可用模型，请联系管理员在管理后台添加模型渠道。</div>
                 )}
-
                 {/*
                  * Agent 自己调生成工具时用的默认参数。模型多半只想得起写提示词，尺寸、画质、张数一概不传，
                  * 不给默认就只能吃服务端的通用值；在这里配一次，agent 生出来的图才一直是用户要的规格。
@@ -104,8 +103,8 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
                         </div>
                     </>
                 ) : null}
-
-                <div className="mb-2 text-sm font-semibold">生成偏好</div>                <div className="grid gap-4 md:grid-cols-4">
+                <div className="mb-2 text-sm font-semibold">生成偏好</div>{" "}
+                <div className="grid gap-4 md:grid-cols-4">
                     {capabilities.image ? (
                         <Form.Item label="画布默认生图张数" extra="新建画布生图和配置节点默认使用，单个节点仍可单独覆盖。" className="mb-4">
                             <Input
@@ -147,6 +146,15 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
                 ) : null}
                 <Form.Item label="系统提示词" extra="会和管理员配置的全局提示词一起生效。" className="mb-0">
                     <Input.TextArea rows={4} value={config.systemPrompt} placeholder="例如：你是一位擅长电影感写实摄影的视觉导演。" onChange={(event) => updateConfig("systemPrompt", event.target.value)} />
+                </Form.Item>
+                {/*
+                 * 算力点归属。这个开关决定的是钱从谁的账上出，文案必须把两种结果都讲死：
+                 * 只写「团队没钱时使用个人积分」的话，用户不会意识到关着的时候生成会直接失败，
+                 * 开着的时候花的是他自己的钱。
+                 */}
+                <div className="mt-6 mb-2 text-sm font-semibold">算力点</div>
+                <Form.Item label="团队积分用尽时改用个人积分" extra="关闭时：团队积分不够，这次生成直接失败，不会动你的个人积分。开启时：团队积分不够会改扣你自己的个人积分，这笔消费记在你个人账上，退款也退回个人。" className="mb-0">
+                    <Switch checked={config.billingFallbackToPersonal} aria-label="团队积分用尽时改用个人积分" onChange={(checked) => updateConfig("billingFallbackToPersonal", checked)} />
                 </Form.Item>
             </Form>
             {showDoneButton ? (

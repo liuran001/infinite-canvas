@@ -46,6 +46,12 @@ export type AiConfig = {
     background: string;
     count: string;
     canvasImageCount: string;
+    /**
+     * 团队积分用尽时是否改扣个人积分。默认 false，服务端 billing.ts 只认这个字段的 true。
+     * 用布尔而不是这里惯用的字符串：服务端做的是 `=== true` 的严格判断，
+     * 存成 "false" 这种字符串在 JS 里是真值，哪天有人改成宽松判断就会给所有人默默打开回落。
+     */
+    billingFallbackToPersonal: boolean;
 };
 
 export type ConfigTabKey = "preferences";
@@ -81,6 +87,8 @@ export const defaultConfig: AiConfig = {
     background: "",
     count: "1",
     canvasImageCount: "3",
+    // 默认不回落：悄悄改扣个人余额等于替用户做了一次付款决定，必须他自己点开才算数。
+    billingFallbackToPersonal: false,
 };
 
 type ConfigStore = {

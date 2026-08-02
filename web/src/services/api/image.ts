@@ -1,3 +1,4 @@
+import { notifyTeamCreditsExhausted } from "@/services/team-realtime";
 import { modelOptionName, type AiConfig } from "@/stores/use-config-store";
 import { serverModelFormat, useServerStore } from "@/stores/use-server-store";
 import { serverAiStream } from "./server";
@@ -144,6 +145,8 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
         if (answer === "没有返回内容") onDelta(answer);
         return answer;
     } catch (error) {
+        // 同步的文本调用在服务端就地扣费，团队池不足会当场 403 回来；这条路径不经任务流，得自己弹一次。
+        notifyTeamCreditsExhausted(error);
         throw new Error(readError(error, "请求失败"));
     }
 }
