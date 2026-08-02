@@ -186,6 +186,93 @@ async function main() {
     guestUnsubscribe();
     otherUnsubscribe();
 
+    // 画布 SSE 的三处时序：ready 与窗口期事件的先后、flush 中途被断流、读库期间就断开的连接。
+    // 这些都发生在路由闭包里，端到端只能看到"流没了"，所以直接把路由处理器拿出来喂假的 req/res。
+    console.log("画布 SSE 时序");
+    resetShareRuntimeState();
+    const { syncRouter } = await import("./src/routes/sync");
+    const { publishProjectSaved } = await import("./src/services/project-realtime");
+    type Layer = { route?: { path: string; stack: { handle: (req: unknown, res: unknown, next: (error?: unknown) => void) => void }[] } };
+    const realtime = (syncRouter.stack as unknown as Layer[]).find((layer) => layer.route?.path === "/v1/projects/:id/realtime")?.route;
+    check("找得到画布 SSE 路由", Boolean(realtime), true);
+    const handler = realtime!.stack[realtime!.stack.length - 1].handle;
+    // 假 res 只实现路由用到的那几个方法。onWrite 用来在写出某一帧的瞬间模拟 disconnectShare 的 res.end()。
+    const makeRes = (onWrite?: (chunk: string, res: { writableEnded: boolean }) => void) => {
+        const chunks: string[] = [];
+        const res = {
+            writableEnded: false,
+            chunks,
+            statusCode: 200,
+            status(code: number) { res.statusCode = code; return res; },
+            setHeader() { return res; },
+            flushHeaders() { return res; },
+            json(body: unknown) { chunks.push(`json:${JSON.stringify(body)}`); return res; },
+            write(chunk: string) {
+                if (res.writableEnded) throw new Error("ERR_STREAM_WRITE_AFTER_END");
+                chunks.push(chunk);
+                onWrite?.(chunk, res);
+                return true;
+            },
+            end() { res.writableEnded = true; return res; },
+        };
+        return res;
+    };
+    const makeReq = (clientId: string, guest: typeof editorSession) => {
+        const closeHandlers: (() => void)[] = [];
+        return {
+            params: { id: "p1" },
+            query: { clientId, sinceRevision: "0" },
+            guest,
+            on(event: string, listener: () => void) { if (event === "close") closeHandlers.push(listener); },
+            fireClose() { closeHandlers.forEach((listener) => listener()); },
+        };
+    };
+    const frames = (res: { chunks: string[] }) => res.chunks.filter((chunk) => chunk.startsWith("data: ")).map((chunk) => JSON.parse(chunk.slice(6)) as { type: string; revision?: number });
+    const settle = async () => { for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setTimeout(resolve, 5)); };
+    const liveShare = await shares.findOneByOrFail({ id: editor.share.id });
+    const liveSession = guestSessionOf(liveShare, { accountId: "", actorId: "", displayName: "", avatarUrl: "" });
+    const liveRevision = (await projects.findOneByOrFail({ userId: "owner-1", projectId: "p1" })).revision;
+
+    // 窗口期事件必须排在 ready 之后：先写事件、后写带旧快照的 ready，客户端会停在旧 revision 上。
+    const orderedRes = makeRes();
+    const orderedReq = makeReq("sse-order-client", liveSession);
+    handler(orderedReq, orderedRes, () => undefined);
+    publishProjectSaved("owner-1", "p1", liveRevision + 5, "other-client");
+    await settle();
+    const orderedFrames = frames(orderedRes);
+    check("ready 之前不会先写窗口期事件", orderedFrames.findIndex((frame) => frame.type === "ready") < orderedFrames.length - 1, true);
+    check("ready 之后补发窗口期事件", orderedFrames[orderedFrames.length - 1].revision, liveRevision + 5);
+    check("窗口期事件只补发一次", orderedFrames.filter((frame) => frame.revision === liveRevision + 5).length, 1);
+    orderedReq.fireClose();
+    check("正常关闭后连接不再登记", disconnectShare("owner-1", "p1", editor.share.id), 0);
+
+    // flush 补发到一半被 disconnectShare 关掉：剩下的事件静默丢弃，绝不能抛 ERR_STREAM_WRITE_AFTER_END。
+    // 抛在 flush 的循环里等于把这条流截断，而调用方（bus 的 emit）没有任何理由接得住它。
+    const cutRes = makeRes((chunk, res) => { if (chunk.includes('"ready"')) res.writableEnded = true; });
+    const cutReq = makeReq("sse-cut-client", liveSession);
+    handler(cutReq, cutRes, () => undefined);
+    publishProjectSaved("owner-1", "p1", liveRevision + 6, "other-client");
+    publishProjectSaved("owner-1", "p1", liveRevision + 7, "other-client");
+    await settle();
+    check("flush 中途被关掉后写到 ready 为止", frames(cutRes).map((frame) => frame.type).join(","), `project.saved,ready`);
+    check("结束后的补发被静默丢弃而不是抛错", cutRes.chunks.some((chunk) => chunk.startsWith("json:")), false);
+    cutReq.fireClose();
+    check("被中途关掉的连接同样不再登记", disconnectShare("owner-1", "p1", editor.share.id), 0);
+
+    // 读库这段 await 里对端就走了：清理必须已经挂上，否则 listener 与 Presence 会永久留在内存里。
+    const goneRes = makeRes();
+    const goneReq = makeReq("sse-gone-client", liveSession);
+    handler(goneReq, goneRes, () => undefined);
+    updateProjectPresence("owner-1", "p1", actorOf(liveSession.actorId), { clientId: "sse-gone-client", nodeIds: [], activity: "idle" });
+    goneRes.writableEnded = true;
+    goneReq.fireClose();
+    await settle();
+    check("读库期间断开的连接已经退订", disconnectShare("owner-1", "p1", editor.share.id), 0);
+    check("读库期间断开的连接不留 Presence", listProjectPresence("owner-1", "p1").some((item) => item.clientId === "sse-gone-client"), false);
+    publishProjectSaved("owner-1", "p1", liveRevision + 8, "other-client");
+    await settle();
+    check("断开后的事件不会再写进这条连接", frames(goneRes).length, 0);
+
     console.log("哪些改动会收权");
     // 断流条件此前散在路由里没法直接测，导致「关掉匿名不断流」漏到了合并之后。
     const revokeBase = await shares.findOneByOrFail({ id: viewerShare.id });
