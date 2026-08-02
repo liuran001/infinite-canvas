@@ -30,3 +30,19 @@ export function createBufferedWriter(sink: (event: unknown) => void) {
         },
     };
 }
+
+/**
+ * 往一条 SSE 连接上写事件，连接已经结束就静默丢弃。
+ *
+ * 守卫不是可选的加固：被挂起或移除的成员由 closeTeamConnectionsOf 直接 `res.end()`，
+ * 而这可能正好发生在 flush 补发缓冲事件的中途、或 keepalive 定时器即将触发的那一刻。
+ * 结束后再写会抛 ERR_STREAM_WRITE_AFTER_END——补发那条抛在 flush 的循环里会截断剩余事件，
+ * 定时器那条则没有任何调用栈接得住，会直接掀翻整个进程。
+ * 收到 end 之后本来就没有对端可言，丢弃是唯一正确的处置。
+ */
+export function sseWriter(res: { writableEnded: boolean; write: (chunk: string) => unknown }) {
+    return (event: unknown) => {
+        if (res.writableEnded) return;
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+}

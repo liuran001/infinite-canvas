@@ -1,7 +1,7 @@
 import { Router } from "express";
 
 import { handle, ok, parseQuery } from "../lib/response";
-import { createBufferedWriter } from "../lib/sse";
+import { createBufferedWriter, sseWriter } from "../lib/sse";
 import { requireUser, userAuth } from "../middleware/auth";
 import { requireTeamRole } from "../services/team-access";
 import { acceptTeamInvite, createTeamInvite, deleteTeamInvite, listTeamInvites, previewTeamInvite, updateTeamInvite } from "../services/team-invites";
@@ -118,10 +118,10 @@ teamRouter.get(
         res.setHeader("X-Accel-Buffering", "no");
         res.flushHeaders();
         // 被移除或降级时由服务层调 closeTeamConnectionsOf 关掉这条连接，同时退订总线 listener。
-        sink = (event: unknown) => void res.write(`data: ${JSON.stringify(event)}\n\n`);
+        // 写入统一走 sseWriter：连接可能在 flush 补发的中途就被关掉，结束后再写会抛错并截断剩余事件。
+        sink = sseWriter(res);
         stream.flush({ type: "ready", teamId, role, credits: team.credits });
-        // 连接可能已经被 closeTeamConnectionsOf 关掉（res.end()），此时再写会抛 ERR_STREAM_WRITE_AFTER_END，
-        // 而这个错误发生在定时器里，没有任何调用栈能接住它，会直接掀翻整个进程。
+        // keepalive 同理。它抛在定时器里，没有任何调用栈接得住，会直接掀翻整个进程。
         const keepAlive = setInterval(() => {
             if (res.writableEnded) return clearInterval(keepAlive);
             res.write(": keep-alive\n\n");
