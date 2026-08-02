@@ -8,6 +8,7 @@ import { repo } from "../db/data-source";
 import { CreditLog, DEFAULT_STORAGE_QUOTA, User, type CreditLogType, type UserRole, type UserStatus } from "../db/entities";
 import { fail, firstNonEmpty, newAffCode, newId, now } from "../lib/errors";
 import type { Query } from "../lib/response";
+import { charge, refund } from "./billing";
 import { claimInviteCode, recordInviteUse, releaseInviteCode } from "./invites";
 import { usedBytesOf } from "./quota";
 import { getSettings } from "./settings";
@@ -254,34 +255,16 @@ export async function adjustUserQuota(id: string, quota: number) {
     return { ...(await users.save(user)), password: "" };
 }
 
-/** 扣点走带条件的原子更新，余额不足时不会扣成负数。 */
+/**
+ * 扣点与退款的实现都在 billing.ts（扣费、读回余额、写流水同事务）。
+ * 这两个是保留给现有调用点的薄封装，签名与语义一字不变。
+ */
 export async function consumeUserCredits(userId: string, model: string, credits: number, path: string) {
-    if (credits <= 0) return;
-    const users = repo(User);
-    const result = await users
-        .createQueryBuilder()
-        .update(User)
-        .set({ credits: () => "credits - :credits", updatedAt: now() })
-        .where("id = :userId AND credits >= :credits", { userId, credits })
-        .setParameter("credits", credits)
-        .execute();
-    if (!result.affected) throw fail("算力点不足");
-    const user = await users.findOneBy({ id: userId });
-    await writeCreditLog(userId, "ai_consume", -credits, user?.credits || 0, `调用模型 ${model}`, { model, path });
+    await charge({ kind: "user", userId }, credits, { model, path });
 }
 
 export async function refundUserCredits(userId: string, model: string, credits: number, path: string) {
-    if (credits <= 0) return;
-    const users = repo(User);
-    await users
-        .createQueryBuilder()
-        .update(User)
-        .set({ credits: () => "credits + :credits", updatedAt: now() })
-        .where("id = :userId", { userId })
-        .setParameter("credits", credits)
-        .execute();
-    const user = await users.findOneBy({ id: userId });
-    await writeCreditLog(userId, "ai_refund", credits, user?.credits || 0, `模型调用失败返还 ${model}`, { model, path });
+    await refund({ payer: { kind: "user", userId }, credits, logId: "" }, { model, path });
 }
 
 export async function listCreditLogs(query: Query) {
