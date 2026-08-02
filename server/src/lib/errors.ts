@@ -18,6 +18,17 @@ export function fail(message: string, status = 400, code: string | number = 1, d
     return new SafeError(message, status, code, data);
 }
 
+/**
+ * 分享链路的稳定错误码。前端要靠它区分「链接失效」「只读」「超频」这几种完全不同的处置方式，
+ * 所以集中在这里定义，不散落成各处的字符串字面量。
+ */
+export const SHARE_READ_ONLY = "SHARE_READ_ONLY";
+export const CLONE_DISABLED = "CLONE_DISABLED";
+export const RATE_LIMITED = "RATE_LIMITED";
+export const QUOTA_EXCEEDED = "QUOTA_EXCEEDED";
+export const FORBIDDEN = "FORBIDDEN";
+export const NOT_FOUND = "NOT_FOUND";
+
 export function safeMessage(error: unknown) {
     if (error instanceof SafeError) return error.message;
     console.error("request failed:", error);

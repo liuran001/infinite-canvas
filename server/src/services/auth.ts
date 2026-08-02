@@ -70,7 +70,8 @@ function newUser(patch: Partial<User>): User {
 }
 
 function signToken(user: User) {
-    return jwt.sign({ userId: user.id, username: user.username, role: user.role }, config.jwtSecret, { expiresIn: `${config.jwtExpireHours}h`, subject: user.id });
+    // kind 用来和分享访客的 guest 令牌区分：两种令牌用同一把密钥签，只有载荷能证明这是账号身份。
+    return jwt.sign({ kind: "user", userId: user.id, username: user.username, role: user.role }, config.jwtSecret, { expiresIn: `${config.jwtExpireHours}h`, subject: user.id });
 }
 
 export async function newSession(user: User): Promise<AuthSession> {
@@ -150,7 +151,10 @@ export async function login(username: string, password: string) {
 export async function currentAuthUser(token: string): Promise<AuthUser | null> {
     let userId = "";
     try {
-        userId = String((jwt.verify(token, config.jwtSecret) as { userId?: string }).userId || "");
+        const payload = jwt.verify(token, config.jwtSecret) as { userId?: string; kind?: string };
+        // 分享访客的令牌签名同样有效，绝不能在这里被兑换成账号身份。签发早于本次改动的老令牌没有 kind，按账号处理。
+        if (payload.kind && payload.kind !== "user") return null;
+        userId = String(payload.userId || "");
     } catch {
         return null;
     }

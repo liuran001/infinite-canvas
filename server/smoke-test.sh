@@ -171,7 +171,11 @@ check "调整算力点写入流水" "$(curl -s "$BASE/admin/credit-logs" -H "Aut
 
 # 上游地址是假的必定失败，正好验证「先扣点、失败后原路返还」这条路径。
 curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"key-3","kind":"image","model":"gpt-image-2","prompt":"一只狗","params":{"count":2},"inputFileIds":[]}' >/dev/null
-sleep 4
+# 等任务真的进终态再断言。固定睡几秒是靠不住的：这个上游要多久才失败取决于当前网络能不能解析到它。
+for _ in $(seq 1 40); do
+    [ "$(curl -s "$BASE/v1/jobs?status=pending,running" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items | length')" = "0" ] && break
+    sleep 1
+done
 check "生成失败后算力点原路返还" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)" "10"
 check "流水记录了扣除" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.type=="ai_consume")] | length')" "1"
 check "扣除金额按张数计算" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.type=="ai_consume")][0].amount')" "-4"
@@ -462,6 +466,144 @@ check "画布详情带出图片节点引用" "$(curl -s "$BASE/admin/projects/$U
 check "按用户筛选文件生效" "$(curl -s "$BASE/admin/files?userId=$USER_ID&kind=image" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "2"
 check "换个用户筛不出文件" "$(curl -s "$BASE/admin/files?userId=$ADMIN_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "0"
 check "文件列表带出所属用户名" "$(curl -s "$BASE/admin/files?userId=$USER_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].username')" "tester"
+
+echo "画布分享"
+# 分享链接就是能力凭证：这一节要跑通「建链接 → 换 guest 令牌 → 访客读写 → 撤销断流 → 克隆」整条链路，
+# 并守住两条底线：明文 token 不出现在列表里，guest 身份碰不到账号级能力。
+CLONER_TOKEN=$(curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' -d '{"username":"share-cloner","password":"cloner-pass"}' | jq -r .data.token)
+curl -s -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"分享画布","revision":0,"clientId":"smoke-share","data":{"nodes":[{"id":"s1","type":"image","metadata":{"storageKey":"server:'"$FILE_ID"'"}}],"connections":[]}}' >/dev/null
+check "未登录不能创建分享" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/projects/share-p1/shares" -H 'Content-Type: application/json' -d '{"role":"viewer"}')" "401"
+
+SHARE=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"viewer","allowAnonymous":true,"allowClone":true}')
+TOKEN=$(echo "$SHARE" | jq -r .data.token)
+SHARE_ID=$(echo "$SHARE" | jq -r .data.id)
+check "创建分享返回明文 token" "$(printf '%s' "$TOKEN" | wc -c | tr -d ' ')" "32"
+check "创建分享返回完整链接" "$(echo "$SHARE" | jq -r .data.url | grep -c "/s/$TOKEN\$")" "1"
+LIST=$(curl -s "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN")
+check "列表不返回明文 token" "$(echo "$LIST" | jq -r '.data[0].token // "absent"')" "absent"
+check "列表只给出 token 前缀" "$(echo "$LIST" | jq -r '.data[0].tokenPrefix')" "$(printf '%s' "$TOKEN" | cut -c1-8)"
+check "他人管理分享按画布不存在处理" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $ADMIN_TOKEN")" "404"
+
+SESSION=$(curl -s -X POST "$BASE/v1/shares/$TOKEN/session")
+GUEST=$(echo "$SESSION" | jq -r .data.token)
+check "匿名换取 guest 令牌" "$(echo "$SESSION" | jq -r .data.role)" "viewer"
+check "换令牌时带出画布元信息" "$(echo "$SESSION" | jq -r '"\(.data.project.title)/\(.data.project.revision)"')" "分享画布/1"
+check "匿名访客拿到访客昵称" "$(echo "$SESSION" | jq -r .data.displayName | grep -c '^访客-')" "1"
+check "刷新页面沿用同一个匿名 id" "$(curl -s -X POST "$BASE/v1/shares/$TOKEN/session" -H 'Content-Type: application/json' -d "{\"previousToken\":\"$GUEST\"}" | jq -r .data.actorId)" "$(echo "$SESSION" | jq -r .data.actorId)"
+FORGED_ACTOR=$(curl -s -X POST "$BASE/v1/shares/$TOKEN/session" -H 'Content-Type: application/json' -d '{"previousToken":"forged-guest-token"}' | jq -r .data.actorId)
+check "伪造的旧凭据不会被沿用" "$([ -n "$FORGED_ACTOR" ] && [ "$FORGED_ACTOR" != "$(echo "$SESSION" | jq -r .data.actorId)" ] && echo yes || echo no)" "yes"
+check "错误 token 返回 404" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/deadbeefdeadbeefdeadbeef/session")" "404"
+check "只读访客可以读画布" "$(curl -s "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $GUEST" | jq -r .data.title)" "分享画布"
+check "只读访客可以订阅实时流" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$BASE/v1/projects/share-p1/realtime?clientId=share-viewer-1&sinceRevision=99" -H "Authorization: Bearer $GUEST")" "200"
+
+# guest 身份的边界是「编辑这张画布」，不是「以所有者身份用系统」：账号级能力一律 403，
+# 而不是 401 —— 访客的凭证本身是合法的，回 401 会让前端把会话清掉，页面直接白掉。
+check "访客不能管理分享" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $GUEST")" "403"
+check "访客不能列出画布" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects" -H "Authorization: Bearer $GUEST")" "403"
+check "访客不能用 Agent" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $GUEST" -H 'Content-Type: application/json' -d '{"projectId":"share-p1"}')" "403"
+check "访客不能调模型" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/ai/chat/completions" -H "Authorization: Bearer $GUEST" -H 'Content-Type: application/json' -d '{"model":"mock-image"}')" "403"
+check "访客不能提交生成任务" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $GUEST" -H 'Content-Type: application/json' -d '{"clientJobId":"guest-1","kind":"image","model":"mock-image","prompt":"x","params":{},"inputFileIds":[]}')" "403"
+check "访客不能读账号偏好" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/preferences" -H "Authorization: Bearer $GUEST")" "403"
+check "访客不能读云空间用量" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/storage" -H "Authorization: Bearer $GUEST")" "403"
+check "guest 令牌换不出账号身份" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $GUEST" | jq -r .data.role)" "guest"
+check "viewer 访客写入被拒" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $GUEST" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":1,"clientId":"share-viewer-1"}')" "403"
+check "viewer 写入有稳定错误码" "$(curl -s -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $GUEST" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":1,"clientId":"share-viewer-1"}' | jq -r .code)" "SHARE_READ_ONLY"
+printf 'share-guest-upload-payload' >"$WORK/share-guest.png"
+check "只读访客不能上传" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/files" -H "Authorization: Bearer $GUEST" -F "file=@$WORK/share-guest.png;type=image/png" -F "projectId=share-p1")" "403"
+
+# 可编辑分享：写的是所有者的项目本体，复用现有 CAS 与广播，不另起一条写路径。
+ESHARE=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"editor","allowAnonymous":true,"allowClone":false}')
+ETOKEN=$(echo "$ESHARE" | jq -r .data.token)
+ESHARE_ID=$(echo "$ESHARE" | jq -r .data.id)
+EGUEST=$(curl -s -X POST "$BASE/v1/shares/$ETOKEN/session" | jq -r .data.token)
+REV=$(curl -s "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST" | jq -r .data.revision)
+WROTE=$(curl -s -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d "{\"title\":\"访客改标题\",\"data\":{\"nodes\":[{\"id\":\"s1\",\"type\":\"image\",\"metadata\":{\"storageKey\":\"server:$FILE_ID\"}}]},\"revision\":$REV,\"clientId\":\"share-editor-1\"}")
+check "editor 访客写入成功" "$(echo "$WROTE" | jq -r .data.revision)" "$((REV + 1))"
+check "写入落在所有者的画布上" "$(curl -s "$BASE/v1/projects" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.items[] | select(.id=="share-p1")][0].title')" "访客改标题"
+check "访客写入不会分叉出第二份画布" "$(curl -s --get "$BASE/admin/projects" --data-urlencode 'keyword=访客改标题' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "1"
+check "访客用旧版本写入照样 409" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d "{\"title\":\"x\",\"data\":{},\"revision\":$REV,\"clientId\":\"share-editor-1\"}")" "409"
+check "访客不能删除画布" "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST" -H 'X-Client-Id: share-editor-1')" "403"
+PRESENCE=$(curl -s -X POST "$BASE/v1/projects/share-p1/presence" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d '{"clientId":"share-editor-1","nodeIds":["s1"],"activity":"editing"}')
+check "访客 Presence 用服务端给的访客昵称" "$(echo "$PRESENCE" | jq -r '[.data.members[] | select(.clientId=="share-editor-1")][0].displayName' | grep -c '^访客-')" "1"
+check "所有者能看到访客的 Presence" "$(curl -s -X POST "$BASE/v1/projects/share-p1/presence" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientId":"smoke-owner","nodeIds":[],"activity":"idle"}' | jq -r '.data.members | length')" "2"
+
+UP=$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $EGUEST" -F "file=@$WORK/share-guest.png;type=image/png" -F "projectId=share-p1")
+FID=$(echo "$UP" | jq -r .data.id)
+check "editor 访客可上传" "$(echo "$UP" | jq -r .code)" "0"
+check "访客上传的文件归所有者" "$(curl -s "$BASE/v1/files/$FID" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.id)" "$FID"
+check "访客上传计入所有者名下" "$(curl -s "$BASE/admin/files?userId=$USER_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r "[.data.items[] | select(.id==\"$FID\")] | length")" "1"
+check "别的账号读不到这个文件" "$(curl -s "$BASE/v1/files/$FID" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .msg)" "无权访问该文件"
+
+# 访客上传单独限流：配额只拦总量，拦不住「拿分享链接当图床」在几分钟内把所有者的空间刷满。
+RSHARE=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"editor","allowAnonymous":true,"allowClone":false}')
+RGUEST=$(curl -s -X POST "$BASE/v1/shares/$(echo "$RSHARE" | jq -r .data.token)/session" | jq -r .data.token)
+RATE_LAST=0
+for _ in $(seq 1 21); do
+    RATE_LAST=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/files" -H "Authorization: Bearer $RGUEST" -F "file=@$WORK/share-guest.png;type=image/png" -F "projectId=share-p1")
+done
+check "访客上传超频返回 429" "$RATE_LAST" "429"
+
+# 克隆：单事务复用底层对象，只给克隆者建新的文件记录，源画布后续修改不影响副本。
+CLONED=$(curl -s -X POST "$BASE/v1/shares/$TOKEN/clone" -H "Authorization: Bearer $CLONER_TOKEN")
+CLONE_ID=$(echo "$CLONED" | jq -r .data.id)
+check "克隆成功" "$(echo "$CLONED" | jq -r .code)" "0"
+check "副本 revision 从 1 开始" "$(echo "$CLONED" | jq -r .data.revision)" "1"
+check "副本标题带「的副本」" "$(echo "$CLONED" | jq -r .data.title)" "访客改标题的副本"
+CLONE_VIEW=$(curl -s "$BASE/v1/projects/$CLONE_ID" -H "Authorization: Bearer $CLONER_TOKEN")
+CLONE_FILE=$(echo "$CLONE_VIEW" | jq -r '.data.data.nodes[0].metadata.storageKey' | sed 's/^server://')
+check "副本里的 fileId 已被重写" "$([ "$CLONE_FILE" != "$FILE_ID" ] && [ -n "$CLONE_FILE" ] && echo yes || echo no)" "yes"
+check "副本的图片归克隆者" "$(curl -s "$BASE/v1/files/$CLONE_FILE" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .data.id)" "$CLONE_FILE"
+check "副本的图片可正常显示" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/files/$CLONE_FILE/content")" "200"
+check "源画布的图片没有被动过" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/files/$FILE_ID/content")" "200"
+check "匿名不能克隆" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$TOKEN/clone")" "401"
+check "不允许克隆的分享被拒" "$(curl -s -X POST "$BASE/v1/shares/$ETOKEN/clone" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .code)" "CLONE_DISABLED"
+
+# 分享页里 Authorization 已经被访客凭据占着，账号 JWT 只能另走 X-User-Authorization，
+# 「匿名看了一圈再登录，然后保存到自己账号」这条路全靠它。
+DUAL=$(curl -s -X POST "$BASE/v1/shares/$TOKEN/clone" -H "Authorization: Bearer $GUEST" -H "X-Share-Guest: 1" -H "X-User-Authorization: Bearer $CLONER_TOKEN")
+check "带访客凭据时用账号头完成克隆" "$(echo "$DUAL" | jq -r .code)" "0"
+check "克隆出来的副本归登录账号" "$(curl -s "$BASE/v1/projects/$(echo "$DUAL" | jq -r .data.id)" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .data.revision)" "1"
+DUAL_SESSION=$(curl -s -X POST "$BASE/v1/shares/$TOKEN/session" -H "Authorization: Bearer $GUEST" -H "X-Share-Guest: 1" -H "X-User-Authorization: Bearer $CLONER_TOKEN")
+check "带账号头换会话时用真实昵称" "$(echo "$DUAL_SESSION" | jq -r .data.displayName)" "share-cloner"
+check "带账号头换会话时不再算匿名" "$(echo "$DUAL_SESSION" | jq -r .data.anonymous)" "false"
+check "会话同时给出 role 与 permission" "$(echo "$DUAL_SESSION" | jq -r '"\(.data.role)/\(.data.permission)"')" "viewer/viewer"
+check "会话给出绝对过期时间" "$(echo "$DUAL_SESSION" | jq -r '.data.expiresAt | test("^[0-9]{4}-")')" "true"
+check "账号头不能拿来提权到写" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $GUEST" -H "X-Share-Guest: 1" -H "X-User-Authorization: Bearer $CLONER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":2,"clientId":"share-viewer-1"}')" "403"
+
+# 撤销必须当场断开长连接：SSE 建好之后不重连就不会重新鉴权，只靠令牌过期要等到下一次重连才生效。
+timeout 8 curl -sN "$BASE/v1/projects/share-p1/realtime?clientId=share-editor-sse&sinceRevision=0" -H "Authorization: Bearer $EGUEST" >"$WORK/share-stream.txt" &
+SHARE_STREAM_PID=$!
+sleep 1
+REVOKE_AT=$(date +%s)
+DEL=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$BASE/v1/projects/share-p1/shares/$ESHARE_ID" -H "Authorization: Bearer $USER_TOKEN")
+wait "$SHARE_STREAM_PID" 2>/dev/null
+check "撤销成功" "$DEL" "200"
+check "访客流曾经建立成功" "$(grep -c '"type":"ready"' "$WORK/share-stream.txt")" "1"
+check "撤销后长连接被主动断开" "$([ "$(($(date +%s) - REVOKE_AT))" -le 3 ] && echo yes || echo no)" "yes"
+check "撤销后旧 guest 令牌读画布返回 404" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST")" "404"
+check "撤销后旧 guest 令牌写入返回 404" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":9,"clientId":"share-editor-1"}')" "404"
+check "撤销后原始 token 也换不到令牌" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$ETOKEN/session")" "404"
+check "撤销后分享仍能查到（软删除）" "$(curl -s "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" | jq -r "[.data[] | select(.id==\"$ESHARE_ID\")][0].enabled")" "false"
+
+# 停用与过期都按「链接不存在」处理，不给 token 探测留任何信号。
+check "改开关会同步给所有者" "$(curl -s -X PATCH "$BASE/v1/projects/share-p1/shares/$SHARE_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"allowClone":false}' | jq -r .data.allowClone)" "false"
+check "改成不允许克隆后立刻生效" "$(curl -s -X POST "$BASE/v1/shares/$TOKEN/clone" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .code)" "CLONE_DISABLED"
+curl -s -X PATCH "$BASE/v1/projects/share-p1/shares/$SHARE_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"enabled":false}' >/dev/null
+check "停用后换不到令牌" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$TOKEN/session")" "404"
+EXPIRED=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"viewer","allowAnonymous":true,"allowClone":true,"expiresAt":"2020-01-01T00:00:00.000Z"}' | jq -r .data.token)
+check "已过期的链接换不到令牌" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$EXPIRED/session")" "404"
+NOANON=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"viewer","allowAnonymous":false,"allowClone":true}' | jq -r .data.token)
+check "不允许匿名时未登录换不到令牌" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$NOANON/session")" "404"
+check "不允许匿名时登录后可以换到令牌" "$(curl -s -X POST "$BASE/v1/shares/$NOANON/session" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .data.role)" "viewer"
+check "已登录访客用账号昵称而不是访客昵称" "$(curl -s -X POST "$BASE/v1/shares/$NOANON/session" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .data.displayName | grep -c '^访客-')" "0"
+
+# 访问日志按分享维度落库，IP 只存哈希。
+SHARE_LOGS=$(curl -s "$BASE/v1/projects/share-p1/shares/$SHARE_ID/logs" -H "Authorization: Bearer $USER_TOKEN")
+check "所有者能查到访问日志" "$([ "$(echo "$SHARE_LOGS" | jq -r .data.total)" -ge 1 ] && echo yes || echo no)" "yes"
+check "日志区分匿名访问" "$(echo "$SHARE_LOGS" | jq -r '[.data.items[] | select(.event=="open" and .isAnonymous==true)] | length >= 1')" "true"
+check "日志不落原始 IP" "$(echo "$SHARE_LOGS" | jq -r '[.data.items[] | select(.ipHash | test("[.:]"))] | length')" "0"
+check "他人查不到访问日志" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/share-p1/shares/$SHARE_ID/logs" -H "Authorization: Bearer $CLONER_TOKEN")" "404"
+check "分享页响应头带 noindex" "$(curl -sI "http://127.0.0.1:$PORT/s/$TOKEN" | grep -ci 'x-robots-tag: noindex')" "1"
 
 echo "账号自助管理"
 check "改密码要校验原密码" "$(curl -s -X POST "$BASE/auth/password" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"oldPassword":"wrong","newPassword":"new-pass-123"}' | jq -r .msg)" "原密码不正确"

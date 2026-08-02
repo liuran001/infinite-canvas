@@ -25,6 +25,9 @@ const COLORS = ["#2563eb", "#7c3aed", "#db2777", "#dc2626", "#ea580c", "#059669"
 const bus = new EventEmitter();
 bus.setMaxListeners(0);
 const presence = new Map<string, Map<string, ProjectPresence>>();
+/** 每条长连接登记自己是从哪条分享进来的，撤销时才找得到该关谁。owner 直连的 shareId 为空。 */
+type ProjectConnection = { key: string; shareId: string; clientId: string; close: () => void };
+const connections = new Set<ProjectConnection>();
 const channel = (ownerId: string, projectId: string) => `${ownerId}:${projectId}`;
 
 function colorFor(value: string) {
@@ -45,10 +48,38 @@ function publishPresence(ownerId: string, projectId: string) {
     publish(ownerId, projectId, { type: "presence.sync", projectId, members: members(ownerId, projectId) });
 }
 
-export function subscribeProject(ownerId: string, projectId: string, listener: (event: ProjectRealtimeEvent) => void) {
+export function subscribeProject(ownerId: string, projectId: string, listener: (event: ProjectRealtimeEvent) => void, options: { shareId?: string; clientId?: string; close?: () => void } = {}) {
     const key = channel(ownerId, projectId);
     bus.on(key, listener);
-    return () => void bus.off(key, listener);
+    const connection: ProjectConnection | null = options.close ? { key, shareId: options.shareId || "", clientId: options.clientId || "", close: options.close } : null;
+    if (connection) connections.add(connection);
+    return () => {
+        bus.off(key, listener);
+        if (connection) connections.delete(connection);
+    };
+}
+
+/**
+ * 撤销或降级分享后主动断开该链接下的长连接。
+ * 只靠 guest 令牌的短 TTL 不够：SSE 建好之后不重连就不会重新鉴权，撤销要等到下次重连才生效。
+ */
+export function disconnectShare(ownerId: string, projectId: string, shareId: string) {
+    if (!shareId) return 0;
+    const key = channel(ownerId, projectId);
+    let closed = 0;
+    for (const connection of [...connections]) {
+        if (connection.key !== key || connection.shareId !== shareId) continue;
+        connections.delete(connection);
+        closed += 1;
+        if (connection.clientId) removeProjectPresence(ownerId, projectId, connection.clientId);
+        // 对端可能已经断了，关不掉不该影响剩下的连接。
+        try {
+            connection.close();
+        } catch (error) {
+            console.warn("关闭已撤销分享的连接失败：", error);
+        }
+    }
+    return closed;
 }
 
 export function publishProjectSaved(ownerId: string, projectId: string, revision: number, writerClientId: string) {

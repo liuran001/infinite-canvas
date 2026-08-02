@@ -9,7 +9,8 @@ import { consumeUserCredits, refundUserCredits } from "../services/auth";
 import { buildChannelUrl, modelCost, selectModelChannel, type ModelChannel } from "../services/settings";
 
 export const aiRouter = Router();
-aiRouter.use(userAuth);
+
+// 同 jobs：鉴权逐个路由挂，router 级中间件会连带拦下挂在它之后的公开接口。
 
 function geminiUrl(channel: ModelChannel, model: string, action: string) {
     const baseUrl = channel.baseUrl.trim().replace(/\/+$/, "");
@@ -55,12 +56,13 @@ async function proxy(req: Parameters<Parameters<typeof handle>[0]>[0], res: Para
     Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]).pipe(res);
 }
 
-aiRouter.post("/v1/ai/responses", handle((req, res) => proxy(req, res, (channel) => buildChannelUrl(channel, "/responses"))));
+aiRouter.post("/v1/ai/responses", userAuth, handle((req, res) => proxy(req, res, (channel) => buildChannelUrl(channel, "/responses"))));
 
-aiRouter.post("/v1/ai/chat/completions", handle((req, res) => proxy(req, res, (channel) => buildChannelUrl(channel, "/chat/completions"))));
+aiRouter.post("/v1/ai/chat/completions", userAuth, handle((req, res) => proxy(req, res, (channel) => buildChannelUrl(channel, "/chat/completions"))));
 
 aiRouter.post(
     "/v1/ai/gemini/:action",
+    userAuth,
     handle((req, res) => {
         const action = req.params.action === "streamGenerateContent" ? "streamGenerateContent" : "generateContent";
         return proxy(req, res, (channel, model) => geminiUrl(channel, model, action), action === "streamGenerateContent" ? "alt=sse" : undefined);
@@ -70,6 +72,7 @@ aiRouter.post(
 /** 服务器模式下渠道密钥不下发给前端，模型列表由服务端代查。 */
 aiRouter.get(
     "/v1/ai/models",
+    userAuth,
     handle(async (req, res) => {
         const model = String(req.query.model || "").trim();
         if (!model) throw fail("缺少模型名称");

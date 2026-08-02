@@ -15,6 +15,8 @@ export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "cancel
 export type FileStorage = "local" | "s3";
 export type AgentSessionStatus = "idle" | "running" | "awaiting" | "failed";
 export type AgentMessageRole = "user" | "assistant" | "tool";
+export type ShareRole = "viewer" | "editor";
+export type ShareAccessEvent = "open" | "edit" | "clone";
 
 /**
  * 执行到一半、需要用户点头才能继续的请求。
@@ -346,4 +348,45 @@ export class AgentMessage {
     @Column(short) createdAt!: string;
 }
 
-export const entities = [User, CreditLog, Setting, InviteCode, InviteUse, Prompt, PromptCategory, Asset, PhysicalBlob, StoredFile, Project, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage];
+/**
+ * 画布分享链接。一条链接就是一份能力凭证，没有成员表也没有邀请流程。
+ * 只存 token 的哈希：明文一旦落库，拿到数据库备份或日志的人就等于拿到了所有画布的访问权。
+ * 哈希用 SHA-256 而不是慢哈希——token 是 192 bit 随机值，没有字典攻击面，而查询必须能走等值索引。
+ */
+@Entity("project_shares")
+export class ProjectShare {
+    @PrimaryColumn(id) id!: string;
+    @Index() @Column(id) projectId!: string;
+    /** 创建分享时的项目所有者，冗余存储，配额归属与审计都以它为准。 */
+    @Index() @Column(short) ownerId!: string;
+    @Index({ unique: true }) @Column({ type: "varchar", length: 128 }) tokenHash!: string;
+    /** 明文前若干字符，只够管理界面区分「这是哪一条链接」，不足以还原 token。 */
+    @Column({ type: "varchar", length: 16, default: "" }) tokenPrefix!: string;
+    @Column({ type: "varchar", length: 16, default: "viewer" }) role!: ShareRole;
+    @Column({ type: "boolean", default: true }) allowAnonymous!: boolean;
+    @Column({ type: "boolean", default: true }) allowClone!: boolean;
+    /** 撤销开关。撤销是软删除语义：访问日志还要能查回「这条链接当初被谁看过」。 */
+    @Column({ type: "boolean", default: true }) enabled!: boolean;
+    /** 过期时间，空串表示不过期。 */
+    @Column(short) expiresAt!: string;
+    @Column(short) createdAt!: string;
+    @Column(short) updatedAt!: string;
+}
+
+/** 分享维度的访问事件。写入必须节流，否则一次访客打开画布就会被 SSE 与 Presence 刷出几十条。 */
+@Entity("project_access_logs")
+export class ProjectAccessLog {
+    @PrimaryColumn(id) id!: string;
+    @Index() @Column(id) shareId!: string;
+    @Index() @Column(id) projectId!: string;
+    /** 账号 id，或匿名访客的稳定 id。 */
+    @Column(short) actorId!: string;
+    @Column({ type: "boolean", default: false }) isAnonymous!: boolean;
+    @Column({ type: "varchar", length: 16, default: "open" }) event!: ShareAccessEvent;
+    /** IP 只存哈希：所有者需要的是「是不是同一个人」，不是对方的真实地址。 */
+    @Column({ type: "varchar", length: 64, default: "" }) ipHash!: string;
+    @Column(short) userAgent!: string;
+    @Index() @Column(short) createdAt!: string;
+}
+
+export const entities = [User, CreditLog, Setting, InviteCode, InviteUse, Prompt, PromptCategory, Asset, PhysicalBlob, StoredFile, Project, ProjectShare, ProjectAccessLog, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage];

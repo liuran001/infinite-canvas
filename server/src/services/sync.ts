@@ -29,11 +29,6 @@ function toPluginView(row: UserPlugin) { return { id: row.pluginId, data: parseD
 export async function listProjects(userId: string, since: string) {
     return (await repo(Project).find({ where: since ? { userId, updatedAt: MoreThan(since) } : { userId }, order: { updatedAt: "DESC" }, take: MAX_SYNC_ITEMS })).map(toProjectView);
 }
-export async function getProject(userId: string, id: string) {
-    const row = await repo(Project).findOneBy({ userId, projectId: id });
-    if (!row || row.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
-    return toProjectView(row);
-}
 function conflict(row: Project) { return fail("画布项目在其他设备上已更新，请先同步", 409, "REVISION_CONFLICT", toProjectView(row)); }
 
 /** revision 是必填 CAS 基线；同版本并发保存只允许一个成功。 */

@@ -1,14 +1,14 @@
 import { Router } from "express";
 
-import { fail } from "../lib/errors";
+import { fail, FORBIDDEN } from "../lib/errors";
 import { handle, ok } from "../lib/response";
-import { requireUser, userAuth } from "../middleware/auth";
-import { resolveProjectAccess, type ProjectActor } from "../services/project-access";
+import { accessContext, projectAuth, requireUser, userAuth } from "../middleware/auth";
+import { resolveProjectAccess } from "../services/project-access";
 import { listProjectPresence, removeProjectPresence, subscribeProject, updateProjectPresence, type ProjectActivity } from "../services/project-realtime";
-import { deleteProject, deleteUserAsset, deleteUserPlugin, getProject, listProjects, listUserAssets, listUserPlugins, saveProject, saveUserAsset, saveUserPlugin } from "../services/sync";
+import { logShareAccess } from "../services/project-share";
+import { deleteProject, deleteUserAsset, deleteUserPlugin, listProjects, listUserAssets, listUserPlugins, saveProject, saveUserAsset, saveUserPlugin, toProjectView } from "../services/sync";
 
 export const syncRouter = Router();
-syncRouter.use(userAuth);
 
 const CLIENT_ID = /^[A-Za-z0-9_-]{8,128}$/;
 function readClientId(value: unknown) {
@@ -16,31 +16,30 @@ function readClientId(value: unknown) {
     if (!CLIENT_ID.test(clientId)) throw fail("缺少有效的客户端标识", 400, "INVALID_CLIENT_ID");
     return clientId;
 }
-function actor(req: Parameters<typeof requireUser>[0]): ProjectActor {
-    const user = requireUser(req);
-    return { id: user.id, displayName: user.displayName || user.username, avatarUrl: user.avatarUrl || "" };
-}
 
-syncRouter.get("/v1/projects", handle(async (req, res) => ok(res, { items: await listProjects(requireUser(req).id, String(req.query.since || "")) })));
+syncRouter.get("/v1/projects", userAuth, handle(async (req, res) => ok(res, { items: await listProjects(requireUser(req).id, String(req.query.since || "")) })));
 
 /** 一张画布一条 SSE，同时承载版本通知和 Presence，不再另外占浏览器连接。 */
 syncRouter.get(
     "/v1/projects/:id/realtime",
+    projectAuth,
     handle(async (req, res) => {
         const projectId = String(req.params.id);
         const clientId = readClientId(req.query.clientId);
         const sinceRevision = Math.max(0, Number.parseInt(String(req.query.sinceRevision || "0"), 10) || 0);
-        const currentActor = actor(req);
+        const context = accessContext(req);
         // 先订阅再读库，读权限和 revision 的 await 窗口里发生的保存会进入 buffered。
-        let ownerId = currentActor.id;
+        // 访客订阅的是所有者的频道，所以频道 id 只能取自 guest 令牌里的所有者，取访客自己的必然订阅到空频道。
+        const ownerId = context.guest?.ownerId || context.user?.id || "";
         let reading = true;
         const buffered: unknown[] = [];
         let write: (event: unknown) => void = (event) => { buffered.push(event); };
-        const unsubscribe = subscribeProject(ownerId, projectId, (event) => (reading ? buffered.push(event) : write(event)));
+        const unsubscribe = subscribeProject(ownerId, projectId, (event) => (reading ? buffered.push(event) : write(event)), { shareId: context.guest?.shareId, clientId, close: () => res.end() });
         let access;
         try {
-            access = await resolveProjectAccess(currentActor, projectId, "read");
-            ownerId = access.ownerId;
+            access = await resolveProjectAccess(context, projectId, "read");
+            // 令牌里的所有者和库里对不上属于异常输入，直接按不存在处理，绝不改订阅频道。
+            if (access.ownerId !== ownerId) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
         } catch (error) {
             unsubscribe();
             throw error;
@@ -53,7 +52,7 @@ syncRouter.get(
         res.flushHeaders();
         write = (event: unknown) => void res.write(`data: ${JSON.stringify(event)}\n\n`);
         if (access.project.revision > sinceRevision) write({ type: "project.saved", projectId, revision: access.project.revision, writerClientId: "" });
-        write({ type: "ready", revision: access.project.revision, members: listProjectPresence(access.ownerId, projectId) });
+        write({ type: "ready", revision: access.project.revision, role: access.role, members: listProjectPresence(access.ownerId, projectId) });
         reading = false;
         buffered.forEach(write);
         const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 25_000);
@@ -67,56 +66,69 @@ syncRouter.get(
 
 syncRouter.post(
     "/v1/projects/:id/presence",
+    projectAuth,
     handle(async (req, res) => {
         const projectId = String(req.params.id);
-        const currentActor = actor(req);
-        const access = await resolveProjectAccess(currentActor, projectId, "read");
+        const access = await resolveProjectAccess(accessContext(req), projectId, "read");
         const body = req.body || {};
         const clientId = readClientId(body.clientId);
         const activity = String(body.activity || "idle") as ProjectActivity;
         if (!["idle", "selecting", "editing"].includes(activity)) throw fail("无效的协作状态", 400, "INVALID_ACTIVITY");
         if (!Array.isArray(body.nodeIds) || body.nodeIds.some((id: unknown) => typeof id !== "string" || !id || id.length > 128)) throw fail("无效的节点列表", 400, "INVALID_NODE_IDS");
-        ok(res, { members: updateProjectPresence(access.ownerId, projectId, currentActor, { clientId, nodeIds: body.nodeIds, activity }) });
+        ok(res, { members: updateProjectPresence(access.ownerId, projectId, access.actor, { clientId, nodeIds: body.nodeIds, activity }) });
     }),
 );
 
 syncRouter.delete(
     "/v1/projects/:id/presence/:clientId",
+    projectAuth,
     handle(async (req, res) => {
         const projectId = String(req.params.id);
-        const access = await resolveProjectAccess(actor(req), projectId, "read");
+        const access = await resolveProjectAccess(accessContext(req), projectId, "read");
         ok(res, { members: removeProjectPresence(access.ownerId, projectId, readClientId(req.params.clientId)) });
     }),
 );
 
-syncRouter.get("/v1/projects/:id", handle(async (req, res) => ok(res, await getProject(requireUser(req).id, String(req.params.id)))));
+syncRouter.get(
+    "/v1/projects/:id",
+    projectAuth,
+    handle(async (req, res) => ok(res, toProjectView((await resolveProjectAccess(accessContext(req), String(req.params.id), "read")).project))),
+);
 syncRouter.put(
     "/v1/projects/:id",
+    projectAuth,
     handle(async (req, res) => {
         const body = req.body || {};
         const revision = Number(body.revision);
         if (!Number.isInteger(revision) || revision < 0) throw fail("缺少有效的画布版本", 400, "INVALID_REVISION");
-        const currentActor = actor(req);
+        const context = accessContext(req);
         const projectId = String(req.params.id);
-        // revision 0 允许创建；已有项目必须通过统一访问边界，避免未来分享接入时绕过权限。
-        if (revision > 0) await resolveProjectAccess(currentActor, projectId, "write");
-        ok(res, await saveProject(currentActor.id, { id: projectId, title: String(body.title || ""), data: body.data, revision, clientId: readClientId(body.clientId) }));
+        // revision 0 是本人新建画布；已有项目与分享访客一律先过统一访问边界。
+        const access = revision > 0 || context.guest ? await resolveProjectAccess(context, projectId, "write") : null;
+        // 写的是所有者的项目行。这里若用访客自己的 id，可编辑分享会在访客名下另开一份画布，
+        // 所有者永远看不到访客的修改，实时广播也会分叉到两个频道。
+        const ownerId = access ? access.ownerId : requireUser(req).id;
+        const saved = await saveProject(ownerId, { id: projectId, title: String(body.title || ""), data: body.data, revision, clientId: readClientId(body.clientId) });
+        if (access?.share) await logShareAccess(access.share, { actorId: access.actorId, isAnonymous: access.anonymous, event: "edit", ip: req.ip, userAgent: String(req.headers["user-agent"] || "") });
+        ok(res, saved);
     }),
 );
 syncRouter.delete(
     "/v1/projects/:id",
+    projectAuth,
     handle(async (req, res) => {
         const projectId = String(req.params.id);
-        const currentActor = actor(req);
-        await resolveProjectAccess(currentActor, projectId, "write");
-        await deleteProject(currentActor.id, projectId, readClientId(req.headers["x-client-id"]));
+        const access = await resolveProjectAccess(accessContext(req), projectId, "write");
+        // 可编辑分享的边界是「改这张画布的内容」，删掉整张画布不在其中。
+        if (access.role !== "owner") throw fail("分享访客不能删除画布", 403, FORBIDDEN);
+        await deleteProject(access.ownerId, projectId, readClientId(req.headers["x-client-id"]));
         ok(res, true);
     }),
 );
 
-syncRouter.get("/v1/user-assets", handle(async (req, res) => ok(res, { items: await listUserAssets(requireUser(req).id, String(req.query.since || "")) })));
-syncRouter.put("/v1/user-assets/:id", handle(async (req, res) => { const body = req.body || {}; ok(res, await saveUserAsset(requireUser(req).id, { id: String(req.params.id), kind: String(body.kind || "image"), title: String(body.title || ""), data: body.data, revision: body.revision })); }));
-syncRouter.delete("/v1/user-assets/:id", handle(async (req, res) => { await deleteUserAsset(requireUser(req).id, String(req.params.id)); ok(res, true); }));
-syncRouter.get("/v1/user-plugins", handle(async (req, res) => ok(res, { items: await listUserPlugins(requireUser(req).id, String(req.query.since || "")) })));
-syncRouter.put("/v1/user-plugins/:id", handle(async (req, res) => { const body = req.body || {}; ok(res, await saveUserPlugin(requireUser(req).id, { id: String(req.params.id), data: body.data, revision: body.revision })); }));
-syncRouter.delete("/v1/user-plugins/:id", handle(async (req, res) => { await deleteUserPlugin(requireUser(req).id, String(req.params.id)); ok(res, true); }));
+syncRouter.get("/v1/user-assets", userAuth, handle(async (req, res) => ok(res, { items: await listUserAssets(requireUser(req).id, String(req.query.since || "")) })));
+syncRouter.put("/v1/user-assets/:id", userAuth, handle(async (req, res) => { const body = req.body || {}; ok(res, await saveUserAsset(requireUser(req).id, { id: String(req.params.id), kind: String(body.kind || "image"), title: String(body.title || ""), data: body.data, revision: body.revision })); }));
+syncRouter.delete("/v1/user-assets/:id", userAuth, handle(async (req, res) => { await deleteUserAsset(requireUser(req).id, String(req.params.id)); ok(res, true); }));
+syncRouter.get("/v1/user-plugins", userAuth, handle(async (req, res) => ok(res, { items: await listUserPlugins(requireUser(req).id, String(req.query.since || "")) })));
+syncRouter.put("/v1/user-plugins/:id", userAuth, handle(async (req, res) => { const body = req.body || {}; ok(res, await saveUserPlugin(requireUser(req).id, { id: String(req.params.id), data: body.data, revision: body.revision })); }));
+syncRouter.delete("/v1/user-plugins/:id", userAuth, handle(async (req, res) => { await deleteUserPlugin(requireUser(req).id, String(req.params.id)); ok(res, true); }));

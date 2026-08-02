@@ -1,6 +1,6 @@
 import { repo } from "../db/data-source";
 import { DEFAULT_STORAGE_QUOTA, StoredFile, User } from "../db/entities";
-import { fail } from "../lib/errors";
+import { fail, QUOTA_EXCEEDED } from "../lib/errors";
 
 /** 已用量不冗余存储，一律从文件对象表实时聚合；bigint 在部分方言下返回字符串，统一转数字。 */
 export async function usedBytesOf(userIds: string[]) {
@@ -37,5 +37,5 @@ function mb(bytes: number) {
 /** 写入新文件前校验，命中去重的上传不会走到这里，因此不占新增空间。 */
 export async function assertQuota(userId: string, incomingBytes: number) {
     const { used, quota } = await storageOf(userId);
-    if (used + incomingBytes > quota) throw fail(`云空间不足：已用 ${mb(used)} / ${mb(quota)}，本次需要 ${mb(incomingBytes)}`);
+    if (used + incomingBytes > quota) throw fail(`云空间不足：已用 ${mb(used)} / ${mb(quota)}，本次需要 ${mb(incomingBytes)}`, 403, QUOTA_EXCEEDED);
 }

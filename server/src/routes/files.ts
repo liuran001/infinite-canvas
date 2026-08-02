@@ -4,8 +4,10 @@ import multer from "multer";
 import { config } from "../config";
 import { fail } from "../lib/errors";
 import { handle, ok } from "../lib/response";
-import { requireUser, userAuth } from "../middleware/auth";
+import { accessContext, projectAuth, requireUser, userAuth } from "../middleware/auth";
 import { deleteFile, getFile, saveFile, storedObjectOf } from "../services/files";
+import { resolveProjectAccess } from "../services/project-access";
+import { assertShareUploadAllowed } from "../services/project-share";
 import { storageOf } from "../services/quota";
 import { getObject } from "../services/storage";
 
@@ -23,20 +25,27 @@ fileRouter.get(
 /**
  * 上传素材。宽高由服务端解析，视频/音频时长交由前端回传，
  * 相同内容会命中已有记录，重复上传不会产生多份文件。
+ * 带 projectId 时按画布归属判权：分享访客传上来的图必须落在所有者名下，
+ * 否则访客一走图就成了孤儿，所有者打开自己的画布只剩一片破图。
  */
 fileRouter.post(
     "/v1/files",
-    userAuth,
+    projectAuth,
     upload.single("file"),
     handle(async (req, res) => {
-        const user = requireUser(req);
         if (!req.file) throw fail("请选择要上传的文件");
+        const context = accessContext(req);
+        const projectId = String(req.body?.projectId || "").trim() || context.guest?.projectId || "";
+        const access = projectId || context.guest ? await resolveProjectAccess(context, projectId, "write") : null;
+        const ownerId = access ? access.ownerId : requireUser(req).id;
+        // 配额拦的是所有者的总空间，拦不住「拿分享链接当图床」，所以访客还要按 (分享, 访客) 单独限频。
+        if (access?.share) assertShareUploadAllowed(access.share.id, access.actorId, req.file.size);
         const meta = {
             width: Number(req.body?.width) || undefined,
             height: Number(req.body?.height) || undefined,
             durationMs: Number(req.body?.durationMs) || undefined,
         };
-        const file = await saveFile(user.id, req.file.buffer, req.file.mimetype, meta);
+        const file = await saveFile(ownerId, req.file.buffer, req.file.mimetype, meta);
         ok(res, { id: file.id, kind: file.kind, mimeType: file.mimeType, bytes: Number(file.bytes), width: file.width, height: file.height, durationMs: file.durationMs });
     }),
 );

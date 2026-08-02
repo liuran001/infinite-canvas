@@ -9,7 +9,8 @@ const JOB_STATUSES: JobStatus[] = ["pending", "running", "succeeded", "failed", 
 const JOB_KINDS: JobKind[] = ["image", "video", "audio", "text"];
 
 export const jobRouter = Router();
-jobRouter.use(userAuth);
+
+// 鉴权逐个路由挂：router 级中间件会拦下同层挂载在它之后的每一个接口，分享的匿名入口首当其冲。
 
 /**
  * 提交生成任务。clientJobId 是幂等键，重复提交同一个键只会返回已有任务，
@@ -17,6 +18,7 @@ jobRouter.use(userAuth);
  */
 jobRouter.post(
     "/v1/jobs",
+    userAuth,
     handle(async (req, res) => {
         const body = req.body || {};
         const job = await createJob(requireUser(req).id, {
@@ -35,6 +37,7 @@ jobRouter.post(
 /** 客户端重连后拉取未完成任务，据此恢复进度而不是重新发起生成。 */
 jobRouter.get(
     "/v1/jobs",
+    userAuth,
     handle(async (req, res) => {
         const requested = String(req.query.status || "")
             .split(",")
@@ -56,6 +59,7 @@ jobRouter.get(
  */
 jobRouter.get(
     "/v1/jobs/stream",
+    userAuth,
     handle(async (req, res) => {
         const userId = requireUser(req).id;
         const sinceSeq = Math.max(0, Number.parseInt(String(req.query.sinceSeq || "0"), 10) || 0);
@@ -121,6 +125,6 @@ jobRouter.get(
     }),
 );
 
-jobRouter.get("/v1/jobs/:id", handle(async (req, res) => ok(res, await toJobView(await getJob(requireUser(req).id, String(req.params.id))))));
+jobRouter.get("/v1/jobs/:id", userAuth, handle(async (req, res) => ok(res, await toJobView(await getJob(requireUser(req).id, String(req.params.id))))));
 
-jobRouter.post("/v1/jobs/:id/cancel", handle(async (req, res) => ok(res, await toJobView(await cancelJob(requireUser(req).id, String(req.params.id))))));
+jobRouter.post("/v1/jobs/:id/cancel", userAuth, handle(async (req, res) => ok(res, await toJobView(await cancelJob(requireUser(req).id, String(req.params.id))))));
