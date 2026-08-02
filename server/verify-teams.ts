@@ -560,6 +560,10 @@ async function main() {
     // 主键冲突也是唯一冲突，但换码重试解决不了，必须落到「原样抛出」那条分支。
     check("主键冲突不算码冲突", isInviteCodeUniqueViolation(Object.assign(new Error("UNIQUE constraint failed: team_invites.id"), { code: "SQLITE_CONSTRAINT_PRIMARYKEY" })), false);
     check("识别 MySQL 的 code 约束名", isInviteCodeUniqueViolation({ code: "ER_DUP_ENTRY", message: "Duplicate entry 'ABC' for key 'uq_team_invites_code'" }), true);
+    // Postgres：码约束是显式命名的，constraint 字段就是它；主键则是 TypeORM 生成的 PK_<hash>，
+    // 名字里没有表名也没有列名，必须匹配不上而原样抛出，否则会被换码重试八次再伪装成「码耗尽」。
+    check("识别 Postgres 的 code 约束名", isInviteCodeUniqueViolation({ driverError: { code: "23505", constraint: "uq_team_invites_code", table: "team_invites", detail: "Key (code)=(ABC) already exists." } }), true);
+    check("Postgres 主键冲突不算码冲突", isInviteCodeUniqueViolation({ driverError: { code: "23505", constraint: "PK_9a1f2c7b3e", table: "team_invites", detail: "Key (id)=(x) already exists.", message: 'duplicate key value violates unique constraint "PK_9a1f2c7b3e"' } }), false);
     check("识别 MySQL 唯一冲突", isUniqueViolation({ code: "ER_DUP_ENTRY" }), true);
     check("识别 Postgres 唯一冲突", isUniqueViolation({ driverError: { code: "23505" } }), true);
     check("普通错误不算唯一冲突", isUniqueViolation(new Error("boom")), false);

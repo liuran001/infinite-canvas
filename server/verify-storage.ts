@@ -123,6 +123,36 @@ async function main() {
     await rejects("不能删除他人的文件", () => deleteFile(stale.id, "user-b"));
     check("越权删除不影响原引用", await files.countBy({ id: stale.id }), 1);
 
+    // 并发首传的输家会撞 file_blobs 的主键，那一条必须吞掉（下一行重新读就拿到赢家的记录）；
+    // 别的错误吞掉就会被翻译成一条毫无线索的「找不到记录」。判定得认「表 + 列」这组身份：
+    // 主键约束在 TypeORM 里叫 PK_<hash>，名字里既没有表名也没有列名，按名字匹配在 Postgres 上必然漏判。
+    console.log("blob 主键冲突判定");
+    const { isBlobChecksumConflict } = await import("./src/lib/db-errors");
+    const captured = await blobs
+        .insert({ checksum: fileA.checksum, bytes: 1, kind: "image", mimeType: "image/png", width: 0, height: 0, durationMs: 0, storage: "local", path: "dup", refCount: 0, state: "active", pendingSince: "", createdAt: now() })
+        .then(() => null)
+        .catch((error: unknown) => error);
+    check("SQLite 真实主键冲突被认出", isBlobChecksumConflict(captured), true);
+    // 反例也用真实驱动错误：另一张表的主键冲突长得几乎一样，但不能被吞。
+    const otherTable = await files
+        .insert({ id: fileA.id, userId: "user-a", kind: "image", mimeType: "image/png", bytes: 1, width: 0, height: 0, durationMs: 0, storage: "local", path: "dup", checksum: fileA.checksum, createdAt: now() })
+        .then(() => null)
+        .catch((error: unknown) => error);
+    check("其他表的真实主键冲突不被吞", isBlobChecksumConflict(otherTable), false);
+
+    // Postgres 与 MySQL 跑不到真库，这里用两个驱动各自的真实错误形态做判定。
+    const pg = (extra: Record<string, unknown>) => ({ query: `INSERT INTO "file_blobs"("checksum") VALUES ($1)`, driverError: { code: "23505", message: 'duplicate key value violates unique constraint "PK_9a1f2c7b3e"', constraint: "PK_9a1f2c7b3e", schema: "public", ...extra } });
+    check("Postgres 主键冲突按 table + detail 认出", isBlobChecksumConflict(pg({ table: "file_blobs", detail: "Key (checksum)=(abc) already exists." })), true);
+    check("Postgres 缺 detail 时按表名认出", isBlobChecksumConflict(pg({ table: "file_blobs" })), true);
+    check("Postgres 其他表的唯一冲突不被吞", isBlobChecksumConflict(pg({ table: "team_invites", detail: "Key (id)=(x) already exists." })), false);
+    check("Postgres 同表其他列的唯一冲突不被吞", isBlobChecksumConflict(pg({ table: "file_blobs", detail: "Key (path)=(x) already exists." })), false);
+    check("MySQL 8 的 file_blobs.PRIMARY 被认出", isBlobChecksumConflict({ code: "ER_DUP_ENTRY", errno: 1062, message: "Duplicate entry 'abc' for key 'file_blobs.PRIMARY'" }), true);
+    // 5.7 的文案里没有表名，只能从 TypeORM 保存的失败 SQL 认。
+    check("MySQL 5.7 按失败 SQL 的目标表认出", isBlobChecksumConflict({ code: "ER_DUP_ENTRY", errno: 1062, message: "Duplicate entry 'abc' for key 'PRIMARY'", query: "INSERT INTO `file_blobs`(`checksum`) VALUES (?)" }), true);
+    check("MySQL 5.7 其他表的主键冲突不被吞", isBlobChecksumConflict({ code: "ER_DUP_ENTRY", errno: 1062, message: "Duplicate entry 'abc' for key 'PRIMARY'", query: "INSERT INTO `files`(`id`) VALUES (?)" }), false);
+    check("SQLite 其他表的唯一冲突不被吞", isBlobChecksumConflict({ code: "SQLITE_CONSTRAINT_UNIQUE", message: "UNIQUE constraint failed: team_invites.code" }), false);
+    check("非唯一冲突的错误不被吞", isBlobChecksumConflict(new Error("connection lost")), false);
+
     finish(env.root);
 }
 
