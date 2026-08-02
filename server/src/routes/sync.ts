@@ -2,6 +2,7 @@ import { Router } from "express";
 
 import { fail, FORBIDDEN } from "../lib/errors";
 import { handle, ok } from "../lib/response";
+import { createBufferedWriter, sseWriter } from "../lib/sse";
 import { accessContext, projectAuth, requireUser, userAuth } from "../middleware/auth";
 import { resolveProjectAccess } from "../services/project-access";
 import { getProjectTeam, setProjectTeam } from "../services/project-team";
@@ -32,17 +33,29 @@ syncRouter.get(
         // 先订阅再读库，读权限和 revision 的 await 窗口里发生的保存会进入 buffered。
         // 访客订阅的是所有者的频道，所以频道 id 只能取自 guest 令牌里的所有者，取访客自己的必然订阅到空频道。
         const ownerId = context.guest?.ownerId || context.user?.id || "";
-        let reading = true;
-        const buffered: unknown[] = [];
-        let write: (event: unknown) => void = (event) => { buffered.push(event); };
-        const unsubscribe = subscribeProject(ownerId, projectId, (event) => (reading ? buffered.push(event) : write(event)), { shareId: context.guest?.shareId, clientId, close: () => res.end() });
+        // sink 一开始什么都不做：响应头还没发，事件只能先进 stream 的缓冲，等 ready 写完再按序放行。
+        let sink: (event: unknown) => void = () => undefined;
+        const stream = createBufferedWriter((event) => sink(event));
+        let keepAlive: NodeJS.Timeout | undefined;
+        let released = false;
+        // 清理必须在订阅之后立刻挂上：读库这段 await 里对端就可能断开，
+        // 等到最后再注册的话，这中间断掉的连接不会有人退订，listener 和 Presence 就永久留在内存里。
+        const release = () => {
+            if (released) return;
+            released = true;
+            if (keepAlive) clearInterval(keepAlive);
+            unsubscribe();
+            removeProjectPresence(ownerId, projectId, clientId);
+        };
+        const unsubscribe = subscribeProject(ownerId, projectId, (event) => stream.push(event), { shareId: context.guest?.shareId, clientId, close: () => res.end() });
+        req.on("close", release);
         let access;
         try {
             access = await resolveProjectAccess(context, projectId, "read");
             // 令牌里的所有者和库里对不上属于异常输入，直接按不存在处理，绝不改订阅频道。
             if (access.ownerId !== ownerId) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
         } catch (error) {
-            unsubscribe();
+            release();
             throw error;
         }
         res.status(200);
@@ -51,17 +64,18 @@ syncRouter.get(
         res.setHeader("Connection", "keep-alive");
         res.setHeader("X-Accel-Buffering", "no");
         res.flushHeaders();
-        write = (event: unknown) => void res.write(`data: ${JSON.stringify(event)}\n\n`);
-        if (access.project.revision > sinceRevision) write({ type: "project.saved", projectId, revision: access.project.revision, writerClientId: "" });
-        write({ type: "ready", revision: access.project.revision, role: access.role, members: listProjectPresence(access.ownerId, projectId) });
-        reading = false;
-        buffered.forEach(write);
-        const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 25_000);
-        req.on("close", () => {
-            clearInterval(keepAlive);
-            unsubscribe();
-            removeProjectPresence(access.ownerId, projectId, clientId);
-        });
+        // 写入统一走 sseWriter：连接可能在 flush 补发缓冲事件的中途被 disconnectShare 关掉，
+        // 结束后再写会抛 ERR_STREAM_WRITE_AFTER_END，那一抛在 flush 的循环里会把剩余事件整段截断。
+        sink = sseWriter(res);
+        if (access.project.revision > sinceRevision) sink({ type: "project.saved", projectId, revision: access.project.revision, writerClientId: "" });
+        stream.flush({ type: "ready", revision: access.project.revision, role: access.role, members: listProjectPresence(access.ownerId, projectId) });
+        // keepalive 同理，而且更凶：它抛在定时器回调里，没有任何调用栈接得住，会直接掀翻整个进程。
+        // 连接如果在读库期间就断了，req.close 早已跑过 release，这里再起定时器就没人清得掉了。
+        if (res.writableEnded) return release();
+        keepAlive = setInterval(() => {
+            if (res.writableEnded) return clearInterval(keepAlive);
+            res.write(": keep-alive\n\n");
+        }, 25_000);
     }),
 );
 
