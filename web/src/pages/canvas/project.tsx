@@ -261,6 +261,7 @@ function InfiniteCanvasPage() {
     const [dropTargetGroupId, setDropTargetGroupId] = useState<string | null>(null);
 
     const presenceReporterRef = useRef<ReturnType<typeof createPresenceReporter> | null>(null);
+    const applyingRemoteRenderRef = useRef(false);
     const nodesRef = useRef(nodes);
     const connectionsRef = useRef(connections);
     const selectedNodeIdsRef = useRef(selectedNodeIds);
@@ -424,6 +425,7 @@ function InfiniteCanvasPage() {
         if (!projectLoaded) return;
         return onRemoteProjectApplied((project) => {
             if (project.id !== projectId) return;
+            applyingRemoteRenderRef.current = true;
             void Promise.all([hydrateCanvasImages(project.nodes), hydrateAssistantImages(project.chatSessions || [])]).then(([nextNodes, nextSessions]) => {
                 setNodes(nextNodes);
                 setConnections(project.connections);
@@ -431,7 +433,6 @@ function InfiniteCanvasPage() {
                 setActiveChatId(project.activeChatId || null);
                 setBackgroundMode(project.backgroundMode);
                 setShowImageInfo(project.showImageInfo || false);
-                setTimeout(() => finishApplyingRemoteProject(projectId), 0);
             });
         });
     }, [projectId, projectLoaded]);
@@ -546,6 +547,10 @@ function InfiniteCanvasPage() {
     useEffect(() => {
         if (!projectLoaded || historyPausedRef.current) return;
         updateProject(projectId, { nodes, connections, chatSessions, activeChatId, backgroundMode, showImageInfo });
+        if (applyingRemoteRenderRef.current) {
+            applyingRemoteRenderRef.current = false;
+            finishApplyingRemoteProject(projectId);
+        }
     }, [activeChatId, backgroundMode, chatSessions, connections, nodes, projectId, projectLoaded, showImageInfo, updateProject]);
 
     useEffect(() => {
