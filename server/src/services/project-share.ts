@@ -105,7 +105,8 @@ export async function updateShare(share: ProjectShare, patch: Partial<ShareInput
         allowAnonymous: patch.allowAnonymous ?? share.allowAnonymous,
         allowClone: patch.allowClone ?? share.allowClone,
         enabled: patch.enabled ?? share.enabled,
-        expiresAt: patch.expiresAt ?? share.expiresAt,
+        // 前端清空过期时间发的是 null，语义是「改为永不过期」，只有整个字段缺席才算没改。
+        expiresAt: "expiresAt" in patch ? patch.expiresAt || "" : share.expiresAt,
         updatedAt: now(),
     };
     await repo(ProjectShare).update({ id: share.id }, next);

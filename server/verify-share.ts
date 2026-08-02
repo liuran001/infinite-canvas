@@ -15,7 +15,7 @@ async function main() {
     const { check, rejects, finish } = createChecker();
     const { initDatabase, repo } = await import("./src/db/data-source");
     const { PhysicalBlob, Project, ProjectAccessLog, ProjectShare, StoredFile, User } = await import("./src/db/entities");
-    const { createShare, findShareByToken, guestSessionOf, logShareAccess, resetShareRuntimeState, shareTokenHash, signGuestToken, verifyGuestToken, assertShareUploadAllowed } = await import("./src/services/project-share");
+    const { createShare, findShareByToken, guestSessionOf, logShareAccess, resetShareRuntimeState, shareTokenHash, signGuestToken, updateShare, verifyGuestToken, assertShareUploadAllowed } = await import("./src/services/project-share");
     const { resolveProjectAccess } = await import("./src/services/project-access");
     const { disconnectShare, listProjectPresence, subscribeProject, updateProjectPresence } = await import("./src/services/project-realtime");
     const { cloneSharedProject } = await import("./src/services/project-clone");
@@ -90,6 +90,17 @@ async function main() {
     await shares.update({ id: viewer.share.id }, { expiresAt: new Date(Date.now() + 600_000).toISOString() });
     check("未过期的分享仍可用", (await findShareByToken(viewer.token))?.id, viewer.share.id);
     await shares.update({ id: viewer.share.id }, { expiresAt: "" });
+
+    // 前端清空「过期时间」时发的是 null，服务层必须把它当成「改为永不过期」，而不是「没传这个字段」。
+    await shares.update({ id: viewer.share.id }, { expiresAt: new Date(Date.now() + 600_000).toISOString() });
+    await updateShare(await shares.findOneByOrFail({ id: viewer.share.id }), { expiresAt: null as unknown as string });
+    check("清空过期时间后落库为空串", (await shares.findOneByOrFail({ id: viewer.share.id })).expiresAt, "");
+    check("清空过期时间后分享恢复永久可用", (await findShareByToken(viewer.token))?.id, viewer.share.id);
+    // 未提及 expiresAt 的补丁不能顺手抹掉已设的过期时间。
+    await shares.update({ id: viewer.share.id }, { expiresAt: new Date(Date.now() + 600_000).toISOString() });
+    await updateShare(await shares.findOneByOrFail({ id: viewer.share.id }), { allowClone: false });
+    check("不涉及过期时间的补丁保留原过期时间", Boolean((await shares.findOneByOrFail({ id: viewer.share.id })).expiresAt), true);
+    await shares.update({ id: viewer.share.id }, { expiresAt: "", allowClone: true });
 
     console.log("guest 令牌");
     const viewerShare = await shares.findOneByOrFail({ id: viewer.share.id });
