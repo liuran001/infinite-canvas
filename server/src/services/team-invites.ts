@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { EntityManager } from "typeorm";
 
 import { dataSource, repo, serialTransaction } from "../db/data-source";
 import { Team, TeamInvite, TeamInviteUse, TeamMember, type TeamInviteKind, type TeamRole } from "../db/entities";
@@ -6,10 +7,13 @@ import { fail, newId, now } from "../lib/errors";
 // 手输码的字母表与长度只此一份：复制第二份的下场是某天有人改了形近字规则，另一处还在发旧格式的码。
 import { newInviteCode, normalizeInviteCode } from "./invites";
 import { requireTeamRole } from "./team-access";
+import { publishTeamMember } from "./team-realtime";
 
 /** 192 bit 随机值，base64url 后固定 32 个字符，远超「至少 128 bit」的要求。 */
 const TOKEN_BYTES = 24;
 const TOKEN_PREFIX_LENGTH = 8;
+/** 撞码重试上限。31^10 的空间里撞第二次已经是天文数字，试不出来只能是别的地方坏了，早点报错好过死循环。 */
+const CODE_RETRIES = 8;
 
 export type TeamInviteInput = {
     kind?: unknown;
@@ -26,6 +30,32 @@ export function teamInviteTokenHash(token: string) {
     return createHash("sha256").update(token).digest("hex");
 }
 
+/**
+ * 过期时间归一化成 UTC ISO。库里存什么格式决定了 `claimSlot` 的字符串比较是否等价于时间比较：
+ * 原样存下 `2026-08-04T00:00:00+08:00` 的话，它与 `...Z` 的字典序和真实先后毫无关系，
+ * 于是 `assertUsable`（Date.parse）说已过期、`claimSlot`（字符串）说还能领，并发路径就漏了。
+ */
+function normalizeExpiresAt(value: unknown) {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "";
+    const at = Date.parse(raw);
+    if (Number.isNaN(at)) throw fail("过期时间格式不正确", 400, "TEAM_INVITE_INVALID");
+    return new Date(at).toISOString();
+}
+
+/**
+ * 生成一个库里还没有的手输码。撞码本身几乎不会发生，但一旦发生，
+ * 让唯一约束把 500 甩给点「创建邀请」的管理员是最没道理的处理方式。
+ * 生成器与查重都从参数进来，测试可以直接喂脚本化的序列，生产接口上不留任何测试开关。
+ */
+export async function pickUniqueInviteCode(generate: () => string, taken: (code: string) => Promise<boolean>) {
+    for (let attempt = 0; attempt < CODE_RETRIES; attempt += 1) {
+        const code = generate();
+        if (!(await taken(code))) return code;
+    }
+    throw fail("邀请码生成失败，请重试", 500, "TEAM_INVITE_CODE_EXHAUSTED");
+}
+
 /** 列表视图只回前缀：链接明文只在创建响应里出现一次，之后服务端自己也拿不回来。 */
 export function teamInviteView(invite: TeamInvite) {
     return {
@@ -33,7 +63,8 @@ export function teamInviteView(invite: TeamInvite) {
         teamId: invite.teamId,
         kind: invite.kind,
         tokenPrefix: invite.tokenPrefix,
-        code: invite.code,
+        // 库里链接类邀请的 code 是 NULL（为了让唯一约束不被一堆空串顶住），对外统一成空串。
+        code: invite.code || "",
         role: invite.role,
         maxUses: invite.maxUses,
         usedCount: invite.usedCount,
@@ -46,26 +77,28 @@ export function teamInviteView(invite: TeamInvite) {
 }
 
 export async function createTeamInvite(teamId: string, actorId: string, input: TeamInviteInput) {
-    await requireTeamRole(actorId, teamId, ["owner", "admin"], { write: true });
+    await requireTeamRole(actorId, teamId, "invite.manage", { write: true });
     const kind: TeamInviteKind = input.kind === "code" ? "code" : "link";
     const role = String(input.role || "member") as TeamRole;
     // owner 只能通过转让产生。允许邀请授予 owner 等于把「团队恒有一个 owner」交给一张随时可能被转发的链接。
     if (!["admin", "member", "viewer"].includes(role)) throw fail("不能通过邀请授予该角色", 400, "TEAM_INVITE_INVALID");
     // 手输码熵低，默认一次性；链接默认不限次，语义与 InviteCode.maxUses 一致（0 表示不限）。
     const maxUses = input.maxUses === undefined ? (kind === "code" ? 1 : 0) : Math.max(0, Math.floor(Number(input.maxUses) || 0));
+    const expiresAt = normalizeExpiresAt(input.expiresAt);
     const token = kind === "link" ? randomBytes(TOKEN_BYTES).toString("base64url") : "";
+    const code = kind === "code" ? await pickUniqueInviteCode(newInviteCode, async (candidate) => Boolean(await repo(TeamInvite).countBy({ code: candidate }))) : null;
     const invite = repo(TeamInvite).create({
         id: newId("team-invite"),
         teamId,
         kind,
         tokenHash: token ? teamInviteTokenHash(token) : "",
         tokenPrefix: token.slice(0, TOKEN_PREFIX_LENGTH),
-        code: kind === "code" ? newInviteCode() : "",
+        code,
         role,
         maxUses,
         usedCount: 0,
         enabled: true,
-        expiresAt: String(input.expiresAt || "").trim(),
+        expiresAt,
         createdBy: actorId,
         note: String(input.note || "").trim(),
         createdAt: now(),
@@ -75,7 +108,7 @@ export async function createTeamInvite(teamId: string, actorId: string, input: T
 }
 
 export async function listTeamInvites(teamId: string, actorId: string) {
-    await requireTeamRole(actorId, teamId, ["owner", "admin"]);
+    await requireTeamRole(actorId, teamId, "invite.manage");
     return (
         await repo(TeamInvite).find({
             where: { teamId },
@@ -95,7 +128,7 @@ export async function updateTeamInvite(
         note?: unknown;
     },
 ) {
-    await requireTeamRole(actorId, teamId, ["owner", "admin"], { write: true });
+    await requireTeamRole(actorId, teamId, "invite.manage", { write: true });
     const invite = await repo(TeamInvite).findOneBy({ id: inviteId, teamId });
     if (!invite) throw fail("邀请不存在", 404, "TEAM_INVITE_NOT_FOUND");
     const next = {
@@ -108,7 +141,7 @@ export async function updateTeamInvite(
                       const value = Math.max(0, Math.floor(Number(patch.maxUses) || 0));
                       return value === 0 ? 0 : Math.max(invite.usedCount, value);
                   })(),
-        expiresAt: patch.expiresAt === undefined ? invite.expiresAt : String(patch.expiresAt || "").trim(),
+        expiresAt: patch.expiresAt === undefined ? invite.expiresAt : normalizeExpiresAt(patch.expiresAt),
         note: patch.note === undefined ? invite.note : String(patch.note || "").trim(),
     };
     await repo(TeamInvite).update({ id: inviteId }, next);
@@ -116,19 +149,20 @@ export async function updateTeamInvite(
 }
 
 export async function deleteTeamInvite(teamId: string, actorId: string, inviteId: string) {
-    await requireTeamRole(actorId, teamId, ["owner", "admin"], { write: true });
+    await requireTeamRole(actorId, teamId, "invite.manage", { write: true });
     await repo(TeamInvite).delete({ id: inviteId, teamId });
 }
 
-async function findInvite(tokenOrCode: string) {
+async function findInvite(manager: EntityManager, tokenOrCode: string) {
     const value = String(tokenOrCode || "").trim();
     if (!value) return null;
-    const byToken = await repo(TeamInvite).findOneBy({
+    const invites = manager.getRepository(TeamInvite);
+    const byToken = await invites.findOneBy({
         tokenHash: teamInviteTokenHash(value),
     });
     if (byToken) return byToken;
     const code = normalizeInviteCode(value);
-    return code ? repo(TeamInvite).findOneBy({ code }) : null;
+    return code ? invites.findOneBy({ code }) : null;
 }
 
 function assertUsable(invite: TeamInvite | null, at: number): asserts invite is TeamInvite {
@@ -142,9 +176,12 @@ function assertUsable(invite: TeamInvite | null, at: number): asserts invite is 
  * 占一个名额。并发安全全靠这条带条件的 UPDATE：名额判定与自增写在同一条语句里，
  * 十个人同时抢三个名额时数据库只会让其中三条 affected=1，usedCount 不可能越过 maxUses。
  * 上面那次查询只负责给出具体文案，不是门禁。
+ * 必须和成员插入同事务：SQLite 全程只有一条连接，事务外的 UPDATE 实际会落进别人已经打开的
+ * BEGIN 里，别人一回滚就把这次占位一起抹掉——占位方却以为自己拿到了名额，名额于是被超发。
  */
-async function claimSlot(invite: TeamInvite, at: number) {
-    const result = await repo(TeamInvite)
+async function claimSlot(manager: EntityManager, invite: TeamInvite, at: number) {
+    const result = await manager
+        .getRepository(TeamInvite)
         .createQueryBuilder()
         .update(TeamInvite)
         .set({ usedCount: () => `${column("usedCount")} + 1` })
@@ -157,20 +194,8 @@ async function claimSlot(invite: TeamInvite, at: number) {
     return Boolean(result.affected);
 }
 
-/** 名额占了但没能加进团队时还回去，否则一次失败就白吃一个名额。 */
-async function releaseSlot(inviteId: string) {
-    await repo(TeamInvite)
-        .createQueryBuilder()
-        .update(TeamInvite)
-        .set({ usedCount: () => `${column("usedCount")} - 1` })
-        .where(`${column("id")} = :id AND ${column("usedCount")} > 0`, {
-            id: inviteId,
-        })
-        .execute();
-}
-
 export async function previewTeamInvite(tokenOrCode: string, at = Date.now()) {
-    const invite = await findInvite(tokenOrCode);
+    const invite = await findInvite(dataSource.manager, tokenOrCode);
     assertUsable(invite, at);
     const team = await repo(Team).findOneBy({ id: invite.teamId });
     if (!team || team.status !== "active") throw fail("邀请无效或已失效", 400, "TEAM_INVITE_INVALID");
@@ -183,55 +208,56 @@ export async function previewTeamInvite(tokenOrCode: string, at = Date.now()) {
     };
 }
 
+/**
+ * 领取邀请。查邀请、占名额、查成员、插成员、写领取记录全在同一个事务里：
+ * 任何一步失败都整体回滚，名额自然还回去，不需要事务外再补一次 releaseSlot
+ * ——那种补偿写法在单连接的 SQLite 上会跨进别人的事务，回滚时连别人占的名额一起抹掉。
+ */
 export async function acceptTeamInvite(tokenOrCode: string, userId: string, at = Date.now()) {
-    const invite = await findInvite(tokenOrCode);
-    assertUsable(invite, at);
-    const team = await repo(Team).findOneBy({ id: invite.teamId });
-    if (!team || team.status !== "active") throw fail("邀请无效或已失效", 400, "TEAM_INVITE_INVALID");
+    const joined = await serialTransaction(async (manager) => {
+        const invite = await findInvite(manager, tokenOrCode);
+        assertUsable(invite, at);
+        const team = await manager.getRepository(Team).findOneBy({ id: invite.teamId });
+        if (!team || team.status !== "active") throw fail("邀请无效或已失效", 400, "TEAM_INVITE_INVALID");
 
-    const existing = await repo(TeamMember).findOneBy({
-        teamId: invite.teamId,
-        userId,
-    });
-    // 已经在团队里就直接返回，且不占名额：用户点第二次链接不该把一个一次性邀请吃掉。
-    if (existing) return existing;
+        const members = manager.getRepository(TeamMember);
+        const existing = await members.findOneBy({ teamId: invite.teamId, userId });
+        if (existing) {
+            // 挂起的人再点一次链接，不能给「加入成功」——他进去什么都做不了，那是个骗人的成功。
+            // 邀请也无权解挂：解挂是管理员的动作，一条能被转发的链接不该有这个能力。
+            if (existing.status !== "active") throw fail("你在该团队中的状态已被挂起，请联系团队管理员", 403, "TEAM_MEMBER_SUSPENDED");
+            // 已经在团队里就直接返回，且不占名额：用户点第二次链接不该把一个一次性邀请吃掉，
+            // 也不该因为两次点击撞在一起就给其中一次一个 409。
+            return { member: existing, joined: false };
+        }
 
-    if (!(await claimSlot(invite, at))) throw fail("邀请无效或已失效", 400, "TEAM_INVITE_INVALID");
-    try {
-        return await serialTransaction(async (manager) => {
-            const members = manager.getRepository(TeamMember);
-            const already = await members.findOneBy({
-                teamId: invite.teamId,
-                userId,
-            });
-            if (already) throw fail("已经是团队成员", 409, "TEAM_ALREADY_MEMBER");
-            if (team.memberLimit > 0 && (await members.countBy({ teamId: invite.teamId })) >= team.memberLimit) {
-                throw fail("团队成员数已达上限", 400, "TEAM_MEMBER_LIMIT");
-            }
-            const member = members.create({
-                teamId: invite.teamId,
-                userId,
-                role: invite.role,
-                creditLimit: 0,
-                limitWindow: "month",
-                status: "active",
-                invitedBy: invite.createdBy,
-                joinedAt: now(),
-                updatedAt: now(),
-            });
-            await members.insert(member);
-            await manager.getRepository(TeamInviteUse).insert({
-                id: newId("team-invite-use"),
-                inviteId: invite.id,
-                teamId: invite.teamId,
-                userId,
-                role: invite.role,
-                createdAt: now(),
-            });
-            return member;
+        if (!(await claimSlot(manager, invite, at))) throw fail("邀请无效或已失效", 400, "TEAM_INVITE_INVALID");
+        if (team.memberLimit > 0 && (await members.countBy({ teamId: invite.teamId })) >= team.memberLimit) {
+            throw fail("团队成员数已达上限", 400, "TEAM_MEMBER_LIMIT");
+        }
+        const member = members.create({
+            teamId: invite.teamId,
+            userId,
+            role: invite.role,
+            creditLimit: 0,
+            limitWindow: "month",
+            status: "active",
+            invitedBy: invite.createdBy,
+            joinedAt: now(),
+            updatedAt: now(),
         });
-    } catch (error) {
-        await releaseSlot(invite.id);
-        throw error;
-    }
+        await members.insert(member);
+        await manager.getRepository(TeamInviteUse).insert({
+            id: newId("team-invite-use"),
+            inviteId: invite.id,
+            teamId: invite.teamId,
+            userId,
+            role: invite.role,
+            createdAt: now(),
+        });
+        return { member, joined: true };
+    });
+    // 广播放在事务提交之后：事务里发出去的话，回滚时事件已经收不回来了。
+    if (joined.joined) publishTeamMember(joined.member.teamId, { type: "member.joined", userId, role: joined.member.role });
+    return joined.member;
 }

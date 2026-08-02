@@ -457,7 +457,14 @@ export class TeamInvite {
     @Column({ type: "varchar", length: 16, default: "link" }) kind!: TeamInviteKind;
     @Index() @Column({ type: "varchar", length: 128, default: "" }) tokenHash!: string;
     @Column({ type: "varchar", length: 32, default: "" }) tokenPrefix!: string;
-    @Index() @Column({ type: "varchar", length: 64, default: "" }) code!: string;
+    /**
+     * 手输码唯一。没有这条约束的话，两次生成撞上同一个码时，
+     * 按 code 查只会命中其中一张，另一张邀请的领取路径就被静默劫走了。
+     * 链接类邀请没有码，这里存 NULL 而不是空串：三种数据库的唯一索引都允许多行 NULL，
+     * 而空串会互相冲突——用 NULL 才能让「唯一」和「链接不占码」同时成立，
+     * 也不必依赖 MySQL 不支持的部分索引。
+     */
+    @Index("uq_team_invites_code", { unique: true }) @Column({ type: "varchar", length: 64, nullable: true, default: null }) code!: string | null;
     @Column({ type: "varchar", length: 32, default: "member" }) role!: TeamRole;
     /** 0 表示不限次，语义与 InviteCode.maxUses 一致。 */
     @Column({ type: "int", default: 0 }) maxUses!: number;

@@ -178,19 +178,69 @@ async function main() {
     check("admin 不能把人提升为 admin", canTeamAction("admin", "member.promoteAdmin"), false);
     check("owner 可以把人提升为 admin", canTeamAction("owner", "member.promoteAdmin"), true);
 
-    await rejects("非成员访问团队抛错", () => requireTeamRole("user-outsider", teamId, ["viewer"]));
-    await rejects("团队不存在抛错", () => requireTeamRole("user-owner", "team-missing", ["viewer"]));
-    check("owner 通过 viewer 门槛", (await requireTeamRole("user-owner", teamId, ["owner", "viewer"])).role, "owner");
-    await rejects("member 不满足 admin 门槛", () => requireTeamRole("user-a", teamId, ["owner", "admin"]));
+    await rejects("非成员访问团队抛错", () => requireTeamRole("user-outsider", teamId, "team.read"));
+    await rejects("团队不存在抛错", () => requireTeamRole("user-owner", "team-missing", "team.read"));
+    check("owner 通过 team.read 门槛", (await requireTeamRole("user-owner", teamId, "team.read")).role, "owner");
+    await rejects("member 不满足 team.update 门槛", () => requireTeamRole("user-a", teamId, "team.update"));
 
     await repo(TeamMember).update({ teamId, userId: "user-a" }, { status: "suspended" });
-    await rejects("挂起成员被拒", () => requireTeamRole("user-a", teamId, ["member"]));
+    await rejects("挂起成员被拒", () => requireTeamRole("user-a", teamId, "team.read"));
     await repo(TeamMember).update({ teamId, userId: "user-a" }, { status: "active" });
 
     await repo(Team).update({ id: teamId }, { status: "disabled" });
-    check("团队被停用仍可只读", (await requireTeamRole("user-a", teamId, ["member"])).team.status, "disabled");
-    await rejects("团队被停用禁止写入", () => requireTeamRole("user-a", teamId, ["member"], { write: true }));
+    check("团队被停用仍可只读", (await requireTeamRole("user-a", teamId, "team.read")).team.status, "disabled");
+    await rejects("团队被停用禁止写入", () => requireTeamRole("user-a", teamId, "credits.spend", { write: true }));
     await repo(Team).update({ id: teamId }, { status: "active" });
+
+    // 权限判定只有 MATRIX 一个来源：调用处拿不到「角色数组」这个口子，
+    // 传一个不在矩阵里的动作只能是硬拒，而不是意外放行。
+    await rejects("未知动作一律拒绝", () => requireTeamRole("user-owner", teamId, "team.nope" as never));
+
+    // 同级 admin 保护是一条具名断言，不是散在各服务里的 role 比较。
+    const { assertCanManageMember } = await import("./src/services/team-access");
+    await rejects("admin 不能操作同级 admin", async () => assertCanManageMember("admin", "admin"));
+    check(
+        "owner 可以操作 admin",
+        (() => {
+            assertCanManageMember("owner", "admin");
+            return "放行";
+        })(),
+        "放行",
+    );
+    check(
+        "admin 可以操作 member",
+        (() => {
+            assertCanManageMember("admin", "member");
+            return "放行";
+        })(),
+        "放行",
+    );
+
+    console.log("嵌套事务");
+    const { serialTransaction } = await import("./src/db/data-source");
+    // 嵌套调用必须复用外层 manager，否则内层会永远排在自己后面，整个进程的写入全挂住。
+    const nested = await Promise.race([
+        serialTransaction(async (outer) => {
+            await outer.getRepository(Team).update({ id: teamId }, { name: "嵌套改名" });
+            return serialTransaction(async (inner) => {
+                // 内层看得到外层还没提交的写入，才说明真的是同一个事务。
+                check("嵌套事务复用同一个 manager", inner === outer, true);
+                return (await inner.getRepository(Team).findOneByOrFail({ id: teamId })).name;
+            });
+        }),
+        new Promise((resolve) => setTimeout(() => resolve("死锁超时"), 2000)),
+    ]);
+    check("嵌套事务不自死锁", nested, "嵌套改名");
+    check("嵌套事务提交后写入生效", (await repo(Team).findOneByOrFail({ id: teamId })).name, "嵌套改名");
+    await rejects("嵌套事务内抛错整体回滚", () =>
+        serialTransaction(async (outer) => {
+            await outer.getRepository(Team).update({ id: teamId }, { name: "不该留下" });
+            await serialTransaction(async () => {
+                throw new Error("boom");
+            });
+        }),
+    );
+    check("回滚后外层写入也没留下", (await repo(Team).findOneByOrFail({ id: teamId })).name, "嵌套改名");
 
     console.log("团队生命周期与 owner 不变量");
     const { createTeam, disbandTeam, leaveTeam, listMyTeams, removeMember, transferOwner, updateMemberRole, updateTeam } = await import("./src/services/teams");
@@ -292,6 +342,16 @@ async function main() {
     await leaveTeam(fresh.id, "user-boss");
     check("退出后成员记录被删除", await repo(TeamMember).countBy({ teamId: fresh.id, userId: "user-boss" }), 0);
 
+    // 平台停用团队后成员仍必须能退出：退出是「保护自己」的动作，
+    // 把它一起掐掉等于把人永久锁在一个已经停用的团队里，连断开关系都做不到。
+    const frozen = await createTeam("user-frozen-owner", { name: "被停用的团队" });
+    await repo(TeamMember).insert({ teamId: frozen.id, userId: "user-frozen-member", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-frozen-owner", joinedAt: now(), updatedAt: now() });
+    await repo(Team).update({ id: frozen.id }, { status: "disabled" });
+    await leaveTeam(frozen.id, "user-frozen-member");
+    check("停用团队后普通成员仍可退出", await repo(TeamMember).countBy({ teamId: frozen.id, userId: "user-frozen-member" }), 0);
+    await rejects("停用团队后 owner 仍不能直接退出", () => leaveTeam(frozen.id, "user-frozen-owner"));
+    await rejects("停用团队后仍不能改成员角色", () => updateMemberRole(frozen.id, "user-frozen-owner", "user-frozen-owner", "member"));
+
     const { createTeamInvite: makeInvite } = await import("./src/services/team-invites");
     const leftover = await makeInvite(fresh.id, "user-c", { kind: "link", role: "member", maxUses: 0 });
     const leftoverInviteId = leftover.id;
@@ -305,7 +365,7 @@ async function main() {
         (await listMyTeams("user-c")).some((item) => item.id === fresh.id),
         false,
     );
-    await rejects("解散后无法再访问", () => requireTeamRole("user-c", fresh.id, ["viewer"]));
+    await rejects("解散后无法再访问", () => requireTeamRole("user-c", fresh.id, "team.read"));
 
     // 解散会删光成员，所以这里手工塞回一条：验证列表过滤的是团队状态本身，
     // 而不是「碰巧没有成员记录了」——否则残留一条成员行就能让死团队重新出现在列表里。
@@ -407,15 +467,9 @@ async function main() {
     const results = await Promise.allSettled(Array.from({ length: 10 }, (_unused, index) => acceptTeamInvite(limited.token, `rush-${index}`)));
     check("成功数恰好等于名额上限", results.filter((item) => item.status === "fulfilled").length, 3);
     check("usedCount 不超过 maxUses", (await repo(TeamInvite).findOneByOrFail({ id: limited.id })).usedCount, 3);
-    check(
-        "实际入队人数等于名额上限",
-        await repo(TeamMember).countBy({
-            invitedBy: "user-host",
-            teamId: host.id,
-            role: "member",
-        }),
-        4,
-    );
+    // 只数本轮 rush-* 用户：按 invitedBy 数会把更早通过同一个人加入的成员算进来，
+    // 断言名与期望值对不上，日后调整前序用例会先在这里翻车。
+    check("本轮实际入队人数等于名额上限", (await repo(TeamMember).findBy({ teamId: host.id })).filter((member) => member.userId.startsWith("rush-")).length, 3);
 
     const single = await createTeamInvite(host.id, "user-host", {
         kind: "code",
@@ -425,6 +479,102 @@ async function main() {
     const duel = await Promise.allSettled([acceptTeamInvite(single.code, "duel-a"), acceptTeamInvite(single.code, "duel-b")]);
     check("同时抢一个名额只有一人成功", duel.filter((item) => item.status === "fulfilled").length, 1);
     check("单名额邀请 usedCount 为 1", (await repo(TeamInvite).findOneByOrFail({ id: single.id })).usedCount, 1);
+
+    // 同一个人手抖点两次链接：两次都该成功且指向同一条成员记录，只吃一个名额。
+    // 「其中一次拿到 409」不是可接受的语义——用户看到的是一次莫名其妙的失败。
+    const twice = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0 });
+    const sameUser = await Promise.allSettled([acceptTeamInvite(twice.token, "user-double"), acceptTeamInvite(twice.token, "user-double")]);
+    check("同一用户并发领取两次都成功", sameUser.filter((item) => item.status === "fulfilled").length, 2);
+    check("同一用户并发领取只产生一条成员记录", await repo(TeamMember).countBy({ teamId: host.id, userId: "user-double" }), 1);
+    check("同一用户并发领取只消耗一个名额", (await repo(TeamInvite).findOneByOrFail({ id: twice.id })).usedCount, 1);
+    check("同一用户并发领取只写一条使用记录", await repo(TeamInviteUse).countBy({ inviteId: twice.id }), 1);
+
+    // 挂起的成员再点链接，必须给一个明确的错误，而不是「返回成功但进去什么都做不了」。
+    await repo(TeamMember).update({ teamId: host.id, userId: "user-double" }, { status: "suspended" });
+    await rejects("挂起成员领取邀请被明确拒绝", () => acceptTeamInvite(twice.token, "user-double"));
+    check("挂起成员领取后状态不变", (await repo(TeamMember).findOneByOrFail({ teamId: host.id, userId: "user-double" })).status, "suspended");
+    check("挂起成员领取不消耗名额", (await repo(TeamInvite).findOneByOrFail({ id: twice.id })).usedCount, 1);
+    await repo(TeamMember).update({ teamId: host.id, userId: "user-double" }, { status: "active" });
+
+    console.log("邀请码唯一性与过期归一化");
+    // code 列必须有唯一约束：没有它，两次生成撞上同一个码时后来的那张会把前一张的领取路径整个劫走。
+    const dup = await createTeamInvite(host.id, "user-host", { kind: "code", role: "member", maxUses: 1 });
+    await rejects("重复的手输码写不进库", () =>
+        repo(TeamInvite).insert({
+            id: newId("team-invite"),
+            teamId: host.id,
+            kind: "code",
+            tokenHash: "",
+            tokenPrefix: "",
+            code: dup.code,
+            role: "member",
+            maxUses: 1,
+            usedCount: 0,
+            enabled: true,
+            expiresAt: "",
+            createdBy: "user-host",
+            note: "",
+            createdAt: now(),
+        }),
+    );
+    // 生成器撞码时要重试而不是把冲突甩给调用方；用纯函数验证，生产接口上不留测试开关。
+    const { pickUniqueInviteCode } = await import("./src/services/team-invites");
+    const scripted = ["AAAAAAAAAA", "AAAAAAAAAA", "BBBBBBBBBB"];
+    let picked = 0;
+    check(
+        "撞码后换一个新码",
+        await pickUniqueInviteCode(
+            () => scripted[picked++],
+            async (code: string) => code === "AAAAAAAAAA",
+        ),
+        "BBBBBBBBBB",
+    );
+    check("撞码重试确实换过码", picked, 3);
+    await rejects("一直撞码则明确报错而不是死循环", () =>
+        pickUniqueInviteCode(
+            () => "AAAAAAAAAA",
+            async () => true,
+        ),
+    );
+
+    // 带时区偏移的过期时间必须归一化成 UTC ISO：直接原样入库的话，
+    // claimSlot 的字符串比较与 Date.parse 判定会分家，已过期的邀请在并发路径上还能被领走。
+    const tz = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0, expiresAt: "2020-01-01T00:00:00+08:00" });
+    check("过期时间归一化为 UTC ISO", (await repo(TeamInvite).findOneByOrFail({ id: tz.id })).expiresAt, new Date("2020-01-01T00:00:00+08:00").toISOString());
+    await rejects("带时区的过期邀请无法领取", () => acceptTeamInvite(tz.token, "user-tz"));
+    check("带时区的过期邀请没有消耗名额", (await repo(TeamInvite).findOneByOrFail({ id: tz.id })).usedCount, 0);
+    await rejects("非法过期时间被拒绝", () => createTeamInvite(host.id, "user-host", { kind: "link", role: "member", expiresAt: "明天" }));
+    const tzPatch = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0 });
+    check("更新过期时间同样归一化", (await updateTeamInvite(host.id, "user-host", tzPatch.id, { expiresAt: "2030-01-01T00:00:00+08:00" })).expiresAt, new Date("2030-01-01T00:00:00+08:00").toISOString());
+    await rejects("更新时非法过期时间被拒绝", () => updateTeamInvite(host.id, "user-host", tzPatch.id, { expiresAt: "后天" }));
+
+    console.log("成员变更广播");
+    const { closeTeamConnectionsOf, publishTeamMember, subscribeTeam } = await import("./src/services/team-realtime");
+    const events: Array<{ type: string; userId: string }> = [];
+    const stopWatching = subscribeTeam(host.id, "user-host", (event) => events.push(event));
+    const otherEvents: unknown[] = [];
+    const stopOther = subscribeTeam(fresh.id, "user-host", (event) => otherEvents.push(event));
+
+    const joinLink = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0 });
+    await repo(Team).update({ id: host.id }, { memberLimit: 0 });
+    await acceptTeamInvite(joinLink.token, "user-broadcast");
+    check("加入后广播 member.joined", events.filter((event) => event.type === "member.joined" && event.userId === "user-broadcast").length, 1);
+    check("其他团队的订阅者收不到", otherEvents.length, 0);
+
+    let kicked = false;
+    subscribeTeam(host.id, "user-broadcast", () => undefined, () => {
+        kicked = true;
+    });
+    await removeMember(host.id, "user-host", "user-broadcast");
+    check("移除后广播 member.removed", events.filter((event) => event.type === "member.removed" && event.userId === "user-broadcast").length, 1);
+    check("移除后断开该成员的团队连接", kicked, true);
+
+    const before = events.length;
+    stopWatching();
+    stopOther();
+    publishTeamMember(host.id, { type: "member.joined", userId: "user-none", role: "member" });
+    check("退订后不再收到事件", events.length, before);
+    check("没有连接时断连返回 0", closeTeamConnectionsOf(host.id, "user-nobody"), 0);
 
     console.log("邀请状态校验");
     // 停用与过期各用一条独立的、名额充足的邀请：共用一条的话后一个用例会被前一个吃掉的名额掩盖，
@@ -449,6 +599,16 @@ async function main() {
     await rejects("名额用完后无法领取", () => acceptTeamInvite(usedUp.token, "user-late"));
 
     console.log("成员数上限");
+    // 名额只剩一个人的位置，两个人同时抢：一个进去，另一个必须被拒且不留下任何痕迹。
+    // 占位若发生在事务外，SQLite 单连接下它会落进别人已经打开的 BEGIN 里，
+    // 被拒那一方回滚时会把成功那一方占掉的名额一起抹掉，usedCount 从此对不上真实入队人数。
+    await repo(Team).update({ id: host.id }, { memberLimit: (await repo(TeamMember).countBy({ teamId: host.id })) + 1 });
+    const race = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0 });
+    const raced = await Promise.allSettled([acceptTeamInvite(race.token, "user-race-a"), acceptTeamInvite(race.token, "user-race-b")]);
+    check("只剩一个位置时只有一人挤进来", raced.filter((item) => item.status === "fulfilled").length, 1);
+    check("被上限拒绝的一方不留成员记录", (await repo(TeamMember).findBy({ teamId: host.id })).filter((member) => member.userId.startsWith("user-race-")).length, 1);
+    check("并发触上限后 usedCount 等于真实入队人数", (await repo(TeamInvite).findOneByOrFail({ id: race.id })).usedCount, 1);
+
     await repo(Team).update({ id: host.id }, { memberLimit: await repo(TeamMember).countBy({ teamId: host.id }) });
     const overflow = await createTeamInvite(host.id, "user-host", {
         kind: "link",

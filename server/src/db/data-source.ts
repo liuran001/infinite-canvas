@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import { DataSource, type EntityManager } from "typeorm";
 
@@ -62,11 +63,18 @@ export function repo<T extends object>(entity: new () => T) {
  * 而且必须是全进程唯一的一条队列——各服务各排各的等于没排，扣费和领邀请照样会撞在一起。
  * MySQL/Postgres 走连接池不需要它，但排队本身无害：这些事务都以毫秒计。
  * 跨进程的正确性不依赖这把锁——那由事务内的条件更新与行锁保证。
+ *
+ * 嵌套调用复用外层 manager，不再排队：队列全进程只有一条，在事务内再排一次就是等自己前面那一环，
+ * 永远等不到，整个进程的余额与团队写入会无声挂死。复用外层 manager 同时也更正确——
+ * 嵌套那段本来就该和外层同生共死，单独开一个事务反而会让外层回滚时留下内层已提交的半截数据。
  */
 let transactionQueue: Promise<unknown> = Promise.resolve();
+const currentManager = new AsyncLocalStorage<EntityManager>();
 
 export function serialTransaction<T>(work: (manager: EntityManager) => Promise<T>): Promise<T> {
-    const run = () => dataSource.transaction(work);
+    const outer = currentManager.getStore();
+    if (outer) return work(outer);
+    const run = () => dataSource.transaction((manager) => currentManager.run(manager, () => work(manager)));
     const next = transactionQueue.then(run, run);
     transactionQueue = next.catch(() => undefined);
     return next;
