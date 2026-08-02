@@ -54,7 +54,7 @@ async function moveUserCredits(userId: string, delta: number, type: CreditLogTyp
                 .where(delta < 0 ? "id = :userId AND credits >= :amount" : "id = :userId", { userId })
                 .setParameter("amount", Math.abs(delta))
                 .execute();
-            if (!result.affected) throw fail("算力点不足");
+            if (!result.affected) throw fail(delta < 0 ? "算力点不足" : "用户不存在");
             const user = await users.findOneBy({ id: userId });
             const logId = newId("credit");
             await manager.getRepository(CreditLog).insert({
@@ -84,4 +84,42 @@ export async function charge(payer: Payer, credits: number, meta: ChargeMeta): P
 export async function refund(receipt: ChargeReceipt, meta: ChargeMeta) {
     if (receipt.credits <= 0) return;
     await moveUserCredits(receipt.payer.userId, receipt.credits, "ai_refund", `模型调用失败返还 ${meta.model}`, { model: meta.model, path: meta.path });
+}
+
+const SET_RETRIES = 5;
+
+/**
+ * 管理员把余额直接改成某个值。语义是覆盖而非增减，所以必须先读旧值才算得出流水里的 amount，
+ * 而「读了再写」天然会丢更新：读到 100 的同时用户花掉 20，写回 150 就把那 20 点凭空还了回去，
+ * 流水累加从此对不上余额。用读到的旧值当更新条件，被别人抢先就重读重算
+ * ——与画布保存的 revision 冲突是同一套思路，只是这里能直接重试，不必让调用方参与合并。
+ */
+export async function setUserCredits(userId: string, credits: number) {
+    const next = Math.max(0, Math.floor(credits));
+    for (let attempt = 0; attempt < SET_RETRIES; attempt += 1) {
+        const settled = await queueCreditWork(() =>
+            dataSource.transaction(async (manager) => {
+                const users = manager.getRepository(User);
+                const user = await users.findOneBy({ id: userId });
+                if (!user) throw fail("用户不存在");
+                if (user.credits === next) return user;
+                const result = await users.update({ id: userId, credits: user.credits }, { credits: next, updatedAt: now() });
+                if (!result.affected) return null;
+                await manager.getRepository(CreditLog).insert({
+                    id: newId("credit"),
+                    userId,
+                    type: "admin_adjust",
+                    amount: next - user.credits,
+                    balance: next,
+                    relatedId: "",
+                    remark: "后台手动调整",
+                    extra: "",
+                    createdAt: now(),
+                });
+                return { ...user, credits: next };
+            }),
+        );
+        if (settled) return settled;
+    }
+    throw fail("余额正在变动，请稍后重试");
 }

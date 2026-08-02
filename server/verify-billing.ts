@@ -136,6 +136,18 @@ async function main() {
         // 每一步都对账：流水最后一条的 balance 必须就是此刻库里的真实余额。
         if (ordered[ordered.length - 1].balance !== (await creditsOf("audit"))) mismatched += 1;
     }
+    console.log("管理员调整与扣费并发");
+    // 「设置成某个值」必须先读旧值才能算出流水里的 amount，而读了再写天然会丢更新：
+    // 读到 100 的同时用户花掉 20，写回 150 就把那 20 点凭空还了回去。串行断言看不出这一点。
+    await makeUser("race", 100);
+    await Promise.all([adjustUserCredits("race", 150), charge({ kind: "user", userId: "race" }, 20, { model: "m", path: "/x" })]);
+    const raceLogs = await logsOf("race");
+    const raceBalance = await creditsOf("race");
+    check("并发调整后流水最后一条的 balance 等于真实余额", raceLogs[raceLogs.length - 1].balance, raceBalance);
+    check("并发调整逐条回放能还原余额", raceLogs.every((row, index) => (index ? row.balance === raceLogs[index - 1].balance + row.amount : true)), true);
+    // 两种交错都合法：先扣后调停在 150，先调后扣停在 130。落在这两个值之外说明有一次写入被覆盖了。
+    check("并发调整的结果是两种合法交错之一", [130, 150].includes(raceBalance), true);
+
     check("随机操作后余额与预期一致", await creditsOf("audit"), expected);
     check("每一步操作后流水 balance 都等于真实余额", mismatched, 0);
     check("最后一条流水的 balance 等于当前余额", ordered[ordered.length - 1].balance, await creditsOf("audit"));

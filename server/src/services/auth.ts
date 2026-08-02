@@ -8,7 +8,7 @@ import { repo } from "../db/data-source";
 import { CreditLog, DEFAULT_STORAGE_QUOTA, User, type CreditLogType, type UserRole, type UserStatus } from "../db/entities";
 import { fail, firstNonEmpty, newAffCode, newId, now } from "../lib/errors";
 import type { Query } from "../lib/response";
-import { charge, refund } from "./billing";
+import { charge, refund, setUserCredits } from "./billing";
 import { claimInviteCode, recordInviteUse, releaseInviteCode } from "./invites";
 import { usedBytesOf } from "./quota";
 import { getSettings } from "./settings";
@@ -234,15 +234,7 @@ async function writeCreditLog(userId: string, type: CreditLogType, amount: numbe
 }
 
 export async function adjustUserCredits(id: string, credits: number) {
-    const users = repo(User);
-    const user = await users.findOneBy({ id });
-    if (!user) throw fail("用户不存在");
-    const previous = user.credits;
-    user.credits = credits;
-    user.updatedAt = now();
-    const saved = await users.save(user);
-    if (previous !== credits) await writeCreditLog(id, "admin_adjust", credits - previous, credits, "后台手动调整");
-    return { ...saved, password: "" };
+    return { ...(await setUserCredits(id, credits)), password: "" };
 }
 
 /** 调整云空间配额。已用量按文件对象实时聚合，这里只改上限。 */
