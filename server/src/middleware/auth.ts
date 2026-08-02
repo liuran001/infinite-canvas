@@ -45,7 +45,9 @@ function guard(check: (user: AuthUser | null) => boolean, allowGuest: boolean): 
                 if (guest) {
                     // 分享访客带着合法凭证走到了不该他用的接口：这是权限不足而不是登录态失效，
                     // 回 401 会让前端把访客的会话清掉，页面直接白掉。
-                    if (!allowGuest) return failResponse(res.status(403), "分享访客无法使用该功能");
+                    // 文案说"请先登录"而不是"访客不能用"：这些接口登录之后就能用，
+                    // 保存到自己账号更是只差一次登录，说成"无法使用"会让人以为此路不通。
+                    if (!allowGuest) return failResponse(res.status(403), "请先登录后再使用该功能");
                     return next();
                 }
                 // 用 401 而不是 200 + code:1，前端才能可靠识别登录态失效并清理本地会话。

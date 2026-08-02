@@ -41,7 +41,11 @@ export function shareTokenHash(token: string) {
     return createHash("sha256").update(token).digest("hex");
 }
 
-/** 比较用常量时间：等值查询已经定位到唯一行，这一步只为杜绝按哈希前缀做时序探测。 */
+/**
+ * 常量时间比较。注意：上游是按 tokenHash 等值查询定位到唯一行的，真正的时序信息在数据库索引里，
+ * 走到这一步时两个值必然相等——所以它防不住时序探测，只是万一以后改成前缀匹配时的一道保险。
+ * 别把它当作"该面向已被覆盖"的依据。
+ */
 function sameToken(left: string, right: string) {
     const a = Buffer.from(left);
     const b = Buffer.from(right);

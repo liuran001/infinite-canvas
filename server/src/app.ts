@@ -34,7 +34,10 @@ export function createApp() {
         return next();
     });
 
-    // 分享页不进搜索引擎索引。响应头这一层管的是代理与非 HTML 资源，页面里的 meta 和 robots.txt 各管一段抓取路径。
+    // 分享页不进搜索引擎索引。
+    // 注意：常规部署下 /s/:token 由 nginx 或 Vercel 直接返回静态页，请求到不了这里，
+    // 真正生效的是 nginx.conf、vercel.json 与页面里的 robots meta。
+    // 这一条只兜住"Express 同时兼作静态服务器"的部署方式，别把它当成唯一防线。
     app.use("/s", (_req, res, next) => {
         res.setHeader("X-Robots-Tag", "noindex, nofollow");
         next();
