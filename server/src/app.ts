@@ -17,6 +17,7 @@ import { preferenceRouter } from "./routes/preferences";
 import { publicRouter } from "./routes/public";
 import { shareRouter } from "./routes/share";
 import { syncRouter } from "./routes/sync";
+import { teamRouter } from "./routes/teams";
 
 export function createApp() {
     const app = express();
@@ -56,6 +57,7 @@ export function createApp() {
     api.use(syncRouter);
     api.use(aiRouter);
     api.use(agentRouter);
+    api.use(teamRouter);
     api.use("/admin", adminUserRouter);
     api.use("/admin", adminRouter);
     api.use("/admin", adminReviewRouter);

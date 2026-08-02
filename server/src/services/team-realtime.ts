@@ -2,16 +2,19 @@ import { EventEmitter } from "node:events";
 
 /**
  * 团队实时总线。与 project-realtime 一样是进程内 EventEmitter，因此存在明确的单实例限制：
- * 水平扩容成多进程后，事件只在产生它的那个进程内广播，连到别的实例的成员收不到成员变更，
- * 界面上的成员列表会一直停在旧值，直到用户自己刷新或发起一次会被服务端拒绝的调用。
+ * 水平扩容成多进程后，事件只在产生它的那个进程内广播，连到别的实例的成员收不到余额与成员变更，
+ * 界面上的团队余额会一直停在旧值，直到用户自己刷新或发起一次会被服务端拒绝的调用。
  *
- * 这不影响正确性：所有权限与名额判定都靠数据库上的条件更新，广播只负责让界面早点知道，
- * 任何判定都不读它，所以跨实例最坏结果是数字滞后，不会放行本该被拒的操作。
+ * 这不影响正确性：所有扣费判定都靠数据库上的条件更新（UPDATE ... WHERE credits >= :amount），
+ * 广播只负责让界面早点知道，任何判定都不读它，所以跨实例最坏结果是数字滞后，不会超扣。
  *
  * 结论：实时推送仅在单实例部署下完整可用。要多实例必须先把总线换成 Redis Pub/Sub 或数据库轮询；
- * 在那之前，前端必须保留「SSE 不可用时按 30 秒轮询」的降级路径。
+ * 在那之前，前端必须保留「SSE 不可用时按 30 秒轮询余额」的降级路径。
  */
-export type TeamMemberEvent = { type: "member.joined" | "member.left" | "member.removed" | "member.roleChanged"; teamId: string; userId: string; role: string };
+export type TeamMemberEvent = { type: "member.joined" | "member.left" | "member.removed" | "member.roleChanged" | "member.suspended"; teamId: string; userId: string; role: string };
+/** 余额事件只带最新余额，不带增量：跨进程丢过事件的客户端拿绝对值才能自己纠回来。 */
+export type TeamCreditsEvent = { type: "team.credits"; teamId: string; credits: number };
+export type TeamRealtimeEvent = TeamMemberEvent | TeamCreditsEvent;
 
 const bus = new EventEmitter();
 bus.setMaxListeners(0);
@@ -23,11 +26,11 @@ const channel = (teamId: string) => `team:${teamId}`;
  * 漏掉一次就是一个永久泄漏的 listener，被移除的成员早已看不到页面，进程里却还留着他的回调，
  * 而且他被重新拉回团队时会收到两份事件。现在退订由本模块自己保证，调用方漏不掉。
  */
-type Subscription = { listener: (event: TeamMemberEvent) => void; onClose?: () => void };
+type Subscription = { listener: (event: TeamRealtimeEvent) => void; onClose?: () => void };
 const subscriptions = new Map<string, Set<Subscription>>();
 const closerKey = (teamId: string, userId: string) => `${teamId}:${userId}`;
 
-export function subscribeTeam(teamId: string, userId: string, listener: (event: TeamMemberEvent) => void, onClose?: () => void) {
+export function subscribeTeam(teamId: string, userId: string, listener: (event: TeamRealtimeEvent) => void, onClose?: () => void) {
     const key = channel(teamId);
     const mapKey = closerKey(teamId, userId);
     const subscription: Subscription = { listener, onClose };
@@ -50,6 +53,14 @@ function dropSubscription(teamId: string, userId: string, subscription: Subscrip
 
 export function publishTeamMember(teamId: string, event: Omit<TeamMemberEvent, "teamId">) {
     bus.emit(channel(teamId), { ...event, teamId });
+}
+
+/**
+ * 团队池余额变化。发的是变动后的绝对值而不是增量：
+ * 增量要求客户端从未丢过任何一条事件，而 SSE 断线重连期间必然会丢，届时界面上的余额会永久偏掉。
+ */
+export function publishTeamCredits(teamId: string, credits: number) {
+    bus.emit(channel(teamId), { type: "team.credits", teamId, credits } satisfies TeamCreditsEvent);
 }
 
 /**

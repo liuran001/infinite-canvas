@@ -1,0 +1,116 @@
+import { Router } from "express";
+
+import { handle, ok, parseQuery } from "../lib/response";
+import { requireUser, userAuth } from "../middleware/auth";
+import { requireTeamRole } from "../services/team-access";
+import { acceptTeamInvite, createTeamInvite, deleteTeamInvite, listTeamInvites, previewTeamInvite, updateTeamInvite } from "../services/team-invites";
+import { subscribeTeam, type TeamRealtimeEvent } from "../services/team-realtime";
+import { createTeam, disbandTeam, getTeam, leaveTeam, listMemberViews, listMyTeamCreditLogs, listMyTeams, listTeamCreditLogs, removeMember, transferOwner, updateMember, updateTeam } from "../services/teams";
+
+/**
+ * 团队前台。整个 router 走 userAuth（账号身份，分享访客一律拒绝），
+ * 每个处理器的权限判定都落在服务层的 requireTeamRole 上：把判定写在路由里，
+ * 服务就会多出一条没人守门的调用路径，而验证脚本正是直接调服务的。
+ */
+export const teamRouter = Router();
+teamRouter.use(userAuth);
+
+teamRouter.get("/v1/teams", handle(async (req, res) => ok(res, await listMyTeams(requireUser(req).id))));
+
+teamRouter.post("/v1/teams", handle(async (req, res) => ok(res, await createTeam(requireUser(req).id, req.body || {}))));
+
+/** 手输码加入。放在 /v1/teams/:id 之前，否则 "join" 会被当成团队 id。 */
+teamRouter.post("/v1/teams/join", handle(async (req, res) => ok(res, await acceptTeamInvite(String(req.body?.code || ""), requireUser(req).id))));
+
+teamRouter.get("/v1/teams/:id", handle(async (req, res) => ok(res, await getTeam(requireUser(req).id, String(req.params.id)))));
+
+teamRouter.patch("/v1/teams/:id", handle(async (req, res) => ok(res, await updateTeam(String(req.params.id), requireUser(req).id, req.body || {}))));
+
+teamRouter.delete(
+    "/v1/teams/:id",
+    handle(async (req, res) => {
+        await disbandTeam(String(req.params.id), requireUser(req).id);
+        ok(res, true);
+    }),
+);
+
+teamRouter.post(
+    "/v1/teams/:id/transfer",
+    handle(async (req, res) => {
+        await transferOwner(String(req.params.id), requireUser(req).id, String(req.body?.userId || ""));
+        ok(res, true);
+    }),
+);
+
+teamRouter.post(
+    "/v1/teams/:id/leave",
+    handle(async (req, res) => {
+        await leaveTeam(String(req.params.id), requireUser(req).id);
+        ok(res, true);
+    }),
+);
+
+teamRouter.get("/v1/teams/:id/members", handle(async (req, res) => ok(res, await listMemberViews(requireUser(req).id, String(req.params.id)))));
+
+teamRouter.patch("/v1/teams/:id/members/:userId", handle(async (req, res) => ok(res, await updateMember(String(req.params.id), requireUser(req).id, String(req.params.userId), req.body || {}))));
+
+teamRouter.delete(
+    "/v1/teams/:id/members/:userId",
+    handle(async (req, res) => {
+        await removeMember(String(req.params.id), requireUser(req).id, String(req.params.userId));
+        ok(res, true);
+    }),
+);
+
+teamRouter.get("/v1/teams/:id/invites", handle(async (req, res) => ok(res, await listTeamInvites(String(req.params.id), requireUser(req).id))));
+
+/** 创建响应里的 token 是这条链接明文唯一一次露面，之后连服务端自己都只剩哈希。 */
+teamRouter.post("/v1/teams/:id/invites", handle(async (req, res) => ok(res, await createTeamInvite(String(req.params.id), requireUser(req).id, req.body || {}))));
+
+teamRouter.patch("/v1/teams/:id/invites/:inviteId", handle(async (req, res) => ok(res, await updateTeamInvite(String(req.params.id), requireUser(req).id, String(req.params.inviteId), req.body || {}))));
+
+teamRouter.delete(
+    "/v1/teams/:id/invites/:inviteId",
+    handle(async (req, res) => {
+        await deleteTeamInvite(String(req.params.id), requireUser(req).id, String(req.params.inviteId));
+        ok(res, true);
+    }),
+);
+
+teamRouter.get("/v1/teams/:id/credit-logs/mine", handle(async (req, res) => ok(res, await listMyTeamCreditLogs(requireUser(req).id, String(req.params.id), parseQuery(req)))));
+
+teamRouter.get("/v1/teams/:id/credit-logs", handle(async (req, res) => ok(res, await listTeamCreditLogs(requireUser(req).id, String(req.params.id), parseQuery(req)))));
+
+teamRouter.get("/v1/team-invites/:token", handle(async (req, res) => ok(res, await previewTeamInvite(String(req.params.token)))));
+
+teamRouter.post("/v1/team-invites/:token/accept", handle(async (req, res) => ok(res, await acceptTeamInvite(String(req.params.token), requireUser(req).id))));
+
+/**
+ * 团队 SSE。先鉴权再订阅：反过来的话，鉴权失败那条路径上已经挂好的 listener 要靠 catch 收干净，
+ * 漏一次就是一个永久泄漏的订阅。团队事件没有「错过就补不回来」的语义（余额事件带的是绝对值），
+ * 所以不需要 project SSE 那套 buffered 缓冲。
+ */
+teamRouter.get(
+    "/v1/teams/:id/realtime",
+    handle(async (req, res) => {
+        const teamId = String(req.params.id);
+        const userId = requireUser(req).id;
+        const { team, role } = await requireTeamRole(userId, teamId, "team.read");
+
+        res.status(200);
+        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache, no-transform");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("X-Accel-Buffering", "no");
+        res.flushHeaders();
+        const write = (event: unknown) => void res.write(`data: ${JSON.stringify(event)}\n\n`);
+        // 被移除或降级时由服务层调 closeTeamConnectionsOf 关掉这条连接，同时退订总线 listener。
+        const unsubscribe = subscribeTeam(teamId, userId, (event: TeamRealtimeEvent) => write(event), () => res.end());
+        write({ type: "ready", teamId, role, credits: team.credits });
+        const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 25_000);
+        req.on("close", () => {
+            clearInterval(keepAlive);
+            unsubscribe();
+        });
+    }),
+);

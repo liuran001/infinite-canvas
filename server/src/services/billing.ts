@@ -6,6 +6,7 @@ import { isRefundOfUniqueViolation } from "../lib/db-errors";
 import { fail, newId, now } from "../lib/errors";
 import { getPreferences } from "./preferences";
 import { canTeamAction } from "./team-access";
+import { publishTeamCredits } from "./team-realtime";
 
 /**
  * 付费方。个人与团队是两本完全独立的账，各自有余额与流水，
@@ -55,6 +56,11 @@ async function usedByMember(manager: EntityManager, teamId: string, userId: stri
     if (start) query.andWhere("log.createdAt >= :start", { start });
     const row = await query.getRawOne<{ total: string | number | null }>();
     return -Number(row?.total || 0);
+}
+
+/** 成员本窗口已用额度的只读视图，给成员列表用。判定路径一律走事务内的 usedByMember，不用这个。 */
+export async function usedCreditsOfMember(teamId: string, userId: string, window: TeamLimitWindow) {
+    return serialTransaction((manager) => usedByMember(manager, teamId, userId, window));
 }
 
 /** 团队消费的资格：团队在用、成员在册且状态正常、角色允许花钱。三者缺一都不能动团队池。 */
@@ -169,6 +175,21 @@ async function logInsufficient(manager: EntityManager, teamId: string, memberId:
 export type ChargePersist = (manager: EntityManager, receipt: ChargeReceipt) => Promise<void>;
 
 /**
+ * 提交之后再广播团队余额，而且回库重读一次而不是复用事务里那个数字：
+ * 事务内广播的话，回滚时事件已经发出去收不回来，界面会显示一次没发生的扣费；
+ * 复用事务里读到的余额则会在并发下把一个已经过时的值当成最新值广播出去，比不广播更糟。
+ * 广播失败绝不能影响扣费本身——钱已经动了，一条推送发不出去只是界面晚点知道。
+ */
+export async function publishTeamBalance(teamId: string) {
+    try {
+        const team = await repo(Team).findOneBy({ id: teamId });
+        if (team) publishTeamCredits(teamId, team.credits);
+    } catch (error) {
+        console.warn("广播团队余额失败：", error);
+    }
+}
+
+/**
  * 扣费。余额不足时不扣款也不写消费流水，错误语义与文案保持「算力点不足」。
  * 团队池不足默认直接拒绝：悄悄改扣个人余额等于替用户做了一次付款决定，
  * 只有用户本人在偏好里显式打开 billingFallbackToPersonal 才回落，而且回落后的回执 payer 就是个人，
@@ -213,7 +234,10 @@ export async function charge(payer: Payer, credits: number, meta: ChargeMeta, pe
         if (persist) await persist(manager, { payer, credits, logId: teamLogId });
         return teamLogId;
     });
-    if (logId) return { payer, credits, logId };
+    if (logId) {
+        await publishTeamBalance(payer.teamId);
+        return { payer, credits, logId };
+    }
 
     if (!fallbackAllowed) throw fail("团队算力点不足", 403, TEAM_CREDITS_EXHAUSTED);
     // 回落是另一笔账：付费方从此就是个人，回执里再也看不到团队，退款自然也回不到团队池。
@@ -239,7 +263,7 @@ export async function refund(receipt: ChargeReceipt, meta: ChargeMeta): Promise<
     if (receipt.credits <= 0) return false;
     if (!receipt.logId) throw fail("退款缺少原始扣费流水 ID");
     try {
-        return await serialTransaction(async (manager) => {
+        const settled = await serialTransaction(async (manager) => {
             if (receipt.payer.kind === "user") {
                 const origin = await manager.getRepository(CreditLog).findOneBy({ id: receipt.logId });
                 if (!origin || origin.type !== "ai_consume") throw fail("退款失败：找不到原始扣费流水");
@@ -256,6 +280,8 @@ export async function refund(receipt: ChargeReceipt, meta: ChargeMeta): Promise<
             await moveTeamCredits(manager, receipt.payer.teamId, origin.userId, receipt.credits, "ai_refund", meta, `模型调用失败返还 ${meta.model}`, receipt.logId, receipt.logId);
             return true;
         });
+        if (settled && receipt.payer.kind === "team") await publishTeamBalance(receipt.payer.teamId);
+        return settled;
     } catch (error) {
         // 只有撞上 refundOf 那条唯一约束才算「已经退过」——崩溃重启后的重放本就该是空操作。
         // 主键冲突之类的唯一冲突必须原样抛出：把它当成已退，这笔钱就再也没人退了。
@@ -346,4 +372,45 @@ export async function setUserCredits(userId: string, credits: number) {
         if (settled) return settled;
     }
     throw fail("余额正在变动，请稍后重试");
+}
+
+/**
+ * 平台管理员把团队池改成某个值。与 setUserCredits 同一套「读旧值当更新条件、被抢先就重试」的写法，
+ * 理由也一样：语义是覆盖，必须先读旧值才算得出流水里的 amount，而读了再写天然会丢更新——
+ * 读到 100 的同时团队正好花掉 20，写回 500 就把那 20 点凭空还了回去，流水累加从此对不上团队池。
+ * 余额与 admin_adjust 流水同事务写入，中途崩溃不会留下「钱变了没流水」。
+ */
+export async function setTeamCredits(teamId: string, credits: number, remark: string) {
+    const next = Math.max(0, Math.floor(credits));
+    for (let attempt = 0; attempt < SET_RETRIES; attempt += 1) {
+        const settled = await serialTransaction(async (manager) => {
+            const teams = manager.getRepository(Team);
+            const team = await teams.findOneBy({ id: teamId });
+            if (!team) throw fail("团队不存在", 404, "TEAM_NOT_FOUND");
+            if (team.credits === next) return team;
+            const result = await teams.update({ id: teamId, credits: team.credits }, { credits: next, updatedAt: now() });
+            if (!result.affected) return null;
+            await manager.getRepository(TeamCreditLog).insert({
+                id: newId("team-credit"),
+                teamId,
+                // 平台管理员不是团队成员，这一列留空：填上他的 id 会让成员额度聚合把这笔算到某个人头上。
+                userId: "",
+                type: "admin_adjust",
+                amount: next - team.credits,
+                balance: next,
+                model: "",
+                relatedId: "",
+                refundOf: null,
+                remark: remark || "平台后台调整",
+                extra: "",
+                createdAt: now(),
+            });
+            return { ...team, credits: next };
+        });
+        if (settled) {
+            await publishTeamBalance(teamId);
+            return settled;
+        }
+    }
+    throw fail("团队余额正在变动，请稍后重试");
 }
