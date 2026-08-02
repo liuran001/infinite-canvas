@@ -16,7 +16,7 @@ const CODE_LENGTH = 10;
 const MAX_BATCH = 200;
 
 /** 用 CSPRNG 逐位取字符，31^10 ≈ 8e14 种组合，既猜不出也扫不完，不会被枚举出来。 */
-function newInviteCode() {
+export function newInviteCode() {
     let code = "";
     for (let index = 0; index < CODE_LENGTH; index += 1) code += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
     return code;

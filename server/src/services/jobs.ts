@@ -133,6 +133,8 @@ export async function createJob(userId: string, input: JobInput) {
         progress: 0,
         seq: await nextJobSeq(userId),
         upstreamTaskId: "",
+        payerKind: "user",
+        payerTeamId: "",
         createdAt: now(),
         updatedAt: now(),
         finishedAt: "",

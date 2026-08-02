@@ -16,6 +16,14 @@ export type FileStorage = "local" | "s3";
 export type AgentSessionStatus = "idle" | "running" | "awaiting" | "failed";
 export type AgentMessageRole = "user" | "assistant" | "tool";
 export type ShareRole = "viewer" | "editor";
+export type TeamRole = "owner" | "admin" | "member" | "viewer";
+export type TeamStatus = "active" | "disabled" | "disbanded";
+export type TeamMemberStatus = "active" | "suspended";
+export type TeamLimitWindow = "day" | "month" | "total";
+export type TeamInviteKind = "link" | "code";
+export type TeamCreditLogType = "topup" | "admin_adjust" | "ai_consume" | "ai_refund" | "insufficient";
+/** 谁为这次调用买单。存量记录读出来就是 user，因此加列不改变任何既有行为。 */
+export type PayerKind = "user" | "team";
 export type ShareAccessEvent = "open" | "edit" | "clone";
 
 /**
@@ -281,6 +289,12 @@ export class Job {
      */
     @Index() @Column({ type: "int", default: 0 }) seq!: number;
     @Column({ type: "varchar", length: 512, default: "" }) upstreamTaskId!: string;
+    /**
+     * 创建时固化的付费方。任务可能跑几分钟，期间用户可能被移出团队，
+     * 退款必须回到当初扣钱的那个池子，所以不能在退款时重新解析。
+     */
+    @Column({ type: "varchar", length: 16, default: "user" }) payerKind!: PayerKind;
+    @Column(short) payerTeamId!: string;
     @Column(short) createdAt!: string;
     @Index() @Column(short) updatedAt!: string;
     @Column(short) finishedAt!: string;
@@ -314,6 +328,9 @@ export class AgentSession {
      */
     @Column({ type: "boolean", default: false }) autoRenamed!: boolean;
     @Column({ type: "boolean", default: false }) deleted!: boolean;
+    /** 同 Job：会话创建时固化付费方，同一会话所有轮次沿用它。 */
+    @Column({ type: "varchar", length: 16, default: "user" }) payerKind!: PayerKind;
+    @Column(short) payerTeamId!: string;
     @Column(short) createdAt!: string;
     @Index() @Column(short) updatedAt!: string;
 }
@@ -389,4 +406,101 @@ export class ProjectAccessLog {
     @Index() @Column(short) createdAt!: string;
 }
 
-export const entities = [User, CreditLog, Setting, InviteCode, InviteUse, Prompt, PromptCategory, Asset, PhysicalBlob, StoredFile, Project, ProjectShare, ProjectAccessLog, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage];
+/**
+ * 团队。积分池与 User.credits 是两个完全独立的余额，各自有独立流水，
+ * 谁付钱由服务端在调用发起时解析一次并固化，之后不再重算。
+ */
+@Entity("teams")
+export class Team {
+    @PrimaryColumn(id) id!: string;
+    @Column(short) name!: string;
+    @Column({ type: "text", nullable: true }) description!: string;
+    @Column({ type: "text", nullable: true }) avatarUrl!: string;
+    /** 冗余当前 owner，列出「我拥有的团队」时不必再连 team_members。 */
+    @Index() @Column(short) ownerId!: string;
+    @Column({ type: "int", default: 0 }) credits!: number;
+    /** 成员数上限，0 表示不限。 */
+    @Column({ type: "int", default: 0 }) memberLimit!: number;
+    @Column({ type: "varchar", length: 32, default: "active" }) status!: TeamStatus;
+    @Column(short) createdAt!: string;
+    @Column(short) updatedAt!: string;
+}
+
+/**
+ * 团队成员。复合主键 (teamId, userId) 与 Project 同一风格：
+ * 一个人在一个团队里只可能有一条记录，复合主键比额外加唯一索引更直接地表达这件事。
+ * 已用额度不落冗余计数列，按 TeamCreditLog 实时聚合——冗余列漏改一条路径就会永久漂移。
+ */
+@Entity("team_members")
+export class TeamMember {
+    @PrimaryColumn(short) teamId!: string;
+    @PrimaryColumn(short) userId!: string;
+    @Column({ type: "varchar", length: 32, default: "member" }) role!: TeamRole;
+    /** 成员周期额度上限，0 表示不限。 */
+    @Column({ type: "int", default: 0 }) creditLimit!: number;
+    @Column({ type: "varchar", length: 32, default: "month" }) limitWindow!: TeamLimitWindow;
+    @Column({ type: "varchar", length: 32, default: "active" }) status!: TeamMemberStatus;
+    @Column(short) invitedBy!: string;
+    @Column(short) joinedAt!: string;
+    @Column(short) updatedAt!: string;
+}
+
+/**
+ * 邀请链接与手输码共用一张表，靠 kind 区分：两者的生命周期字段完全相同，
+ * 拆两张表只会让「这个人是怎么进来的」变成两次查询。
+ * 链接只存哈希（高熵、无需回显），手输码存明文（管理员必须能反复看到它才能分发）。
+ */
+@Entity("team_invites")
+export class TeamInvite {
+    @PrimaryColumn(id) id!: string;
+    @Index() @Column(short) teamId!: string;
+    @Column({ type: "varchar", length: 16, default: "link" }) kind!: TeamInviteKind;
+    @Index() @Column({ type: "varchar", length: 128, default: "" }) tokenHash!: string;
+    @Column({ type: "varchar", length: 32, default: "" }) tokenPrefix!: string;
+    @Index() @Column({ type: "varchar", length: 64, default: "" }) code!: string;
+    @Column({ type: "varchar", length: 32, default: "member" }) role!: TeamRole;
+    /** 0 表示不限次，语义与 InviteCode.maxUses 一致。 */
+    @Column({ type: "int", default: 0 }) maxUses!: number;
+    @Column({ type: "int", default: 0 }) usedCount!: number;
+    @Column({ type: "boolean", default: true }) enabled!: boolean;
+    /** 空串表示不过期。 */
+    @Column(short) expiresAt!: string;
+    @Column(short) createdBy!: string;
+    @Column(short) note!: string;
+    @Index() @Column(short) createdAt!: string;
+}
+
+/** 邀请领取记录。role 是领取当时授予的角色，邀请后来改角色不影响历史。 */
+@Entity("team_invite_uses")
+export class TeamInviteUse {
+    @PrimaryColumn(id) id!: string;
+    @Index() @Column(short) inviteId!: string;
+    @Index() @Column(short) teamId!: string;
+    @Index() @Column(short) userId!: string;
+    @Column({ type: "varchar", length: 32, default: "member" }) role!: TeamRole;
+    @Index() @Column(short) createdAt!: string;
+}
+
+/**
+ * 团队积分流水，独立于 CreditLog。
+ * 共表会让 balance 这一列的含义变成「要靠 type 猜是团队池还是个人余额」，
+ * 而且平台后台的个人流水页会混进不影响个人余额的行。
+ */
+@Index(["teamId", "userId", "createdAt"])
+@Entity("team_credit_logs")
+export class TeamCreditLog {
+    @PrimaryColumn(id) id!: string;
+    @Index() @Column(short) teamId!: string;
+    @Index() @Column(short) userId!: string;
+    @Column({ type: "varchar", length: 32 }) type!: TeamCreditLogType;
+    @Column({ type: "int", default: 0 }) amount!: number;
+    /** 本次变动后的团队池余额。 */
+    @Column({ type: "int", default: 0 }) balance!: number;
+    @Column(short) model!: string;
+    @Column(short) relatedId!: string;
+    @Column(short) remark!: string;
+    @Column({ type: "text", nullable: true }) extra!: string;
+    @Index() @Column(short) createdAt!: string;
+}
+
+export const entities = [User, CreditLog, Setting, InviteCode, InviteUse, Prompt, PromptCategory, Asset, PhysicalBlob, StoredFile, Project, ProjectShare, ProjectAccessLog, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage, Team, TeamMember, TeamInvite, TeamInviteUse, TeamCreditLog];

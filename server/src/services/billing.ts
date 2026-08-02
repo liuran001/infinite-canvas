@@ -1,4 +1,4 @@
-import { dataSource } from "../db/data-source";
+import { serialTransaction } from "../db/data-source";
 import { CreditLog, User, type CreditLogType } from "../db/entities";
 import { fail, newId, now } from "../lib/errors";
 
@@ -24,53 +24,37 @@ export async function resolvePayer(userId: string, _context: BillingContext = {}
 }
 
 /**
- * 进程内串行队列。SQLite 驱动全程只有一条连接，两个并发的 `BEGIN` 会直接报
- * 「cannot start a transaction within a transaction」，所以余额事务必须排队进出。
- * MySQL/Postgres 走连接池不需要它，但排队本身无害：计费的吞吐远低于一次上游模型调用的耗时。
- * 跨进程的正确性不依赖这把锁——那由事务内的条件更新与行锁保证。
- */
-let creditQueue: Promise<unknown> = Promise.resolve();
-
-function queueCreditWork<T>(work: () => Promise<T>): Promise<T> {
-    const next = creditQueue.then(work, work);
-    creditQueue = next.catch(() => undefined);
-    return next;
-}
-
-/**
  * 余额变动与流水写入的唯一通道：条件更新 + 读回余额 + 插入流水在同一个事务里完成。
  * 三步分开做的话，进程在中间挂掉就是「钱扣了没流水」；并发下各自单独读一次余额，
  * 两条流水还会记到同一个 balance 上，对账时流水累加永远回不到 users.credits。
  * 事务只负责「三件事要么全成要么全不成」，不扣成负数仍然由 `WHERE credits >= :amount` 这个条件更新本身保证。
  */
 async function moveUserCredits(userId: string, delta: number, type: CreditLogType, remark: string, extra: unknown) {
-    return queueCreditWork(() =>
-        dataSource.transaction(async (manager) => {
-            const users = manager.getRepository(User);
-            const result = await users
-                .createQueryBuilder()
-                .update(User)
-                .set({ credits: () => (delta < 0 ? "credits - :amount" : "credits + :amount"), updatedAt: now() })
-                .where(delta < 0 ? "id = :userId AND credits >= :amount" : "id = :userId", { userId })
-                .setParameter("amount", Math.abs(delta))
-                .execute();
-            if (!result.affected) throw fail(delta < 0 ? "算力点不足" : "用户不存在");
-            const user = await users.findOneBy({ id: userId });
-            const logId = newId("credit");
-            await manager.getRepository(CreditLog).insert({
-                id: logId,
-                userId,
-                type,
-                amount: delta,
-                balance: user?.credits || 0,
-                relatedId: "",
-                remark,
-                extra: extra ? JSON.stringify(extra) : "",
-                createdAt: now(),
-            });
-            return logId;
-        }),
-    );
+    return serialTransaction(async (manager) => {
+        const users = manager.getRepository(User);
+        const result = await users
+            .createQueryBuilder()
+            .update(User)
+            .set({ credits: () => (delta < 0 ? "credits - :amount" : "credits + :amount"), updatedAt: now() })
+            .where(delta < 0 ? "id = :userId AND credits >= :amount" : "id = :userId", { userId })
+            .setParameter("amount", Math.abs(delta))
+            .execute();
+        if (!result.affected) throw fail(delta < 0 ? "算力点不足" : "用户不存在");
+        const user = await users.findOneBy({ id: userId });
+        const logId = newId("credit");
+        await manager.getRepository(CreditLog).insert({
+            id: logId,
+            userId,
+            type,
+            amount: delta,
+            balance: user?.credits || 0,
+            relatedId: "",
+            remark,
+            extra: extra ? JSON.stringify(extra) : "",
+            createdAt: now(),
+        });
+        return logId;
+    });
 }
 
 /** 扣费。余额不足时不扣款也不写流水，错误语义与文案保持「算力点不足」。 */
@@ -97,28 +81,26 @@ const SET_RETRIES = 5;
 export async function setUserCredits(userId: string, credits: number) {
     const next = Math.max(0, Math.floor(credits));
     for (let attempt = 0; attempt < SET_RETRIES; attempt += 1) {
-        const settled = await queueCreditWork(() =>
-            dataSource.transaction(async (manager) => {
-                const users = manager.getRepository(User);
-                const user = await users.findOneBy({ id: userId });
-                if (!user) throw fail("用户不存在");
-                if (user.credits === next) return user;
-                const result = await users.update({ id: userId, credits: user.credits }, { credits: next, updatedAt: now() });
-                if (!result.affected) return null;
-                await manager.getRepository(CreditLog).insert({
-                    id: newId("credit"),
-                    userId,
-                    type: "admin_adjust",
-                    amount: next - user.credits,
-                    balance: next,
-                    relatedId: "",
-                    remark: "后台手动调整",
-                    extra: "",
-                    createdAt: now(),
-                });
-                return { ...user, credits: next };
-            }),
-        );
+        const settled = await serialTransaction(async (manager) => {
+            const users = manager.getRepository(User);
+            const user = await users.findOneBy({ id: userId });
+            if (!user) throw fail("用户不存在");
+            if (user.credits === next) return user;
+            const result = await users.update({ id: userId, credits: user.credits }, { credits: next, updatedAt: now() });
+            if (!result.affected) return null;
+            await manager.getRepository(CreditLog).insert({
+                id: newId("credit"),
+                userId,
+                type: "admin_adjust",
+                amount: next - user.credits,
+                balance: next,
+                relatedId: "",
+                remark: "后台手动调整",
+                extra: "",
+                createdAt: now(),
+            });
+            return { ...user, credits: next };
+        });
         if (settled) return settled;
     }
     throw fail("余额正在变动，请稍后重试");
