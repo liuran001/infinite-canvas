@@ -15,7 +15,7 @@ async function main() {
     const { check, rejects, finish } = createChecker();
     const { initDatabase, repo } = await import("./src/db/data-source");
     const { PhysicalBlob, Project, ProjectAccessLog, ProjectShare, StoredFile, User } = await import("./src/db/entities");
-    const { createShare, findShareByToken, guestSessionOf, logShareAccess, resetShareRuntimeState, shareTokenHash, signGuestToken, updateShare, verifyGuestToken, assertShareUploadAllowed } = await import("./src/services/project-share");
+    const { createShare, findShareByToken, guestSessionOf, logShareAccess, resetShareRuntimeState, shareRevokesAccess, shareTokenHash, signGuestToken, updateShare, verifyGuestToken, assertShareUploadAllowed } = await import("./src/services/project-share");
     const { resolveProjectAccess } = await import("./src/services/project-access");
     const { disconnectShare, listProjectPresence, subscribeProject, updateProjectPresence } = await import("./src/services/project-realtime");
     const { cloneSharedProject } = await import("./src/services/project-clone");
@@ -184,6 +184,19 @@ async function main() {
     ownerUnsubscribe();
     guestUnsubscribe();
     otherUnsubscribe();
+
+    console.log("哪些改动会收权");
+    // 断流条件此前散在路由里没法直接测，导致「关掉匿名不断流」漏到了合并之后。
+    const revokeBase = await shares.findOneByOrFail({ id: viewerShare.id });
+    const withPatch = (patch: Partial<typeof revokeBase>) => ({ ...revokeBase, ...patch });
+    check("撤销要断流", shareRevokesAccess(revokeBase, withPatch({ enabled: false })), true);
+    check("降级为只读要断流", shareRevokesAccess({ ...revokeBase, role: "editor" }, withPatch({ role: "viewer" })), true);
+    check("关掉匿名要断流", shareRevokesAccess({ ...revokeBase, allowAnonymous: true }, withPatch({ allowAnonymous: false })), true);
+    check("改成已过期要断流", shareRevokesAccess(revokeBase, withPatch({ expiresAt: new Date(Date.now() - 1000).toISOString() })), true);
+    check("放开匿名不必断流", shareRevokesAccess({ ...revokeBase, allowAnonymous: false }, withPatch({ allowAnonymous: true })), false);
+    check("升级为可编辑不必断流", shareRevokesAccess({ ...revokeBase, role: "viewer" }, withPatch({ role: "editor" })), false);
+    check("延长有效期不必断流", shareRevokesAccess(revokeBase, withPatch({ expiresAt: new Date(Date.now() + 600_000).toISOString() })), false);
+    check("只改允许克隆不必断流", shareRevokesAccess(revokeBase, withPatch({ allowClone: !revokeBase.allowClone })), false);
 
     console.log("访问日志节流");
     resetShareRuntimeState();

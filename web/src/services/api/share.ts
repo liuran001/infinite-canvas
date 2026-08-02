@@ -93,8 +93,8 @@ export function isShareConflict(error: unknown) {
 }
 
 /**
- * 分享请求头。除了 guest 令牌本身，再带一个标记头，
- * 让服务端与网关都能一眼把分享流量与账号流量分开（限流、日志、审计都靠它）。
+ * 分享请求头。除了 guest 令牌本身，再带一个标记头，方便网关和反向代理按它把分享流量与账号流量分开。
+ * 服务端的鉴权、限流与日志都只认 guest 令牌本身，不依赖这个头——它可以被伪造，不能当判据。
  */
 export function shareAuthHeaders(guestToken: string, extra?: HeadersInit): HeadersInit {
     return { ...(guestToken ? { Authorization: `Bearer ${guestToken}` } : {}), "X-Share-Guest": "1", ...extra };

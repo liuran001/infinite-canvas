@@ -1,4 +1,4 @@
-import { isShareConflict, isShareGone, shareApi, shareProjectStream, type ShareApiError } from "@/services/api/share";
+import { isShareConflict, isShareGone, isShareReadOnly, shareApi, shareProjectStream, type ShareApiError } from "@/services/api/share";
 import type { ServerProject, ServerProjectEvent, ServerProjectPresence } from "@/services/api/server";
 import { mergeProjectSnapshots } from "@/services/project-merge";
 import { useShareStore } from "@/stores/use-share-store";
@@ -70,6 +70,12 @@ export async function flushShareProject(): Promise<void> {
     } catch (error) {
         if (isShareGone(error)) {
             useShareStore.getState().markGone("链接已失效");
+        } else if (isShareReadOnly(error)) {
+            // 链接在编辑途中被降级成只读。继续留在可编辑状态只会让访客一直改、一直存不上，
+            // 当场收权并说明原因，比默默失败诚实。
+            useShareStore.getState().setRole("viewer");
+            useShareStore.getState().setSyncState("failed", "这条分享链接已被改为只读，你的最新改动没有保存");
+            saveState.dirty = false;
         } else if (isShareConflict(error) && (error as ShareApiError).data && saveState.base && saveState.retries < 3) {
             // 与账号侧同一套三方合并：base 是上次确认过的快照，local 是当前内存快照，remote 是服务端最新版本。
             const remote = toProject((error as ShareApiError).data as ServerProject);
@@ -155,6 +161,10 @@ export function watchShareProject(projectId: string, handlers: { onProject?: (pr
                     (event: ServerProjectEvent) => {
                         if (event.type === "ready") {
                             lastRevision = Math.max(lastRevision, event.revision);
+                            // 降级为只读会先断流，重连后的 ready 是最早能拿到新角色的地方。
+                            // 不在这里同步，访客最长要到下次续期（10 分钟）才知道自己已经不能编辑了。
+                            // owner 不是分享角色（所有者自己开这条流时会带上），跳过不动。
+                            if ((event.role === "viewer" || event.role === "editor") && event.role !== useShareStore.getState().role) useShareStore.getState().setRole(event.role);
                             useShareStore.getState().setMembers(event.members.filter((item) => item.clientId !== shareClientId));
                             useShareStore.getState().setStreamStatus("ready");
                             failure = 0;

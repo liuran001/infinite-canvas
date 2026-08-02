@@ -42,14 +42,20 @@ export async function resolveMetadataReferences(metadata: CanvasNodeMetadata) {
     return references.every(Boolean) ? (references as ReferenceImage[]) : null;
 }
 
-export async function hydrateCanvasImages(nodes: CanvasNodeData[]) {
+/**
+ * 把节点里的 storageKey 换成可直接渲染的地址。
+ * allowUpload 为 false 时遇到 dataURL 图片原样保留：分享态的访客走的是分享通道，
+ * 这里的上传只认账号令牌，匿名访客会拿到 401 并被公共通道清掉登录态——
+ * 打开一条分享链接不该把人从自己的账号里踢出去。dataURL 本身就能渲染，不上传不影响显示。
+ */
+export async function hydrateCanvasImages(nodes: CanvasNodeData[], { allowUpload = true } = {}) {
     return Promise.all(
         nodes.map(async (node) => {
             const content = node.metadata?.content;
             if ((node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio) && node.metadata?.storageKey) return { ...node, metadata: { ...node.metadata, content: await resolveMediaUrl(node.metadata.storageKey, content) } };
             if (node.type !== CanvasNodeType.Image || !content) return node;
             if (node.metadata?.storageKey) return { ...node, metadata: { ...node.metadata, content: await resolveImageUrl(node.metadata.storageKey, content) } };
-            if (!content.startsWith("data:image/")) return node;
+            if (!content.startsWith("data:image/") || !allowUpload) return node;
             return { ...node, metadata: { ...node.metadata, ...imageMetadata(await uploadImage(content)) } };
         }),
     );

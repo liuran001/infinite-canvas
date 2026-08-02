@@ -114,6 +114,18 @@ export async function updateShare(share: ProjectShare, patch: Partial<ShareInput
 }
 
 /** 按哈希等值查找。不存在、已撤销、已过期一律回 null，调用方统一按 404 处理，不给 token 探测留信号。 */
+/**
+ * 改动是否必须把在线连接踢下线。已建立的 SSE 不会重新鉴权，凡是收权的改动都得当场断，
+ * 否则访客能靠一条老连接继续读到撤销后的内容。放权（启用、升级、延长、放开匿名）不必断。
+ */
+export function shareRevokesAccess(before: ProjectShare, after: ProjectShare, at = Date.now()) {
+    if (!after.enabled) return true;
+    // 只有降级才收权：升级成可编辑不必打断正在编辑的人，客户端下次 ready 自然会拿到新角色。
+    if (before.role === "editor" && after.role !== "editor") return true;
+    if (before.allowAnonymous && !after.allowAnonymous) return true;
+    return Boolean(after.expiresAt) && Date.parse(after.expiresAt) <= at;
+}
+
 export async function findShareByToken(token: string, at = Date.now()) {
     const value = (token || "").trim();
     if (!value) return null;

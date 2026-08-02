@@ -7,7 +7,7 @@ import { requestOrigin } from "../services/auth";
 import { cloneSharedProject } from "../services/project-clone";
 import { resolveProjectAccess } from "../services/project-access";
 import { disconnectShare } from "../services/project-realtime";
-import { createShare, findShareByToken, getOwnedShare, guestSessionOf, guestTokenTtl, listShareLogs, listShares, logShareAccess, shareView, signGuestToken, updateShare, verifyGuestToken, type ShareInput } from "../services/project-share";
+import { createShare, findShareByToken, getOwnedShare, guestSessionOf, guestTokenTtl, listShareLogs, listShares, logShareAccess, shareRevokesAccess, shareView, signGuestToken, updateShare, verifyGuestToken, type ShareInput } from "../services/project-share";
 
 // 鉴权逐个路由挂：分享管理必须是本人，token 交换却要给未登录的访客留入口，整段套一个中间件必然堵死其中一边。
 export const shareRouter = Router();
@@ -69,8 +69,8 @@ shareRouter.patch(
             enabled: body.enabled === undefined ? share.enabled : body.enabled !== false,
         };
         const updated = await updateShare(share, patch);
-        // 撤销、过期或降级之后还挂着的 SSE 不会重新鉴权，必须当场把它们踢下线。
-        if (!updated.enabled || updated.role !== share.role || (updated.expiresAt && Date.parse(updated.expiresAt) <= Date.now())) disconnectShare(access.ownerId, projectId, share.id);
+        // 撤销、降级、关掉匿名或过期之后还挂着的 SSE 不会重新鉴权，必须当场把它们踢下线。
+        if (shareRevokesAccess(share, updated)) disconnectShare(access.ownerId, projectId, share.id);
         ok(res, shareView(updated));
     }),
 );

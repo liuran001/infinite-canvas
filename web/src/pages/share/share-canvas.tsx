@@ -89,7 +89,7 @@ export default function ShareCanvasPage() {
             if (cancelled || !session) return;
             const loaded = await loadShareProject(session.project.id);
             if (cancelled || !loaded) return;
-            setNodes(await hydrateCanvasImages(loaded.nodes));
+            setNodes(await hydrateCanvasImages(loaded.nodes, { allowUpload: false }));
         })();
         return () => {
             cancelled = true;
@@ -114,7 +114,7 @@ export default function ShareCanvasPage() {
         watchShareProject(
             project.id,
             {
-                onProject: (next) => void hydrateCanvasImages(next.nodes).then(setNodes),
+                onProject: (next) => void hydrateCanvasImages(next.nodes, { allowUpload: false }).then(setNodes),
                 onDeleted: () => useShareStore.getState().markGone("画布已被删除"),
             },
             controller.signal,

@@ -68,7 +68,7 @@ export type ServerProjectEvent =
     | { type: "project.saved"; projectId: string; revision: number; writerClientId: string }
     | { type: "project.deleted"; projectId: string; revision: number; writerClientId: string }
     | { type: "presence.sync"; projectId: string; members: ServerProjectPresence[] }
-    | { type: "ready"; revision: number; members: ServerProjectPresence[] };
+    | { type: "ready"; revision: number; role?: "owner" | "editor" | "viewer"; members: ServerProjectPresence[] };
 export type ServerUserAsset = { id: string; kind: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerUserPlugin = { id: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerPasskey = { id: string; name: string; createdAt: string };

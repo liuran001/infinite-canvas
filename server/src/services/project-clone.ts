@@ -1,8 +1,9 @@
 import type { EntityManager } from "typeorm";
 
-import { dataSource } from "../db/data-source";
+import { dataSource, repo } from "../db/data-source";
 import { DEFAULT_STORAGE_QUOTA, PhysicalBlob, Project, ProjectShare, StoredFile, User } from "../db/entities";
 import { CLONE_DISABLED, fail, FORBIDDEN, newId, now, QUOTA_EXCEEDED } from "../lib/errors";
+import { withBlobLock } from "./files";
 import { logShareAccess, shareUsable } from "./project-share";
 
 /** 画布与素材里的文件引用一律是 server:<fileId>，克隆时按同一套规则扫描并重写。 */
@@ -42,7 +43,9 @@ export async function cloneSharedProject(share: ProjectShare, clonerId: string, 
         const created: StoredFile[] = [];
         let incoming = 0;
         for (const sourceId of sourceIds) {
-            const file = await files.findOneBy({ id: sourceId });
+            // 只认属于画布所有者的文件：画布数据是 editor 访客能改的，
+            // 不限归属的话，往里塞一个别人的 fileId 就能在自己账号下建出指向他人文件的引用。
+            const file = await files.findOneBy({ id: sourceId, userId: share.ownerId });
             if (!file) continue;
             // 克隆者已经有同一份内容时直接复用自己的引用，不给同一内容再记一次账。
             const owned = file.checksum ? await files.findOneBy({ userId: clonerId, checksum: file.checksum }) : null;
@@ -85,9 +88,19 @@ export async function cloneSharedProject(share: ProjectShare, clonerId: string, 
             updatedAt: now(),
         });
         await manager.getRepository(Project).insert(project);
-        return project;
+        return { project, checksums: [...new Set(created.map((copy) => copy.checksum).filter(Boolean))] };
     });
 
+    // 事务提交前，源用户删掉最后一个引用的话，deleteFile 的对账读不到我们这批未提交的副本，
+    // 会把 blob 标成 pending_delete 等 GC 回收——副本刚建好就指向一个待删对象。
+    // 提交后在同一把 checksum 锁里重新对账一次，把被误判的 blob 拉回 active。
+    for (const checksum of cloned.checksums) {
+        await withBlobLock(checksum, async () => {
+            const actual = await repo(StoredFile).countBy({ checksum });
+            if (actual > 0) await repo(PhysicalBlob).update({ checksum }, { refCount: actual, state: "active", pendingSince: "" });
+        });
+    }
+
     await logShareAccess(share, { actorId: clonerId, isAnonymous: false, event: "clone", ip: meta.ip, userAgent: meta.userAgent });
-    return { id: cloned.projectId, title: cloned.title, revision: cloned.revision };
+    return { id: cloned.project.projectId, title: cloned.project.title, revision: cloned.project.revision };
 }

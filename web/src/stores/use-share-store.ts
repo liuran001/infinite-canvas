@@ -37,6 +37,8 @@ type ShareStore = {
     setProject: (project: CanvasProject, revision: number) => void;
     setRevision: (revision: number) => void;
     setStreamStatus: (streamStatus: ShareStreamStatus) => void;
+    /** 服务端把链接降级成只读时同步过来，交互层据此立刻收权。 */
+    setRole: (role: ShareRole) => void;
     setMembers: (members: ServerProjectPresence[]) => void;
     setSyncState: (syncState: ShareSyncState, syncError?: string) => void;
     setCloning: (cloning: boolean) => void;
@@ -81,6 +83,7 @@ export const useShareStore = create<ShareStore>()((set) => ({
     setProject: (project, revision) => set({ project, revision, status: "ready", error: "" }),
     setRevision: (revision) => set({ revision }),
     setStreamStatus: (streamStatus) => set({ streamStatus }),
+    setRole: (role) => set({ role }),
     setMembers: (members) => set({ members }),
     setSyncState: (syncState, syncError = "") => set({ syncState, syncError }),
     setCloning: (cloning) => set({ cloning }),
