@@ -271,7 +271,8 @@ async function refundConflictShapes({ check }: { check: (name: string, actual: u
  */
 async function insufficientThroughCallers({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
     const { repo } = await import("./src/db/data-source");
-    const { AgentSession, Job, Project, Team, TeamCreditLog, TeamMember, User } = await import("./src/db/entities");
+    const { AgentMessage, AgentSession, CreditLog, Job, Project, Team, TeamCreditLog, TeamMember, User } = await import("./src/db/entities");
+    const { charge } = await import("./src/services/billing");
     const { createJob } = await import("./src/services/jobs");
     const { resolveAgentSession } = await import("./src/services/agent");
     const { saveSettings } = await import("./src/services/settings");
@@ -280,8 +281,8 @@ async function insufficientThroughCallers({ check, rejects }: { check: (name: st
     console.log("团队池不足的留痕活过真实调用入口");
     // 真实入口要能跑起来就得有一个「存在且有单价」的模型；上游永远不会被调用，因为扣费先抛错。
     await saveSettings({
-        private: { channels: [{ apiFormat: "openai", name: "verify", baseUrl: "http://127.0.0.1:9", apiKey: "k", models: [{ name: "verify-model", capability: "image" }], weight: 1, enabled: true, remark: "" }] },
-        public: { modelChannel: { modelCosts: [{ model: "verify-model", credits: 5 }] } },
+        private: { channels: [{ apiFormat: "openai", name: "verify", baseUrl: "http://127.0.0.1:9", apiKey: "k", models: [{ name: "verify-model", capability: "image" }, { name: "verify-text", capability: "text" }], weight: 1, enabled: true, remark: "" }] },
+        public: { modelChannel: { modelCosts: [{ model: "verify-model", credits: 5 }, { model: "verify-text", credits: 5 }] } },
     } as never);
 
     await repo(User).insert({ id: "poor", username: "poor", password: "", email: "", displayName: "poor", avatarUrl: "", role: "user", credits: 100, storageQuota: 1 << 20, affCode: "poor", affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
@@ -316,6 +317,37 @@ async function insufficientThroughCallers({ check, rejects }: { check: (name: st
     check("被拒后会话没有留下回执", stalled.payerLogId, "");
     check("被拒后会话金额仍为零", stalled.payerCredits, 0);
     check("被拒后会话仍停在等确认", stalled.status, "awaiting");
+
+    console.log("行上还挂着退不掉的回执时，新消息不能覆盖它");
+    // 一行只放得下一笔回执。上一笔退款失败时会话已经是 failed / idle，用户随时能再发一条消息，
+    // 这时候直接扣新的一笔并覆写回执，上一笔就再也没人退得了——必须先结清，结不掉就拒绝这次扣费。
+    const { sendAgentMessage } = await import("./src/services/agent");
+    const users = repo(User);
+    const balanceOf = async (id: string) => (await users.findOneByOrFail({ id })).credits;
+    await users.insert({ id: "stuck", username: "stuck", password: "", email: "", displayName: "stuck", avatarUrl: "", role: "user", credits: 100, storageQuota: 1 << 20, affCode: "stuck", affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
+    await repo(Project).insert({ userId: "stuck", projectId: "p-stuck", title: "画布", data: "{}", revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
+    const messages = repo(AgentMessage);
+    for (const status of ["failed", "idle"] as const) {
+        const stuckSession = newId("agent");
+        // payerLogId 指向一条不存在的流水：退款一定抛错，也就一定不能放行新的扣费。
+        await repo(AgentSession).insert({ userId: "stuck", sessionId: stuckSession, projectId: "p-stuck", title: "会话", status, model: "verify-text", error: "", lastSeq: 0, pendingAction: null, rounds: 0, autoRenamed: false, deleted: false, payerKind: "user", payerTeamId: "", payerLogId: "credit-missing", payerCredits: 30, createdAt: now(), updatedAt: now() } as never);
+        const before = await balanceOf("stuck");
+        await rejects(`${status} 会话上一笔退不掉时拒绝新消息`, () => sendAgentMessage("stuck", stuckSession, { clientMessageId: `stuck-${status}`, content: "接着做", model: "verify-text", attachmentIds: [], references: [] }));
+        const after = await repo(AgentSession).findOneByOrFail({ userId: "stuck", sessionId: stuckSession });
+        check(`${status} 会话的旧回执没有被覆盖`, after.payerLogId, "credit-missing");
+        check(`${status} 会话的旧金额没有被覆盖`, after.payerCredits, 30);
+        check(`${status} 会话被拒后没有扣新的钱`, await balanceOf("stuck"), before);
+        check(`${status} 会话被拒后没有落下消息`, await messages.countBy({ userId: "stuck", sessionId: stuckSession }), 0);
+    }
+
+    // 上一笔退得掉时才放行：先把旧的退回去，再扣新的一笔，两笔各自记账。
+    const freshSession = newId("agent");
+    const oldReceipt = await charge({ kind: "user", userId: "stuck" }, 30, { model: "verify-text", path: "/agent" });
+    await repo(AgentSession).insert({ userId: "stuck", sessionId: freshSession, projectId: "p-stuck", title: "会话", status: "idle", model: "verify-text", error: "", lastSeq: 0, pendingAction: null, rounds: 0, autoRenamed: false, deleted: false, payerKind: "user", payerTeamId: "", payerLogId: oldReceipt.logId, payerCredits: 30, createdAt: now(), updatedAt: now() } as never);
+    await sendAgentMessage("stuck", freshSession, { clientMessageId: "stuck-ok", content: "接着做", model: "verify-text", attachmentIds: [], references: [] });
+    // 断言只看旧回执：新的一笔由后台执行负责，跑失败后会异步退回，余额此刻还在变。
+    check("上一笔退得掉时被原路退回", await repo(CreditLog).countBy({ userId: "stuck", type: "ai_refund", refundOf: oldReceipt.logId }), 1);
+    check("旧回执已经不在会话行上", (await repo(AgentSession).findOneByOrFail({ userId: "stuck", sessionId: freshSession })).payerLogId === oldReceipt.logId, false);
 }
 
 /**
@@ -422,6 +454,20 @@ async function crashWindows({ check }: { check: (name: string, actual: unknown, 
     await resetRunningAgentSessions();
     check("再次启动不会重复退款", await creditsOf("idler"), 100);
     check("两笔各只退了一次", await repo(CreditLog).countBy({ userId: "idler", type: "ai_refund" }), 2);
+
+    console.log("存量 running 行没有回执也不能免费重跑");
+    // 这一列上线前留下的行：credits 记着钱，payerLogId 是空的。
+    // 那笔钱已经没有线索能原路退回，但绝不能放着 credits 不清——重跑时 `!job.credits` 判定为假，
+    // 整次生成就成了免费的。清零让它照常重新扣一次。
+    await makeUser("legacy-run", 100);
+    const legacyJobId = newId("job");
+    await jobs.insert({ id: legacyJobId, userId: "legacy-run", clientJobId: "legacy-1", kind: "image", status: "running", model: "m", prompt: "", params: "{}", progress: 0, credits: 25, seq: 1, text: "", error: "", outputFileIds: [], inputFileIds: [], upstreamTaskId: "", payerKind: "user", payerTeamId: "", payerLogId: "", createdAt: now(), updatedAt: now(), finishedAt: "" } as never);
+    await resetRunningJobs();
+    const legacyRevived = await jobs.findOneByOrFail({ id: legacyJobId });
+    check("无回执的存量行回到队列", legacyRevived.status, "pending");
+    check("无回执的存量行金额被清零", legacyRevived.credits, 0);
+    check("无回执的存量行没有凭空退钱", await creditsOf("legacy-run"), 100);
+    check("无回执的存量行没有写退款流水", await repo(CreditLog).countBy({ userId: "legacy-run", type: "ai_refund" }), 0);
 }
 
 /**

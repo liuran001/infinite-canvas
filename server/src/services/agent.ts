@@ -521,8 +521,18 @@ function outstandingReceipt(session: AgentSession): ChargeReceipt {
  * 分两步做的话，进程崩在中间就是钱扣了、会话行上却查不到那笔流水，重启时既退不掉也没人认领。
  * 用 charge 的 persist 回调而不是在外面套一层事务：套在外面的话，团队池不足时 charge 抛出的错
  * 会把同事务里刚写下的 insufficient 留痕一起回滚。
+ *
+ * 一行只放得下一笔回执，所以扣新的一笔之前必须先把上一笔结清。
+ * 上一笔退不掉就拒绝这次扣费：直接覆盖等于抹掉那笔钱唯一的线索，从此谁都退不回去；
+ * 让用户稍后重试，最坏是这次发不出消息，而不是永久吞掉他上一次的钱。
  */
-async function chargeSession(session: AgentSession, model: string, credits: number) {
+async function chargeSession(session: AgentSession, model: string, credits: number): Promise<ChargeReceipt> {
+    if (session.payerCredits > 0 && session.payerLogId) {
+        if (!(await settleRefund(session, session.model || model))) throw fail("上一次执行扣掉的算力点还没退回来，请稍后再试");
+        await clearOutstanding(session);
+    }
+    // 零额不写回执。更要紧的是不能拿它去清行上的回执：那不是一次结清，只是把线索抹掉。
+    if (credits <= 0) return { payer: payerOfSession(session), credits: 0, logId: "" };
     return charge(payerOfSession(session), credits, { model, path: "/agent" }, async (manager, receipt) => {
         await manager.getRepository(AgentSession).update({ userId: session.userId, sessionId: session.sessionId }, { payerLogId: receipt.logId, payerCredits: receipt.credits });
         session.payerLogId = receipt.logId;

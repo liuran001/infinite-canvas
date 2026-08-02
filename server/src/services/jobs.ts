@@ -433,9 +433,13 @@ export async function resetRunningJobs() {
         where: [{ status: "running" }, { status: "pending", ...outstanding }, { status: "failed", ...outstanding }, { status: "canceled", ...outstanding }],
     });
     for (const job of stale) {
-        // 没有回执的 running 行只是没跑完，直接放回队列即可，不涉及任何钱。
         if (!(job.credits > 0 && job.payerLogId)) {
-            if (job.status === "running") await jobs().update({ id: job.id }, { status: "pending", updatedAt: now() });
+            if (job.status !== "running") continue;
+            // credits 记着钱、却没有回执：可能是这一列还没上线时留下的存量行，也可能是哪里写坏了。
+            // 这笔钱已经没有任何线索能原路退回，但更不能放着不管——留着 credits，重跑时
+            // `!job.credits` 判定为假，这次生成一分钱不收。清零让它照常重新扣一次，同时把这行喊出来人工对账。
+            if (job.credits > 0) console.error(`job ${job.id} has credits ${job.credits} but no payer log; clearing so the retry charges again`);
+            await jobs().update({ id: job.id }, { status: "pending", credits: 0, updatedAt: now() });
             continue;
         }
         if (!(await settleRefund(job))) {
