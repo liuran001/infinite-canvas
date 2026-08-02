@@ -54,6 +54,30 @@ export function isInviteCodeUniqueViolation(error: unknown) {
 
 const BLOB_TABLE = "file_blobs";
 
+const REFUND_TABLES = ["credit_logs", "team_credit_logs"];
+
+/**
+ * 冲突的是不是流水表上的 refundOf 唯一约束——也就是「这笔扣费已经退过了」。
+ * 只判断「是唯一冲突」远远不够：同一条 INSERT 也可能撞主键 id，那是 ID 生成出了问题，
+ * 一旦被当成「已经退过」，这笔钱就再也没人退了，而且现场干干净净什么都查不到。
+ *
+ * 约束在实体上是显式命名的（`uq_credit_logs_refund_of` / `uq_team_credit_logs_refund_of`），
+ * 所以 MySQL 的 `for key '...'`、Postgres 的 constraint 字段都能直接认出来；
+ * SQLite 的文案里没有索引名，给的是 `表名.列名`；
+ * Postgres 另有一条结构化的 table + detail(`Key ("refundOf")=(...) already exists.`)。
+ * 主键冲突在这三条路径上都匹配不上：TypeORM 生成的主键约束叫 `PK_<hash>`，
+ * SQLite 报的是 `credit_logs.id`，Postgres 的 detail 里写的是 `Key (id)=`。
+ */
+export function isRefundOfUniqueViolation(error: unknown) {
+    if (!isUniqueViolation(error)) return false;
+    const text = errorText(error);
+    if (/uq_(?:team_)?credit_logs_refund_of/i.test(text)) return true;
+    if (/\b(?:team_)?credit_logs\.refundOf\b/i.test(text)) return true;
+    const table = field(error, "table").toLowerCase();
+    if (!table || !REFUND_TABLES.includes(table)) return false;
+    return /\(\s*"?refundOf"?\s*\)/i.test(field(error, "detail"));
+}
+
 /**
  * 冲突的是不是 file_blobs 的主键（checksum）。
  * 并发首传时输家会撞这条约束，那是可以吞的；而列长度、连接断开这些必须原样抛，

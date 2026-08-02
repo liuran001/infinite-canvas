@@ -2,7 +2,7 @@ import { type EntityManager } from "typeorm";
 
 import { repo, serialTransaction } from "../db/data-source";
 import { AgentSession, CreditLog, Job, Project, Team, TeamCreditLog, TeamMember, User, type CreditLogType, type TeamLimitWindow } from "../db/entities";
-import { isUniqueViolation } from "../lib/db-errors";
+import { isRefundOfUniqueViolation } from "../lib/db-errors";
 import { fail, newId, now } from "../lib/errors";
 import { getPreferences } from "./preferences";
 import { canTeamAction } from "./team-access";
@@ -162,6 +162,13 @@ async function logInsufficient(manager: EntityManager, teamId: string, memberId:
 }
 
 /**
+ * 扣费成功的那一刻、在同一个事务里把回执落到调用方自己的行上（任务行、会话行）。
+ * 做成回调而不是让调用方在外面包一层事务：包在外面的话，团队池不足时 charge 抛出的错
+ * 会把同一个事务里刚写下的 insufficient 留痕一起回滚掉，那条「这里被拒过一次」就永远不存在了。
+ */
+export type ChargePersist = (manager: EntityManager, receipt: ChargeReceipt) => Promise<void>;
+
+/**
  * 扣费。余额不足时不扣款也不写消费流水，错误语义与文案保持「算力点不足」。
  * 团队池不足默认直接拒绝：悄悄改扣个人余额等于替用户做了一次付款决定，
  * 只有用户本人在偏好里显式打开 billingFallbackToPersonal 才回落，而且回落后的回执 payer 就是个人，
@@ -169,11 +176,22 @@ async function logInsufficient(manager: EntityManager, teamId: string, memberId:
  *
  * 团队分支的资格校验、额度聚合、池子扣减、留痕全部落在同一个事务里：
  * 拆开做的话，两笔并发调用会各自读到同一份「已用量」，双双判定没超额，额度形同虚设。
+ *
+ * 调用方不要再往外套事务：`serialTransaction` 嵌套时复用外层 manager，于是这里的「留痕提交、
+ * 随后抛错」会退化成「留痕和错误一起回滚」。要让扣费与回执落库同生共死，请用 persist 回调。
  */
-export async function charge(payer: Payer, credits: number, meta: ChargeMeta): Promise<ChargeReceipt> {
-    if (credits <= 0) return { payer, credits: 0, logId: "" };
+export async function charge(payer: Payer, credits: number, meta: ChargeMeta, persist?: ChargePersist): Promise<ChargeReceipt> {
+    if (credits <= 0) {
+        const receipt: ChargeReceipt = { payer, credits: 0, logId: "" };
+        if (persist) await serialTransaction((manager) => persist(manager, receipt));
+        return receipt;
+    }
     if (payer.kind === "user") {
-        const logId = await serialTransaction((manager) => moveUserCredits(manager, payer.userId, -credits, "ai_consume", `调用模型 ${meta.model}`, { model: meta.model, path: meta.path }));
+        const logId = await serialTransaction(async (manager) => {
+            const id = await moveUserCredits(manager, payer.userId, -credits, "ai_consume", `调用模型 ${meta.model}`, { model: meta.model, path: meta.path });
+            if (persist) await persist(manager, { payer, credits, logId: id });
+            return id;
+        });
         return { payer, credits, logId };
     }
 
@@ -187,8 +205,12 @@ export async function charge(payer: Payer, credits: number, meta: ChargeMeta): P
             if (used + credits > member.creditLimit) throw fail(`已超出你在该团队的额度：${used}/${member.creditLimit}`, 403, TEAM_MEMBER_LIMIT_EXCEEDED);
         }
         const teamLogId = await moveTeamCredits(manager, payer.teamId, payer.memberId, -credits, "ai_consume", meta, `调用模型 ${meta.model}`);
-        // 留痕与扣费失败必须同事务：抛错会把留痕一起回滚，所以这里只返回空串，由外面决定抛不抛。
-        if (!teamLogId) await logInsufficient(manager, payer.teamId, payer.memberId, credits, meta, fallbackAllowed);
+        // 留痕与扣费失败必须同事务，而抛错会把留痕一起回滚，所以这里只返回空串让事务照常提交，由外面决定抛不抛。
+        if (!teamLogId) {
+            await logInsufficient(manager, payer.teamId, payer.memberId, credits, meta, fallbackAllowed);
+            return "";
+        }
+        if (persist) await persist(manager, { payer, credits, logId: teamLogId });
         return teamLogId;
     });
     if (logId) return { payer, credits, logId };
@@ -196,9 +218,11 @@ export async function charge(payer: Payer, credits: number, meta: ChargeMeta): P
     if (!fallbackAllowed) throw fail("团队算力点不足", 403, TEAM_CREDITS_EXHAUSTED);
     // 回落是另一笔账：付费方从此就是个人，回执里再也看不到团队，退款自然也回不到团队池。
     const personal: Payer = { kind: "user", userId: payer.memberId };
-    const fallbackLogId = await serialTransaction((manager) =>
-        moveUserCredits(manager, payer.memberId, -credits, "ai_consume", `调用模型 ${meta.model}`, { model: meta.model, path: meta.path, fallbackFromTeamId: payer.teamId }),
-    );
+    const fallbackLogId = await serialTransaction(async (manager) => {
+        const id = await moveUserCredits(manager, payer.memberId, -credits, "ai_consume", `调用模型 ${meta.model}`, { model: meta.model, path: meta.path, fallbackFromTeamId: payer.teamId });
+        if (persist) await persist(manager, { payer: personal, credits, logId: id });
+        return id;
+    });
     return { payer: personal, credits, logId: fallbackLogId };
 }
 
@@ -233,8 +257,9 @@ export async function refund(receipt: ChargeReceipt, meta: ChargeMeta): Promise<
             return true;
         });
     } catch (error) {
-        // 唯一索引撞上说明这笔已经退过了：崩溃重启后的重放本就该是空操作，不是错误。
-        if (isUniqueViolation(error)) return false;
+        // 只有撞上 refundOf 那条唯一约束才算「已经退过」——崩溃重启后的重放本就该是空操作。
+        // 主键冲突之类的唯一冲突必须原样抛出：把它当成已退，这笔钱就再也没人退了。
+        if (isRefundOfUniqueViolation(error)) return false;
         throw error;
     }
 }

@@ -73,8 +73,9 @@ export class CreditLog {
      * 唯一索引就是防重复退款的最后一道闸：进程崩在「退款已提交、任务行还没清干净」之间，
      * 重启后再退一次会直接撞这条约束而整笔事务回滚，钱不会被退第二遍。
      * 三种驱动都允许多行 NULL，所以非退款流水不受影响。
+     * 约束显式命名：撞上时要能认出「撞的就是这条」，而不是把主键冲突也当成「已经退过了」。
      */
-    @Index({ unique: true }) @Column({ type: "varchar", length: 64, nullable: true }) refundOf!: string | null;
+    @Index("uq_credit_logs_refund_of", { unique: true }) @Column({ type: "varchar", length: 64, nullable: true }) refundOf!: string | null;
     @Column(short) remark!: string;
     @Column({ type: "text", nullable: true }) extra!: string;
     @Index() @Column(short) createdAt!: string;
@@ -530,7 +531,7 @@ export class TeamCreditLog {
     @Column(short) model!: string;
     @Column(short) relatedId!: string;
     /** 同 CreditLog.refundOf：唯一索引保证同一笔团队扣费只可能被退一次。 */
-    @Index({ unique: true }) @Column({ type: "varchar", length: 64, nullable: true }) refundOf!: string | null;
+    @Index("uq_team_credit_logs_refund_of", { unique: true }) @Column({ type: "varchar", length: 64, nullable: true }) refundOf!: string | null;
     @Column(short) remark!: string;
     @Column({ type: "text", nullable: true }) extra!: string;
     @Index() @Column(short) createdAt!: string;

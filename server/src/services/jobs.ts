@@ -1,8 +1,8 @@
 import { EventEmitter } from "node:events";
-import { In, MoreThan } from "typeorm";
+import { In, MoreThan, Not } from "typeorm";
 
 import { config } from "../config";
-import { repo, serialTransaction } from "../db/data-source";
+import { repo } from "../db/data-source";
 import { Job, StoredFile, type JobKind, type JobStatus } from "../db/entities";
 import { fail, newId, now, SafeError } from "../lib/errors";
 import { charge, payerOfJob, payerOfProject, receiptOfJob, refund } from "./billing";
@@ -326,6 +326,22 @@ async function runTextJob(job: Job, signal: AbortSignal) {
     return text;
 }
 
+/**
+ * 退掉任务行上「已扣未结」的那一笔，返回这笔账是不是已经结清。
+ * 只有 refund 正常返回（真退了，或撞唯一约束说明早已退过）才算结清；抛错一律算没结清，
+ * 调用方必须原样保留 payerLogId / credits，否则这笔钱就此失去唯一的线索，再也退不回去。
+ */
+async function settleRefund(job: Job) {
+    if (!(job.credits > 0 && job.payerLogId)) return true;
+    try {
+        await refund(receiptOfJob(job), { model: job.model, path: `/jobs/${job.kind}` });
+        return true;
+    } catch (error) {
+        console.error(`job ${job.id} refund failed:`, error);
+        return false;
+    }
+}
+
 async function runJob(job: Job) {
     const controller = new AbortController();
     runningJobs.set(job.id, controller);
@@ -334,20 +350,19 @@ async function runJob(job: Job) {
     try {
         await patchJob(job, { status: "running", progress: 10, text: "" });
         // 扣点在实际调用上游之前，失败路径统一返还，避免任务重试重复扣费。
-        // 扣费与「把回执写回任务行」必须同一个事务：分两步做的话，进程崩在中间就是钱扣了、
-        // 任务行上却查不到那笔流水，重启后既退不掉也没人认领。charge 内部的事务会复用这里的外层 manager。
+        // 回执由 charge 在扣费成功的同一个事务里写回任务行：分两步做的话，进程崩在中间就是钱扣了、
+        // 任务行上却查不到那笔流水，重启后既退不掉也没人认领。
+        // 反过来也不能在外面套事务：团队池不足时 charge 抛错会把同事务里的 insufficient 留痕一起回滚。
         if (!job.credits && credits > 0) {
-            const receipt = await serialTransaction(async (manager) => {
-                const paid = await charge(payerOfJob(job), credits, { model: job.model, path: `/jobs/${job.kind}` });
+            const receipt = await charge(payerOfJob(job), credits, { model: job.model, path: `/jobs/${job.kind}` }, async (manager, paid) => {
                 // 团队池不足回落到个人时，实际付款方已经变成个人，必须把它写回任务行：
                 // 否则重启后按旧的 payerKind 退款，钱会退进团队池，个人那边白花一笔。
                 await manager.getRepository(Job).update({ id: job.id }, {
-                    credits,
+                    credits: paid.credits,
                     payerKind: paid.payer.kind,
                     payerTeamId: paid.payer.kind === "team" ? paid.payer.teamId : "",
                     payerLogId: paid.logId,
                 });
-                return paid;
             });
             await patchJob(job, { credits, payerKind: receipt.payer.kind, payerTeamId: receipt.payer.kind === "team" ? receipt.payer.teamId : "", payerLogId: receipt.logId });
         }
@@ -363,10 +378,18 @@ async function runJob(job: Job) {
         // 已经流出来的半截文本照常保留在任务里，用户不花钱也能留住它。
         // 退款按任务行上固化的 payer 走，不重新解析：用户可能已经被移出团队，
         // 重新解析会把当初从团队池扣的钱退进他的个人余额。
-        if (job.credits > 0 && job.payerLogId) await refund(receiptOfJob(job), { model: job.model, path: `/jobs/${job.kind}` }).catch(() => undefined);
+        const settled = await settleRefund(job);
         const message = error instanceof SafeError ? error.message : "生成失败，请稍后重试";
         if (!canceled) console.error(`job ${job.id} failed:`, error);
-        await patchJob(job, { status: canceled ? "canceled" : "failed", credits: 0, payerLogId: "", text: runningTexts.get(job.id) ?? job.text ?? "", error: canceled ? "任务已取消" : message, finishedAt: now() });
+        // 退款没退成时绝不清回执：清了就再没有任何地方记得这笔钱，谁都退不了了。
+        // 保留下来，下次启动的扫描会照着它再退一次（退款本身幂等，不会退成两笔）。
+        await patchJob(job, {
+            status: canceled ? "canceled" : "failed",
+            ...(settled ? { credits: 0, payerLogId: "" } : {}),
+            text: runningTexts.get(job.id) ?? job.text ?? "",
+            error: canceled ? "任务已取消" : settled ? message : `${message}（算力点返还失败，稍后会自动重试）`,
+            finishedAt: now(),
+        });
     } finally {
         // 终态由上面的 patchJob 广播（快照里带着最终文本），这里只清内存；
         // 清在广播之后，之后新来的订阅直接读库里的最终内容。
@@ -394,20 +417,35 @@ async function tick() {
 }
 
 /**
- * 把上一次进程留下的 running 任务放回队列。
- * 放回之前必须先把「已扣未结」的那一笔退掉并清零：
- * 不退，用户就为一次没跑完的任务白付了钱；不清零，重跑时 `!job.credits` 判定为假，
- * 整个任务就成了免费的——而这两件事都不能靠内存里的回执，只能从任务行上读回来。
- * 退款本身是幂等的（refundOf 唯一索引），所以崩在退款与清零之间、重启后再走一遍也不会退第二次。
+ * 把上一次进程留下的账结清，并把 running 任务放回队列。
+ *
+ * 扫描范围不能只有 running：退款失败的行会被标成 failed 并原样留着回执，
+ * 那笔钱要靠下一次启动再试一遍，只扫 running 就等于永远不再重试。
+ * 已成功的任务不在扫描内——它们的回执是交付完成的凭据，留着供对账，不是待结的账。
+ *
+ * 每一行都是「先退，退成了才清」：不退，用户就为一次没跑完的任务白付了钱；
+ * 退成了不清零，重跑时 `!job.credits` 判定为假，整个任务就成了免费的。
+ * 退款本身幂等（refundOf 唯一索引），所以崩在退款与清零之间、下次启动再走一遍也不会退第二次。
  */
 export async function resetRunningJobs() {
-    const stale = await jobs().find({ where: { status: "running" } });
+    const outstanding = { credits: MoreThan(0), payerLogId: Not("") };
+    const stale = await jobs().find({
+        where: [{ status: "running" }, { status: "pending", ...outstanding }, { status: "failed", ...outstanding }, { status: "canceled", ...outstanding }],
+    });
     for (const job of stale) {
-        if (job.credits > 0 && job.payerLogId) await refund(receiptOfJob(job), { model: job.model, path: `/jobs/${job.kind}` }).catch(() => undefined);
-        await jobs().update({ id: job.id }, { status: "pending", credits: 0, payerLogId: "", updatedAt: now() });
+        // 没有回执的 running 行只是没跑完，直接放回队列即可，不涉及任何钱。
+        if (!(job.credits > 0 && job.payerLogId)) {
+            if (job.status === "running") await jobs().update({ id: job.id }, { status: "pending", updatedAt: now() });
+            continue;
+        }
+        if (!(await settleRefund(job))) {
+            // 退款没成功：回执必须原样留着等下次启动重试，同时不能让它以 running 的样子回到队列——
+            // 那会拿着一笔没退掉的钱重跑一遍，用户等于付了两次。
+            if (job.status === "running") await jobs().update({ id: job.id }, { status: "failed", error: "服务已重启，算力点返还失败，稍后会自动重试", finishedAt: now(), updatedAt: now() });
+            continue;
+        }
+        await jobs().update({ id: job.id }, { credits: 0, payerLogId: "", ...(job.status === "running" ? { status: "pending" as JobStatus } : {}), updatedAt: now() });
     }
-    // 上面按行处理的是有回执的；没有回执的（还没走到扣费）一并放回队列。
-    await jobs().update({ status: "running" }, { status: "pending", credits: 0, payerLogId: "", updatedAt: now() });
 }
 
 /**

@@ -194,8 +194,128 @@ async function main() {
 
     await teamBilling({ check, rejects });
     await crashWindows({ check });
+    await refundConflictShapes({ check });
+    await insufficientThroughCallers({ check, rejects });
 
     finish(env.root);
+}
+
+/**
+ * 「已经退过了」这个判断必须精确到 refundOf 那条约束。
+ * 放宽成「任何唯一冲突」的话，主键冲突（ID 生成撞车）会被当成一次成功的空操作：
+ * 那笔钱从此没人退，现场还干干净净什么都查不到。三种驱动报冲突的形状各不相同，逐个盯住。
+ */
+async function refundConflictShapes({ check }: { check: (name: string, actual: unknown, expected: unknown) => void }) {
+    const { repo } = await import("./src/db/data-source");
+    const { CreditLog } = await import("./src/db/entities");
+    const { isRefundOfUniqueViolation, isUniqueViolation } = await import("./src/lib/db-errors");
+    const { newId, now } = await import("./src/lib/errors");
+
+    console.log("退款唯一冲突的识别范围");
+    // 三种驱动的真实错误形状，逐个断言，避免只在 SQLite 上碰巧成立。
+    const sqlite = { code: "SQLITE_CONSTRAINT_UNIQUE", message: "UNIQUE constraint failed: credit_logs.refundOf" };
+    const sqliteTeam = { code: "SQLITE_CONSTRAINT_UNIQUE", message: "UNIQUE constraint failed: team_credit_logs.refundOf" };
+    const mysql = { code: "ER_DUP_ENTRY", errno: 1062, sqlMessage: "Duplicate entry 'credit-1' for key 'uq_credit_logs_refund_of'" };
+    const postgres = { code: "23505", table: "credit_logs", constraint: "uq_credit_logs_refund_of", detail: 'Key ("refundOf")=(credit-1) already exists.' };
+    check("SQLite 的 refundOf 冲突被认出", isRefundOfUniqueViolation(sqlite), true);
+    check("SQLite 的团队流水 refundOf 冲突被认出", isRefundOfUniqueViolation(sqliteTeam), true);
+    check("MySQL 的 refundOf 冲突被认出", isRefundOfUniqueViolation(mysql), true);
+    check("Postgres 的 refundOf 冲突被认出", isRefundOfUniqueViolation(postgres), true);
+    // 包一层 QueryFailedError 的形状（TypeORM 把驱动错误挂在 driverError 上）同样要认得出。
+    check("包在 driverError 里的冲突被认出", isRefundOfUniqueViolation({ message: "QueryFailedError", driverError: mysql }), true);
+
+    // 主键冲突：三种驱动都必须判否，否则一次 ID 撞车会被当成「这笔已经退过」。
+    const sqlitePk = { code: "SQLITE_CONSTRAINT_PRIMARYKEY", message: "UNIQUE constraint failed: credit_logs.id" };
+    const mysqlPk = { code: "ER_DUP_ENTRY", errno: 1062, sqlMessage: "Duplicate entry 'credit-1' for key 'PRIMARY'" };
+    const postgresPk = { code: "23505", table: "credit_logs", constraint: "PK_9a1c2f3", detail: "Key (id)=(credit-1) already exists." };
+    check("SQLite 主键冲突不算已退款", isRefundOfUniqueViolation(sqlitePk), false);
+    check("MySQL 主键冲突不算已退款", isRefundOfUniqueViolation(mysqlPk), false);
+    check("Postgres 主键冲突不算已退款", isRefundOfUniqueViolation(postgresPk), false);
+    check("主键冲突本身仍是唯一冲突", isUniqueViolation(sqlitePk), true);
+    // 别的表的唯一冲突也不能被误认。
+    check("别的表的唯一冲突不算已退款", isRefundOfUniqueViolation({ code: "23505", table: "team_invites", constraint: "uq_team_invites_code", detail: "Key (code)=(ABC) already exists." }), false);
+
+    // 真实 SQLite：同一个 refundOf 插第二次必须被认成「已退款」，同一个 id 插第二次必须不是。
+    const logs = repo(CreditLog);
+    const target = newId("credit");
+    const row = { userId: "shape", type: "ai_refund" as const, amount: 1, balance: 1, relatedId: target, remark: "", extra: "", createdAt: now() };
+    const firstId = newId("credit");
+    await logs.insert({ id: firstId, refundOf: target, ...row });
+    let duplicateRefund: unknown = null;
+    try {
+        await logs.insert({ id: newId("credit"), refundOf: target, ...row });
+    } catch (error) {
+        duplicateRefund = error;
+    }
+    check("真实 SQLite 的重复 refundOf 被认成已退款", isRefundOfUniqueViolation(duplicateRefund), true);
+    let duplicateId: unknown = null;
+    try {
+        await logs.insert({ id: firstId, refundOf: newId("credit"), ...row });
+    } catch (error) {
+        duplicateId = error;
+    }
+    check("真实 SQLite 的重复主键不算已退款", isRefundOfUniqueViolation(duplicateId), false);
+    check("真实 SQLite 的重复主键仍是唯一冲突", isUniqueViolation(duplicateId), true);
+    // 多行 refundOf 为 null 不受唯一索引影响，否则所有非退款流水都插不进去。
+    await logs.insert({ id: newId("credit"), refundOf: null, ...row, type: "ai_consume", amount: -1 });
+    await logs.insert({ id: newId("credit"), refundOf: null, ...row, type: "ai_consume", amount: -1 });
+    check("多行 refundOf 为空互不冲突", await logs.countBy({ userId: "shape", type: "ai_consume" }), 2);
+}
+
+/**
+ * insufficient 留痕必须活过调用方的真实封装。
+ * 这条最容易在重构里悄悄失效：调用方为了「扣费与回执落库同生共死」在外面套一层事务，
+ * 而 serialTransaction 嵌套时复用外层 manager，于是 charge 抛出的「团队算力点不足」
+ * 会把同一个事务里刚写下的留痕一起回滚——单测 charge 时一切正常，走到真实入口就什么都不剩。
+ * 所以这里不直接调 charge，而是走 jobs 与 agent 的实际入口。
+ */
+async function insufficientThroughCallers({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { repo } = await import("./src/db/data-source");
+    const { AgentSession, Job, Project, Team, TeamCreditLog, TeamMember, User } = await import("./src/db/entities");
+    const { createJob } = await import("./src/services/jobs");
+    const { resolveAgentSession } = await import("./src/services/agent");
+    const { saveSettings } = await import("./src/services/settings");
+    const { newId, now } = await import("./src/lib/errors");
+
+    console.log("团队池不足的留痕活过真实调用入口");
+    // 真实入口要能跑起来就得有一个「存在且有单价」的模型；上游永远不会被调用，因为扣费先抛错。
+    await saveSettings({
+        private: { channels: [{ apiFormat: "openai", name: "verify", baseUrl: "http://127.0.0.1:9", apiKey: "k", models: [{ name: "verify-model", capability: "image" }], weight: 1, enabled: true, remark: "" }] },
+        public: { modelChannel: { modelCosts: [{ model: "verify-model", credits: 5 }] } },
+    } as never);
+
+    await repo(User).insert({ id: "poor", username: "poor", password: "", email: "", displayName: "poor", avatarUrl: "", role: "user", credits: 100, storageQuota: 1 << 20, affCode: "poor", affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
+    const poorTeam = newId("team");
+    await repo(Team).insert({ id: poorTeam, name: "穷团队", description: "", avatarUrl: "", ownerId: "poor", credits: 0, memberLimit: 0, status: "active", createdAt: now(), updatedAt: now() });
+    await repo(TeamMember).insert({ teamId: poorTeam, userId: "poor", role: "owner", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "", joinedAt: now(), updatedAt: now() });
+    await repo(Project).insert({ userId: "poor", projectId: "p-poor", title: "团队画布", data: "{}", revision: 1, deleted: false, teamId: poorTeam, createdAt: now(), updatedAt: now() });
+
+    const marksBefore = await repo(TeamCreditLog).countBy({ teamId: poorTeam, type: "insufficient" });
+    const job = await createJob("poor", { clientJobId: "poor-1", kind: "image", model: "verify-model", prompt: "", params: {}, inputFileIds: [], billingProjectId: "p-poor" });
+    check("任务挂在团队名下", job.payerKind, "team");
+    // 调度器是后台跑的，等它把这个任务走完扣费那一步。
+    const deadline = Date.now() + 15000;
+    let settled = await repo(Job).findOneByOrFail({ id: job.id });
+    while (settled.status !== "failed" && settled.status !== "succeeded" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        settled = await repo(Job).findOneByOrFail({ id: job.id });
+    }
+    check("团队池不足时任务失败", settled.status, "failed");
+    check("失败任务没有扣到钱", settled.credits, 0);
+    check("失败任务没有留下回执", settled.payerLogId, "");
+    check("走 jobs 真实入口后留痕还在", await repo(TeamCreditLog).countBy({ teamId: poorTeam, type: "insufficient" }), marksBefore + 1);
+    check("个人余额没有被偷偷动用", (await repo(User).findOneByOrFail({ id: "poor" })).credits, 100);
+
+    // Agent 的真实入口：续跑要重新扣一次点，团队池空的时候同样必须留痕。
+    const sessionId = newId("agent");
+    await repo(AgentSession).insert({ userId: "poor", sessionId, projectId: "p-poor", title: "会话", status: "awaiting", model: "verify-model", error: "", lastSeq: 0, pendingAction: { type: "continue", roundsUsed: 3, credits: 5 }, rounds: 3, autoRenamed: false, deleted: false, payerKind: "team", payerTeamId: poorTeam, payerLogId: "", payerCredits: 0, createdAt: now(), updatedAt: now() } as never);
+    const beforeAgent = await repo(TeamCreditLog).countBy({ teamId: poorTeam, type: "insufficient" });
+    await rejects("团队池不足时续跑被拒", () => resolveAgentSession("poor", sessionId, true));
+    check("走 agent 真实入口后留痕还在", await repo(TeamCreditLog).countBy({ teamId: poorTeam, type: "insufficient" }), beforeAgent + 1);
+    const stalled = await repo(AgentSession).findOneByOrFail({ userId: "poor", sessionId });
+    check("被拒后会话没有留下回执", stalled.payerLogId, "");
+    check("被拒后会话金额仍为零", stalled.payerCredits, 0);
+    check("被拒后会话仍停在等确认", stalled.status, "awaiting");
 }
 
 /**
@@ -254,6 +374,54 @@ async function crashWindows({ check }: { check: (name: string, actual: unknown, 
     await resetRunningAgentSessions();
     check("再次重启不会重复退款", await creditsOf("chatter"), 100);
     check("会话重复退款没有写第二条退款流水", await repo(CreditLog).countBy({ userId: "chatter", type: "ai_refund" }), 1);
+
+    console.log("退款失败时保留回执并在下次启动重试");
+    // 退款抛错（这里用一个查不到原始流水的回执制造失败）时绝不能清回执：
+    // 清了就再没有任何地方记得这笔钱。回执留着，下一次启动照着它重试一次，且只退一次。
+    await makeUser("retrier", 100);
+    const retryReceipt = await charge({ kind: "user", userId: "retrier" }, 40, { model: "m", path: "/jobs/image" });
+    check("扣费后余额", await creditsOf("retrier"), 60);
+    const retryJobId = newId("job");
+    // payerLogId 指向一条不存在的流水：refund 会抛「找不到原始扣费流水」。
+    await jobs.insert({ id: retryJobId, userId: "retrier", clientJobId: "retry-1", kind: "image", status: "running", model: "m", prompt: "", params: "{}", progress: 0, credits: 40, seq: 1, text: "", error: "", outputFileIds: [], inputFileIds: [], upstreamTaskId: "", payerKind: "user", payerTeamId: "", payerLogId: "credit-missing", createdAt: now(), updatedAt: now(), finishedAt: "" } as never);
+    await resetRunningJobs();
+    const failedOnce = await jobs.findOneByOrFail({ id: retryJobId });
+    check("退款失败后余额没有变化", await creditsOf("retrier"), 60);
+    check("退款失败后回执原样保留", failedOnce.payerLogId, "credit-missing");
+    check("退款失败后金额原样保留", failedOnce.credits, 40);
+    check("退款失败的任务不会回到队列", failedOnce.status, "failed");
+    check("退款失败时没有写退款流水", await repo(CreditLog).countBy({ userId: "retrier", type: "ai_refund" }), 0);
+    // 修好回执（等价于「那次退款失败的偶发原因消失了」），下一次启动必须重试并退成。
+    await jobs.update({ id: retryJobId }, { payerLogId: retryReceipt.logId });
+    await resetRunningJobs();
+    check("下次启动重试退款成功", await creditsOf("retrier"), 100);
+    const retried = await jobs.findOneByOrFail({ id: retryJobId });
+    check("重试成功后回执被清空", retried.payerLogId, "");
+    check("重试成功后金额清零", retried.credits, 0);
+    // 第三次启动：这笔已经结清，既不会再退也不会再写流水。
+    await resetRunningJobs();
+    check("重试成功后不会再退第二次", await creditsOf("retrier"), 100);
+    check("整个重试过程只退了一次", await repo(CreditLog).countBy({ userId: "retrier", type: "ai_refund" }), 1);
+
+    console.log("非 running 状态的会话也要结清");
+    // 退款失败过的会话早被标成 failed / idle，只扫 running 与 awaiting 等于放着那笔钱永不重试。
+    await makeUser("idler", 100);
+    const idleReceipt = await charge({ kind: "user", userId: "idler" }, 10, { model: "m", path: "/agent" });
+    const failedReceipt = await charge({ kind: "user", userId: "idler" }, 20, { model: "m", path: "/agent" });
+    const idleSession = newId("agent");
+    const failedSession = newId("agent");
+    await repo(AgentSession).insert({ userId: "idler", sessionId: idleSession, projectId: "p-idle", title: "会话", status: "idle", model: "m", error: "", lastSeq: 0, pendingAction: null, rounds: 0, autoRenamed: false, deleted: false, payerKind: "user", payerTeamId: "", payerLogId: idleReceipt.logId, payerCredits: 10, createdAt: now(), updatedAt: now() } as never);
+    await repo(AgentSession).insert({ userId: "idler", sessionId: failedSession, projectId: "p-failed", title: "会话", status: "failed", model: "m", error: "上次退款失败", lastSeq: 0, pendingAction: null, rounds: 0, autoRenamed: false, deleted: false, payerKind: "user", payerTeamId: "", payerLogId: failedReceipt.logId, payerCredits: 20, createdAt: now(), updatedAt: now() } as never);
+    check("两笔已扣未结的钱都还没退", await creditsOf("idler"), 70);
+    await resetRunningAgentSessions();
+    check("idle 与 failed 会话的已扣未结都被退回", await creditsOf("idler"), 100);
+    check("idle 会话回执已清空", (await repo(AgentSession).findOneByOrFail({ userId: "idler", sessionId: idleSession })).payerLogId, "");
+    check("failed 会话回执已清空", (await repo(AgentSession).findOneByOrFail({ userId: "idler", sessionId: failedSession })).payerCredits, 0);
+    // 状态各自维持原样：idle 会话不该因为一笔待退的钱莫名其妙变成失败。
+    check("idle 会话状态没有被改动", (await repo(AgentSession).findOneByOrFail({ userId: "idler", sessionId: idleSession })).status, "idle");
+    await resetRunningAgentSessions();
+    check("再次启动不会重复退款", await creditsOf("idler"), 100);
+    check("两笔各只退了一次", await repo(CreditLog).countBy({ userId: "idler", type: "ai_refund" }), 2);
 }
 
 /**
@@ -469,6 +637,9 @@ async function teamBilling({ check, rejects }: { check: (name: string, actual: u
     check("还原出的付费方是团队", restored.payer.kind, "team");
     check("还原出的金额是任务上的金额", restored.credits, 7);
     check("还原出的流水 ID 不是空串", restored.logId, "team-credit-x");
+    // 这条是纯还原断言，用的是一个假流水 ID；留着它会让之后每次启动扫描都去退一笔退不掉的钱，
+    // 在验证输出里刷出一堆与被测性质无关的噪声，所以用完就把这行任务的回执收掉。
+    await jobs.update({ id: teamJobId }, { credits: 0, payerLogId: "" });
 }
 
 main().catch((error) => {
