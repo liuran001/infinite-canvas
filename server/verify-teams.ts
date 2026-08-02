@@ -696,7 +696,41 @@ async function main() {
     check("被拒后名额已归还", (await repo(TeamInvite).findOneByOrFail({ id: overflow.id })).usedCount, 0);
     check("被拒后没有写入成员", await repo(TeamMember).countBy({ teamId: host.id, userId: "user-z" }), 0);
 
+    await projectOwnership({ check, rejects });
+
     finish(env.root);
+}
+
+/**
+ * 画布的团队归属。这是唯一能写 Project.teamId 的路径，所以它的两道门必须咬得住：
+ * 调用者得是画布所有者，并且是目标团队里有消费权限的活跃成员。
+ */
+async function projectOwnership({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { repo } = await import("./src/db/data-source");
+    const { Project, TeamMember } = await import("./src/db/entities");
+    const { createTeam } = await import("./src/services/teams");
+    const { getProjectTeam, setProjectTeam } = await import("./src/services/project-team");
+    const { now } = await import("./src/lib/errors");
+
+    console.log("画布团队归属");
+    const projects = repo(Project);
+    const owned = await createTeam("user-canvas-owner", { name: "画布团队" });
+    await repo(TeamMember).insert({ teamId: owned.id, userId: "user-canvas-viewer", role: "viewer", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-canvas-owner", joinedAt: now(), updatedAt: now() });
+    await projects.insert({ userId: "user-canvas-owner", projectId: "pt-1", title: "画布", data: "{}", revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
+    check("新画布默认没有团队归属", (await getProjectTeam("user-canvas-owner", "pt-1")).teamId, "");
+
+    await setProjectTeam("user-canvas-owner", "pt-1", owned.id);
+    check("owner 能把自己的画布绑到团队", (await getProjectTeam("user-canvas-owner", "pt-1")).teamId, owned.id);
+
+    await rejects("非成员不能绑定", () => setProjectTeam("user-canvas-stranger", "pt-1", owned.id));
+    await rejects("画布不存在时拒绝", () => setProjectTeam("user-canvas-owner", "pt-nope", owned.id));
+    // viewer 在团队里，但权限矩阵没给它 credits.spend：能看不等于能把画布挂到团队账上花钱。
+    await projects.insert({ userId: "user-canvas-viewer", projectId: "pt-2", title: "看客画布", data: "{}", revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
+    await rejects("viewer 不能把画布绑到团队", () => setProjectTeam("user-canvas-viewer", "pt-2", owned.id));
+    check("被拒后归属仍为空", (await getProjectTeam("user-canvas-viewer", "pt-2")).teamId, "");
+
+    await setProjectTeam("user-canvas-owner", "pt-1", "");
+    check("解绑回个人不需要团队权限", (await getProjectTeam("user-canvas-owner", "pt-1")).teamId, "");
 }
 
 void main();

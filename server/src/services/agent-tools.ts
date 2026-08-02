@@ -415,6 +415,8 @@ async function runGenerationJob(ctx: ToolContext, kind: JobKind, model: string, 
         params,
         inputFileIds,
         context: { source: "agent", projectId: ctx.projectId, sessionId: ctx.sessionId },
+        // 计费归属走独立参数而不是 context：context 是给界面看的自定义信息，不该决定谁付钱。
+        billingProjectId: ctx.projectId,
     });
 
     let job: Job = created;

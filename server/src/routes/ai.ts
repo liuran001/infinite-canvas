@@ -5,7 +5,7 @@ import { fail } from "../lib/errors";
 import { handle, ok } from "../lib/response";
 import { statusMessage, upstreamMessage } from "../lib/upstream";
 import { requireUser, userAuth } from "../middleware/auth";
-import { consumeUserCredits, refundUserCredits } from "../services/auth";
+import { charge, refund, resolvePayer } from "../services/billing";
 import { buildChannelUrl, modelCost, selectModelChannel, type ModelChannel } from "../services/settings";
 
 export const aiRouter = Router();
@@ -34,16 +34,17 @@ async function proxy(req: Parameters<Parameters<typeof handle>[0]>[0], res: Para
     headers["Content-Type"] = "application/json";
     if (req.headers.accept) headers.Accept = String(req.headers.accept);
 
-    await consumeUserCredits(user.id, model, credits, url);
+    // 付费方一律服务端解析：这条同步转发没有绑定任何画布，所以恒是个人账，请求体里写什么都不作数。
+    const receipt = await charge(await resolvePayer(user.id, {}), credits, { model, path: url });
     const controller = new AbortController();
     req.on("close", () => controller.abort());
     const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(req.body || {}), signal: controller.signal }).catch(async (error: Error) => {
-        await refundUserCredits(user.id, model, credits, url).catch(() => undefined);
+        await refund(receipt, { model, path: url }).catch(() => undefined);
         throw fail(error.name === "AbortError" ? "请求已取消" : "AI 接口请求失败：上游无响应或网络不可达");
     });
 
     if (!response.ok) {
-        await refundUserCredits(user.id, model, credits, url).catch(() => undefined);
+        await refund(receipt, { model, path: url }).catch(() => undefined);
         const body = await response.text().catch(() => "");
         throw fail(upstreamMessage(body) || statusMessage(response.status, "AI 接口请求失败"));
     }

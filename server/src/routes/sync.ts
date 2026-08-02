@@ -4,6 +4,7 @@ import { fail, FORBIDDEN } from "../lib/errors";
 import { handle, ok } from "../lib/response";
 import { accessContext, projectAuth, requireUser, userAuth } from "../middleware/auth";
 import { resolveProjectAccess } from "../services/project-access";
+import { getProjectTeam, setProjectTeam } from "../services/project-team";
 import { listProjectPresence, removeProjectPresence, subscribeProject, updateProjectPresence, type ProjectActivity } from "../services/project-realtime";
 import { logShareAccess } from "../services/project-share";
 import { deleteProject, deleteUserAsset, deleteUserPlugin, listProjects, listUserAssets, listUserPlugins, saveProject, saveUserAsset, saveUserPlugin, toProjectView } from "../services/sync";
@@ -124,6 +125,18 @@ syncRouter.delete(
         await deleteProject(access.ownerId, projectId, readClientId(req.headers["x-client-id"]));
         ok(res, true);
     }),
+);
+
+/**
+ * 画布的团队归属。刻意独立成一个接口而不是给保存接口加字段：
+ * 保存每秒都在发生、分享访客也能触发，把归属混进去就等于给「谁付钱」开了一条谁都能写的旁路。
+ * 只挂 userAuth：改归属是所有者的决定，分享访客（哪怕是 editor）没有这项权力。
+ */
+syncRouter.get("/v1/projects/:id/team", userAuth, handle(async (req, res) => ok(res, await getProjectTeam(requireUser(req).id, String(req.params.id)))));
+syncRouter.put(
+    "/v1/projects/:id/team",
+    userAuth,
+    handle(async (req, res) => ok(res, await setProjectTeam(requireUser(req).id, String(req.params.id), String((req.body || {}).teamId || "")))),
 );
 
 syncRouter.get("/v1/user-assets", userAuth, handle(async (req, res) => ok(res, { items: await listUserAssets(requireUser(req).id, String(req.query.since || "")) })));

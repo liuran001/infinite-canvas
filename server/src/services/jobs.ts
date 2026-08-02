@@ -5,7 +5,7 @@ import { config } from "../config";
 import { repo } from "../db/data-source";
 import { Job, StoredFile, type JobKind, type JobStatus } from "../db/entities";
 import { fail, newId, now, SafeError } from "../lib/errors";
-import { consumeUserCredits, refundUserCredits } from "./auth";
+import { charge, payerOfJob, payerOfProject, receiptOfJob, refund } from "./billing";
 import { listFiles, publicFileUrl, saveFile, saveFileFromUrl } from "./files";
 import { createVideoTask, fileToDataUrl, generateAudio, generateImages, generateText, pollVideoTask, type GenerationParams } from "./generation";
 import { modelCost, publicSettings, selectModelChannel } from "./settings";
@@ -18,6 +18,12 @@ export type JobInput = {
     params: GenerationParams;
     inputFileIds: string[];
     context?: Record<string, unknown>;
+    /**
+     * 计费归属画布。刻意与 `context` 分开：context 是客户端自定义的展示信息，前端能往里写任何东西，
+     * 拿它决定付费方等于让请求体自己点名让哪个团队付钱。这个字段只由服务端可信的调用点填，
+     * 而且填进来之后仍要按 userId 回库查一次画布并校验团队成员资格，伪造一个别人的画布 id 也串不了账。
+     */
+    billingProjectId?: string;
 };
 
 export type JobView = {
@@ -115,6 +121,10 @@ export async function createJob(userId: string, input: JobInput) {
     const settings = await publicSettings();
     if (!settings.modelChannel.models.some((item) => item.name === model)) throw fail(`模型不可用：${model}`);
 
+    // 付费方在创建时解析一次并固化到任务行上：任务可能跑几分钟，期间用户可能被移出团队，
+    // 而退款必须回到当初扣钱的那个池子。解析只认按 userId 查得到的自己的画布，查不到就是个人。
+    const payer = input.billingProjectId ? await payerOfProject(userId, input.billingProjectId) : ({ kind: "user", userId } as const);
+
     const job = await jobs().save({
         id: newId("job"),
         userId,
@@ -133,8 +143,9 @@ export async function createJob(userId: string, input: JobInput) {
         progress: 0,
         seq: await nextJobSeq(userId),
         upstreamTaskId: "",
-        payerKind: "user",
-        payerTeamId: "",
+        payerKind: payer.kind,
+        payerTeamId: payer.kind === "team" ? payer.teamId : "",
+        payerLogId: "",
         createdAt: now(),
         updatedAt: now(),
         finishedAt: "",
@@ -315,8 +326,10 @@ async function runJob(job: Job) {
         await patchJob(job, { status: "running", progress: 10, text: "" });
         // 扣点在实际调用上游之前，失败路径统一返还，避免任务重试重复扣费。
         if (!job.credits && credits > 0) {
-            await consumeUserCredits(job.userId, job.model, credits, `/jobs/${job.kind}`);
-            await patchJob(job, { credits });
+            const receipt = await charge(payerOfJob(job), credits, { model: job.model, path: `/jobs/${job.kind}` });
+            // 团队池不足回落到个人时，实际付款方已经变成个人，必须把它写回任务行：
+            // 否则重启后按旧的 payerKind 退款，钱会退进团队池，个人那边白花一笔。
+            await patchJob(job, { credits, payerKind: receipt.payer.kind, payerTeamId: receipt.payer.kind === "team" ? receipt.payer.teamId : "", payerLogId: receipt.logId });
         }
         const text = job.kind === "text" ? await runTextJob(job, controller.signal) : "";
         const outputs = job.kind === "text" ? [] : job.kind === "video" ? await runVideoJob(job, controller.signal) : job.kind === "audio" ? await runAudioJob(job, controller.signal) : await runImageJob(job, controller.signal);
@@ -328,10 +341,12 @@ async function runJob(job: Job) {
         const canceled = controller.signal.aborted;
         // 失败与取消都全额返还：让用户「既没拿到完整内容又被扣了钱」是最不能接受的结果，
         // 已经流出来的半截文本照常保留在任务里，用户不花钱也能留住它。
-        if (job.credits > 0) await refundUserCredits(job.userId, job.model, job.credits, `/jobs/${job.kind}`).catch(() => undefined);
+        // 退款按任务行上固化的 payer 走，不重新解析：用户可能已经被移出团队，
+        // 重新解析会把当初从团队池扣的钱退进他的个人余额。
+        if (job.credits > 0) await refund(receiptOfJob(job), { model: job.model, path: `/jobs/${job.kind}` }).catch(() => undefined);
         const message = error instanceof SafeError ? error.message : "生成失败，请稍后重试";
         if (!canceled) console.error(`job ${job.id} failed:`, error);
-        await patchJob(job, { status: canceled ? "canceled" : "failed", credits: 0, text: runningTexts.get(job.id) ?? job.text ?? "", error: canceled ? "任务已取消" : message, finishedAt: now() });
+        await patchJob(job, { status: canceled ? "canceled" : "failed", credits: 0, payerLogId: "", text: runningTexts.get(job.id) ?? job.text ?? "", error: canceled ? "任务已取消" : message, finishedAt: now() });
     } finally {
         // 终态由上面的 patchJob 广播（快照里带着最终文本），这里只清内存；
         // 清在广播之后，之后新来的订阅直接读库里的最终内容。

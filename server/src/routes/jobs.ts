@@ -29,6 +29,9 @@ jobRouter.post(
             params: body.params || {},
             inputFileIds: Array.isArray(body.inputFileIds) ? body.inputFileIds.map(String) : [],
             context: body.context && typeof body.context === "object" ? body.context : {},
+            // 计费归属只认这个显式字段，而且服务端还要按当前用户回库核对画布与团队成员资格；
+            // context 里的 projectId 是客户端自定义的展示信息，伪造它改不了付费方。
+            billingProjectId: String(body.billingProjectId || ""),
         });
         ok(res, await toJobView(job));
     }),

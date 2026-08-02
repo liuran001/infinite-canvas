@@ -39,7 +39,8 @@ export async function saveProject(userId: string, input: ProjectInput) {
     const saved = await projects.findOneBy({ userId, projectId: id });
     if (!saved) {
         if (input.revision !== 0) throw fail("画布项目在其他设备上已更新，请先同步", 409, "REVISION_CONFLICT");
-        const row = projects.create({ projectId: id, userId, title: input.title || "未命名画布", data: JSON.stringify(input.data ?? {}), revision: 1, deleted: false, createdAt: now(), updatedAt: now() });
+        // teamId 显式写空串：新画布一律归个人，归属只能之后通过受控接口显式改。
+        const row = projects.create({ projectId: id, userId, title: input.title || "未命名画布", data: JSON.stringify(input.data ?? {}), revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
         try { await projects.insert(row); } catch {
             const current = await projects.findOneBy({ userId, projectId: id });
             if (current) throw conflict(current);

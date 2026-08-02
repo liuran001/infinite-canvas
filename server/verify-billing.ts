@@ -17,7 +17,7 @@ async function main() {
     const { CreditLog, User } = await import("./src/db/entities");
     const { charge, refund, resolvePayer } = await import("./src/services/billing");
     const { adjustUserCredits, consumeUserCredits, refundUserCredits } = await import("./src/services/auth");
-    const { now } = await import("./src/lib/errors");
+    const { newId, now } = await import("./src/lib/errors");
 
     await initDatabase();
     const users = repo(User);
@@ -155,7 +155,187 @@ async function main() {
     check("逐条回放流水能还原出每一步余额", ordered.every((row, index) => row.balance === (index ? ordered[index - 1].balance : 0) + row.amount), true);
     check("随机操作中余额从未为负", ordered.every((row) => row.balance >= 0), true);
 
+    await teamBilling({ check, rejects });
+
     finish(env.root);
+}
+
+/**
+ * 团队计费。这一段的每条断言都对应架构文档里「必须测试」的一项：
+ * 两个团队互不串账、非成员既不能绑定也不能消费、普通保存夹带 teamId 无效、
+ * 伪造 Job.context.projectId 不改付费方、存量画布默认走个人、移出成员后新调用被拒但在途退款仍回原团队。
+ */
+async function teamBilling({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { repo } = await import("./src/db/data-source");
+    const { AgentSession, CreditLog, Job, Project, Team, TeamCreditLog, TeamMember, User } = await import("./src/db/entities");
+    const { charge, payerOfJob, payerOfProject, payerOfSession, receiptOfJob, refund, resolvePayer } = await import("./src/services/billing");
+    const { setProjectTeam } = await import("./src/services/project-team");
+    const { saveProject } = await import("./src/services/sync");
+    const { createJob } = await import("./src/services/jobs");
+    const { savePreferences } = await import("./src/services/preferences");
+    const { newId, now } = await import("./src/lib/errors");
+
+    const users = repo(User);
+    const teams = repo(Team);
+    const makeUser = async (id: string, credits: number) =>
+        users.insert({ id, username: id, password: "", email: "", displayName: id, avatarUrl: "", role: "user", credits, storageQuota: 1 << 20, affCode: id, affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
+    const creditsOfTeam = async (id: string) => (await teams.findOneByOrFail({ id })).credits;
+    const creditsOfUser = async (id: string) => (await users.findOneByOrFail({ id })).credits;
+    const makeTeam = async (name: string, ownerId: string, credits: number) => {
+        const id = newId("team");
+        await teams.insert({ id, name, description: "", avatarUrl: "", ownerId, credits, memberLimit: 0, status: "active", createdAt: now(), updatedAt: now() });
+        return id;
+    };
+    const join = async (teamId: string, userId: string, role: "owner" | "admin" | "member" | "viewer") =>
+        repo(TeamMember).insert({ teamId, userId, role, creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "", joinedAt: now(), updatedAt: now() });
+
+    console.log("团队扣费与成员额度");
+    await makeUser("boss", 100);
+    await makeUser("worker", 50);
+    await makeUser("outsider", 100);
+    const teamA = await makeTeam("A 团队", "boss", 40);
+    await join(teamA, "boss", "owner");
+    await join(teamA, "worker", "member");
+
+    const teamReceipt = await charge({ kind: "team", teamId: teamA, memberId: "worker" }, 25, { model: "gpt-x", path: "/v1/ai/chat/completions" });
+    check("团队池被扣", await creditsOfTeam(teamA), 15);
+    check("个人余额未被动用", await creditsOfUser("worker"), 50);
+    check("写入团队流水", await repo(TeamCreditLog).countBy({ teamId: teamA, type: "ai_consume" }), 1);
+    check("个人流水没有新增", await repo(CreditLog).countBy({ userId: "worker" }), 0);
+    check("团队流水 balance 是团队池余额", (await repo(TeamCreditLog).findOneByOrFail({ teamId: teamA, type: "ai_consume" })).balance, 15);
+
+    await rejects("团队池不足且未开回落时拒绝", () => charge({ kind: "team", teamId: teamA, memberId: "worker" }, 999, { model: "gpt-x", path: "/x" }));
+    check("被拒后团队池不变", await creditsOfTeam(teamA), 15);
+    check("被拒后个人余额不变", await creditsOfUser("worker"), 50);
+    check("被拒留下 insufficient 留痕", await repo(TeamCreditLog).countBy({ teamId: teamA, type: "insufficient" }), 1);
+    check("insufficient 金额为 0", (await repo(TeamCreditLog).findOneByOrFail({ teamId: teamA, type: "insufficient" })).amount, 0);
+
+    console.log("用户开启回落后使用个人余额");
+    await savePreferences("worker", { billingFallbackToPersonal: true });
+    const fallback = await charge({ kind: "team", teamId: teamA, memberId: "worker" }, 20, { model: "gpt-x", path: "/x" });
+    check("回落后扣的是个人余额", await creditsOfUser("worker"), 30);
+    check("回落后团队池不变", await creditsOfTeam(teamA), 15);
+    check("回执 payer 变为个人", fallback.payer.kind, "user");
+    check("个人流水标注来源团队", JSON.parse((await repo(CreditLog).findOneByOrFail({ userId: "worker", type: "ai_consume" })).extra || "{}").fallbackFromTeamId, teamA);
+    await savePreferences("worker", {});
+
+    console.log("退款严格原路");
+    await refund(teamReceipt, { model: "gpt-x", path: "/x" });
+    check("团队扣的退回团队", await creditsOfTeam(teamA), 40);
+    check("团队退款不加个人余额", await creditsOfUser("worker"), 30);
+    check("退款流水指回原始扣费流水", (await repo(TeamCreditLog).findOneByOrFail({ teamId: teamA, type: "ai_refund" })).relatedId, teamReceipt.logId);
+    await refund(fallback, { model: "gpt-x", path: "/x" });
+    check("回落扣的退回个人", await creditsOfUser("worker"), 50);
+    check("回落退款不加团队池", await creditsOfTeam(teamA), 40);
+
+    console.log("成员额度按实时聚合");
+    await repo(TeamMember).update({ teamId: teamA, userId: "worker" }, { creditLimit: 10, limitWindow: "total" });
+    await charge({ kind: "team", teamId: teamA, memberId: "worker" }, 8, { model: "gpt-x", path: "/x" });
+    await rejects("超出成员额度时拒绝", () => charge({ kind: "team", teamId: teamA, memberId: "worker" }, 5, { model: "gpt-x", path: "/x" }));
+    check("超额被拒后团队池只少了 8", await creditsOfTeam(teamA), 32);
+    await repo(TeamMember).update({ teamId: teamA, userId: "worker" }, { creditLimit: 0 });
+
+    console.log("并发不超扣");
+    const before = await creditsOfTeam(teamA);
+    const rush = await Promise.allSettled(Array.from({ length: 20 }, () => charge({ kind: "team", teamId: teamA, memberId: "boss" }, 4, { model: "gpt-x", path: "/x" })));
+    const okCount = rush.filter((item) => item.status === "fulfilled").length;
+    check("并发扣费不超扣", await creditsOfTeam(teamA), before - okCount * 4);
+    check("团队池不为负", (await creditsOfTeam(teamA)) >= 0, true);
+
+    console.log("A/B 两团队不串账");
+    await teams.update({ id: teamA }, { credits: 100 });
+    const teamB = await makeTeam("B 团队", "boss", 100);
+    await join(teamB, "boss", "owner");
+    const projects = repo(Project);
+    await projects.insert({ userId: "boss", projectId: "p-a", title: "A 画布", data: "{}", revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
+    await projects.insert({ userId: "boss", projectId: "p-b", title: "B 画布", data: "{}", revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
+    await setProjectTeam("boss", "p-a", teamA);
+    await setProjectTeam("boss", "p-b", teamB);
+    await charge(await resolvePayer("boss", { projectId: "p-a" }), 10, { model: "gpt-x", path: "/x" });
+    check("A 画布扣的是 A 团队", await creditsOfTeam(teamA), 90);
+    check("A 画布的消费没有落到 B 团队", await creditsOfTeam(teamB), 100);
+    await charge(await resolvePayer("boss", { projectId: "p-b" }), 30, { model: "gpt-x", path: "/x" });
+    check("B 画布扣的是 B 团队", await creditsOfTeam(teamB), 70);
+    check("B 画布的消费没有落到 A 团队", await creditsOfTeam(teamA), 90);
+    check("两次消费都没动用个人余额", await creditsOfUser("boss"), 100);
+
+    console.log("非成员不能绑定也不能消费");
+    await projects.insert({ userId: "outsider", projectId: "p-out", title: "外人画布", data: "{}", revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
+    await rejects("非成员不能把画布绑到团队", () => setProjectTeam("outsider", "p-out", teamA));
+    check("被拒后画布归属仍为空", (await projects.findOneByOrFail({ userId: "outsider", projectId: "p-out" })).teamId, "");
+    await rejects("非成员不能直接消费团队池", () => charge({ kind: "team", teamId: teamA, memberId: "outsider" }, 5, { model: "gpt-x", path: "/x" }));
+    check("非成员被拒后团队池不变", await creditsOfTeam(teamA), 90);
+    // viewer 在权限矩阵里没有 credits.spend：有成员身份不等于能花钱。
+    await join(teamA, "watcher", "viewer");
+    await rejects("viewer 不能消费团队池", () => charge({ kind: "team", teamId: teamA, memberId: "watcher" }, 5, { model: "gpt-x", path: "/x" }));
+    check("viewer 被拒后团队池不变", await creditsOfTeam(teamA), 90);
+
+    console.log("普通保存夹带 teamId 改不了归属");
+    await saveProject("boss", { id: "p-a", title: "A 画布", data: { teamId: teamB }, revision: 1, clientId: "client-aaaaaaaa", teamId: teamB } as never);
+    check("保存后归属仍是原团队", (await projects.findOneByOrFail({ userId: "boss", projectId: "p-a" })).teamId, teamA);
+    await saveProject("boss", { id: "p-new", title: "新画布", data: {}, revision: 0, clientId: "client-aaaaaaaa", teamId: teamB } as never);
+    check("新建画布默认归个人", (await projects.findOneByOrFail({ userId: "boss", projectId: "p-new" })).teamId, "");
+
+    console.log("存量画布默认走个人账本");
+    // 存量行不带 teamId，读出来就是空串（或 null），付费方必须仍是个人。
+    await projects.insert({ userId: "solo", projectId: "p-legacy", title: "存量画布", data: "{}", revision: 1, deleted: false, createdAt: now(), updatedAt: now() } as never);
+    check("存量画布 teamId 为空", (await projects.findOneByOrFail({ userId: "solo", projectId: "p-legacy" })).teamId || "", "");
+    check("存量画布 payer 为个人", (await resolvePayer("solo", { projectId: "p-legacy" })).kind, "user");
+    check("客户端传 teamId 被忽略", (await resolvePayer("solo", { projectId: "p-legacy", teamId: teamA } as never)).kind, "user");
+
+    console.log("任务与会话固化 payer");
+    const jobs = repo(Job);
+    const teamJobId = newId("job");
+    await jobs.insert({ id: teamJobId, userId: "boss", clientJobId: "c1", kind: "image", status: "pending", model: "gpt-x", prompt: "", params: "{}", progress: 0, credits: 0, seq: 1, text: "", error: "", outputFileIds: [], inputFileIds: [], upstreamTaskId: "", payerKind: "team", payerTeamId: teamA, payerLogId: "", createdAt: now(), updatedAt: now(), finishedAt: "" } as never);
+    check("任务上固化了 payer 类型", (await jobs.findOneByOrFail({ id: teamJobId })).payerKind, "team");
+    check("按任务解析出团队 payer", payerOfJob(await jobs.findOneByOrFail({ id: teamJobId })).kind, "team");
+
+    const legacyJobId = newId("job");
+    await jobs.insert({ id: legacyJobId, userId: "solo", clientJobId: "c2", kind: "image", status: "pending", model: "gpt-x", prompt: "", params: "{}", progress: 0, credits: 0, seq: 2, text: "", error: "", outputFileIds: [], inputFileIds: [], upstreamTaskId: "", createdAt: now(), updatedAt: now(), finishedAt: "" } as never);
+    check("存量任务默认按个人计费", (await jobs.findOneByOrFail({ id: legacyJobId })).payerKind, "user");
+    check("存量任务 payerTeamId 为空", (await jobs.findOneByOrFail({ id: legacyJobId })).payerTeamId || "", "");
+    check("按存量任务解析出个人 payer", payerOfJob(await jobs.findOneByOrFail({ id: legacyJobId })).kind, "user");
+
+    const teamSession = newId("agent");
+    await repo(AgentSession).insert({ userId: "boss", sessionId: teamSession, projectId: "p-a", title: "会话", status: "idle", model: "gpt-x", error: "", lastSeq: 0, pendingAction: null, rounds: 0, autoRenamed: false, deleted: false, payerKind: "team", payerTeamId: teamA, createdAt: now(), updatedAt: now() } as never);
+    check("按会话解析出团队 payer", payerOfSession(await repo(AgentSession).findOneByOrFail({ userId: "boss", sessionId: teamSession })).kind, "team");
+    check("会话上下文解析出团队 payer", (await resolvePayer("boss", { sessionId: teamSession })).kind, "team");
+
+    console.log("伪造 Job.context.projectId 不改 payer");
+    // context 是客户端自定义的展示信息，付费方一眼都不看它。
+    const forged = await createJob("outsider", { clientJobId: "forge-1", kind: "image", model: "any", prompt: "", params: {}, inputFileIds: [], context: { projectId: "p-a", teamId: teamA } }).catch(() => null);
+    check("伪造 context 的任务不会挂到团队", forged ? forged.payerKind : "user", "user");
+    // 显式的 billingProjectId 同样是不可信输入：服务端按当前 userId 回库查画布，别人的画布查不到，落回个人。
+    check("指定别人的画布解析出的仍是个人", (await payerOfProject("outsider", "p-a")).kind, "user");
+    check("指定不存在的画布解析出的仍是个人", (await payerOfProject("outsider", "p-nope")).kind, "user");
+    const stolen = await createJob("outsider", { clientJobId: "forge-2", kind: "image", model: "any", prompt: "", params: {}, inputFileIds: [], billingProjectId: "p-a" }).catch(() => null);
+    check("指定别人的画布也挂不上团队", stolen ? stolen.payerKind : "user", "user");
+    check("伪造后 A 团队池未被动过", await creditsOfTeam(teamA), 90);
+
+    console.log("移出成员后新调用拒绝，在途退款仍回原团队");
+    // 成员在册时把自己的画布绑到团队，之后被移出：归属不会静默改变，但他已经不能再用它花团队的钱。
+    await projects.insert({ userId: "worker", projectId: "p-w", title: "成员画布", data: "{}", revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
+    await setProjectTeam("worker", "p-w", teamA);
+    const inflight = await charge(await resolvePayer("worker", { projectId: "p-w" }), 12, { model: "gpt-x", path: "/x" });
+    check("在途任务已从团队池扣走", await creditsOfTeam(teamA), 78);
+    const workerBefore = await creditsOfUser("worker");
+    await repo(TeamMember).delete({ teamId: teamA, userId: "worker" });
+    await rejects("被移出后新的团队消费被拒", () => charge({ kind: "team", teamId: teamA, memberId: "worker" }, 5, { model: "gpt-x", path: "/x" }));
+    await rejects("被移出后按画布解析付费方也拒绝", () => resolvePayer("worker", { projectId: "p-w" }));
+    check("被移出后画布归属没有被静默改掉", (await projects.findOneByOrFail({ userId: "worker", projectId: "p-w" })).teamId, teamA);
+    check("被拒后团队池不变", await creditsOfTeam(teamA), 78);
+    await teams.update({ id: teamA }, { status: "disabled" });
+    await refund(inflight, { model: "gpt-x", path: "/x" });
+    check("团队停用且成员已移出，退款仍回团队池", await creditsOfTeam(teamA), 90);
+    check("在途退款没有落到个人余额", await creditsOfUser("worker"), workerBefore);
+    await teams.update({ id: teamA }, { status: "active" });
+
+    console.log("任务行能还原出回执");
+    await jobs.update({ id: teamJobId }, { credits: 7, payerLogId: "team-credit-x" });
+    const restored = receiptOfJob(await jobs.findOneByOrFail({ id: teamJobId }));
+    check("还原出的付费方是团队", restored.payer.kind, "team");
+    check("还原出的金额是任务上的金额", restored.credits, 7);
+    check("还原出的流水 ID 不是空串", restored.logId, "team-credit-x");
 }
 
 main().catch((error) => {

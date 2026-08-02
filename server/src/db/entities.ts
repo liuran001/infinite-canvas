@@ -207,6 +207,11 @@ export class Project {
     @Column({ type: LONG_TEXT, nullable: true }) data!: string;
     @Column({ type: "int", default: 1 }) revision!: number;
     @Column({ type: "boolean", default: false }) deleted!: boolean;
+    /**
+     * 画布的持久团队归属，空串表示个人画布。存量行读出来就是空串，所以加这一列不改变任何既有行为。
+     * 只能通过受控的归属接口修改：普通保存/同步一律不读也不写它，否则一次夹带 teamId 的保存就能把账挪到别人的池子上。
+     */
+    @Index() @Column(short) teamId!: string;
     @Column(short) createdAt!: string;
     @Index() @Column(short) updatedAt!: string;
 }
@@ -295,6 +300,11 @@ export class Job {
      */
     @Column({ type: "varchar", length: 16, default: "user" }) payerKind!: PayerKind;
     @Column(short) payerTeamId!: string;
+    /**
+     * 这次扣费落下的流水 ID。任务可能跨进程重启后才走到退款，那时回执早已不在内存里，
+     * 只有把它落在任务行上，退款流水才能通过 relatedId 指回原始那笔扣费，对账时「扣」与「退」能一一对上。
+     */
+    @Column(short) payerLogId!: string;
     @Column(short) createdAt!: string;
     @Index() @Column(short) updatedAt!: string;
     @Column(short) finishedAt!: string;

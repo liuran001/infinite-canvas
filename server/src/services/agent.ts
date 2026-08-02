@@ -6,7 +6,7 @@ import { AgentMessage, AgentSession, type AgentMessageRole, type AgentPendingAct
 import { fail, newId, now, SafeError } from "../lib/errors";
 import { upstreamJson } from "../lib/upstream";
 import { fileIdOfStorageKey, listAgentTools, runAgentTool, storageKeyOf, type AgentTool, type AgentToolAccess, type ToolState } from "./agent-tools";
-import { consumeUserCredits, refundUserCredits } from "./auth";
+import { charge, payerOfProject, payerOfSession, refund, type ChargeReceipt } from "./billing";
 import { listFiles } from "./files";
 import { fileToBase64 } from "./generation";
 import { getAgentGenerationPreference } from "./preferences";
@@ -172,6 +172,8 @@ export async function createAgentSession(userId: string, input: { sessionId: str
     const projectId = input.projectId.trim();
     if (!projectId) throw fail("缺少画布项目 ID");
     await readProjectCanvas(userId, projectId);
+    // 画布已经按 userId 核对过，这里按它的持久归属固化付费方，同一会话所有轮次都沿用它。
+    const payer = await payerOfProject(userId, projectId);
 
     const model = resolveAgentModel(settings, input.model);
     if (!model) throw fail("系统未配置 Agent 使用的文本模型");
@@ -194,6 +196,8 @@ export async function createAgentSession(userId: string, input: { sessionId: str
         autoRenamed: false,
         lastSeq: 0,
         deleted: false,
+        payerKind: payer.kind,
+        payerTeamId: payer.kind === "team" ? payer.teamId : "",
         createdAt: saved?.createdAt || now(),
         updatedAt: now(),
     } as AgentSession);
@@ -503,7 +507,7 @@ async function runLoop(session: AgentSession, signal: AbortSignal) {
 }
 
 /** 失败或中止时把这条消息扣的那一次点原路返还；跑了多少轮都只返还这一次。 */
-async function runSession(session: AgentSession, model: string, credits: number) {
+async function runSession(session: AgentSession, model: string, receipt: ChargeReceipt) {
     const key = busKey(session.userId, session.sessionId);
     const controller = new AbortController();
     running.set(key, controller);
@@ -513,7 +517,8 @@ async function runSession(session: AgentSession, model: string, credits: number)
     } catch (error) {
         const aborted = controller.signal.aborted;
         if (!aborted) console.error(`agent session ${session.sessionId} failed:`, error);
-        await refundUserCredits(session.userId, model, credits, "/agent").catch(() => undefined);
+        // 退款只认回执：这一轮跑的过程中用户可能已经被移出团队，重新解析会把团队的钱退进个人余额。
+        await refund(receipt, { model, path: "/agent" }).catch(() => undefined);
         const message = error instanceof SafeError ? error.message : "Agent 执行失败，请稍后重试";
         await appendMessage(session, "assistant", { content: aborted ? "已中止本次执行。" : message }).catch(() => undefined);
         await patchSession(session, { status: aborted ? "idle" : "failed", error: aborted ? "" : message, pendingAction: null }).catch(() => undefined);
@@ -542,16 +547,17 @@ export async function resolveAgentSession(userId: string, sessionId: string, app
         await appendMessage(session, "assistant", { content: `已把画布标题改成「${action.title}」。` });
         // 轮数不重置：改个标题不该顺带送一整轮预算，接着用剩下的额度把原来的事做完。
         await patchSession(session, { status: "running", error: "", pendingAction: null });
-        void runSession(session, session.model, 0);
+        // 改标题不扣费，所以这里给的是一张零额回执：refund 见到 credits 为 0 直接返回，不会凭空退出一笔钱。
+        void runSession(session, session.model, { payer: payerOfSession(session), credits: 0, logId: "" });
         return toSessionView(session);
     }
 
     // 续跑是用户明确要求的新一段执行，所以按当前模型单价重新扣一次点；余额不够就明确拒绝，不偷偷放行。
     const credits = await modelCost(session.model);
-    await consumeUserCredits(userId, session.model, credits, "/agent");
+    const receipt = await charge(payerOfSession(session), credits, { model: session.model, path: "/agent" });
     await appendMessage(session, "assistant", { content: "好的，继续执行。" });
     await patchSession(session, { status: "running", error: "", pendingAction: null, rounds: 0 });
-    void runSession(session, session.model, credits);
+    void runSession(session, session.model, receipt);
     return toSessionView(session);
 }
 
@@ -661,20 +667,21 @@ export async function sendAgentMessage(userId: string, sessionId: string, input:
     const { content, references } = await resolveReferences(userId, session.projectId, rawContent, input.references);
 
     // 扣费在真正开始执行之前：余额不足就直接拒绝，连循环都不启动。
+    // 付费方取会话创建时固化的那个，不按当前团队成员关系重算：一段会话中途换池子付款是对不上账的。
     const credits = await modelCost(model);
-    await consumeUserCredits(userId, model, credits, "/agent");
+    const receipt = await charge(payerOfSession(session), credits, { model, path: "/agent" });
     const first = !session.lastSeq;
     try {
         // rounds 清零：轮数预算是按「一条用户消息」给的，不是按会话累计的。
         await patchSession(session, { model, status: "running", error: "", rounds: 0, title: first ? (content || "图片消息").slice(0, 30) : session.title });
         const row = await appendMessage(session, "user", { content, clientMessageId, attachments, references });
-        void runSession(session, model, credits);
+        void runSession(session, model, receipt);
         // 起标题和执行并行跑，接口不等它：拿到了就通过 SSE 把新标题推出去，拿不到就一直用上面的截断兜底。
         if (first) void generateSessionTitle(session, content).catch(() => undefined);
         return toMessageView(row);
     } catch (error) {
         // 还没开始跑就失败了，扣掉的那一次要还回去，否则用户白花一次钱。
-        await refundUserCredits(userId, model, credits, "/agent").catch(() => undefined);
+        await refund(receipt, { model, path: "/agent" }).catch(() => undefined);
         throw error;
     }
 }

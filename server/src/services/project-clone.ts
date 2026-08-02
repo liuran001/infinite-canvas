@@ -84,6 +84,9 @@ export async function cloneSharedProject(share: ProjectShare, clonerId: string, 
             data: (source.data || "").replace(FILE_REFERENCE, (matched, id: string) => (mapping.has(id) ? `server:${mapping.get(id)}` : matched)),
             revision: 1,
             deleted: false,
+            // 副本归克隆者个人，绝不继承源画布的团队归属：访客不是那个团队的人，
+            // 继承下来等于凭一条分享链接就在别人的团队池上开了个计费入口。
+            teamId: "",
             createdAt: now(),
             updatedAt: now(),
         });
