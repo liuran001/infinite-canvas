@@ -796,8 +796,150 @@ async function main() {
     check("被拒后没有写入成员", await repo(TeamMember).countBy({ teamId: host.id, userId: "user-z" }), 0);
 
     await projectOwnership({ check, rejects });
+    await memberSettings({ check, rejects });
+    await backstage({ check, rejects });
+    await readySequencing({ check });
 
     finish(env.root);
+}
+
+/**
+ * 成员设置的入参与原子性。这条路径同时改角色、额度、状态，是团队里唯一能一次动三样东西的写入，
+ * 任何一项校验漏掉都会在库里留下一条谁也解释不了的成员记录。
+ */
+async function memberSettings({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { repo } = await import("./src/db/data-source");
+    const { Team, TeamMember } = await import("./src/db/entities");
+    const { createTeam, updateMember } = await import("./src/services/teams");
+    const { now } = await import("./src/lib/errors");
+
+    console.log("成员设置的入参与原子性");
+    const team = await createTeam("user-set-owner", { name: "设置团队" });
+    const member = () => repo(TeamMember).findOneByOrFail({ teamId: team.id, userId: "user-set-m" });
+    await repo(TeamMember).insert({ teamId: team.id, userId: "user-set-m", role: "member", creditLimit: 7, limitWindow: "month", status: "active", invitedBy: "user-set-owner", joinedAt: now(), updatedAt: now() });
+
+    // 角色白名单。只挡 owner 的话，随手传一个 "boss" 就能在库里种下一个权限矩阵查不到的角色：
+    // 这个人处处被拒，却没有任何一条规则能说明为什么，管理员也没有入口把他改回来。
+    for (const bogus of ["boss", "OWNER", "", "administrator"]) await rejects(`角色 ${JSON.stringify(bogus)} 被拒`, () => updateMember(team.id, "user-set-owner", "user-set-m", { role: bogus }));
+    check("被拒后角色没有变脏", (await member()).role, "member");
+    check("白名单内的角色仍能改", (await updateMember(team.id, "user-set-owner", "user-set-m", { role: "viewer" })).role, "viewer");
+
+    // 额度上限：畸形输入必须是 400，而不是被 `Number(x) || 0` 悄悄折成「把额度改成 0」。
+    for (const bogus of ["abc", Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5, null, {}, 1_000_000_001])
+        await rejects(`额度 ${JSON.stringify(bogus) ?? String(bogus)} 被拒`, () => updateMember(team.id, "user-set-owner", "user-set-m", { creditLimit: bogus }));
+    check("被拒后额度原样保留", (await member()).creditLimit, 7);
+    check("合法额度能改", (await updateMember(team.id, "user-set-owner", "user-set-m", { creditLimit: 0 })).creditLimit, 0);
+    check("字符串数字也认", (await updateMember(team.id, "user-set-owner", "user-set-m", { creditLimit: "42" })).creditLimit, 42);
+
+    // 原子性：角色与额度必须同生共死。分两段写的话，前一段的角色已经落库，
+    // 后一段被非法周期拦下，成员就停在一个「角色改了、额度没改」的中间态上，而调用方收到的是一次失败。
+    await rejects("角色合法但周期非法时整体失败", () => updateMember(team.id, "user-set-owner", "user-set-m", { role: "member", limitWindow: "week" }));
+    check("整体失败后角色没有被改掉", (await member()).role, "viewer");
+    await rejects("角色合法但额度非法时整体失败", () => updateMember(team.id, "user-set-owner", "user-set-m", { role: "member", creditLimit: -5 }));
+    check("整体失败后角色仍未变", (await member()).role, "viewer");
+    check("整体失败后额度仍未变", (await member()).creditLimit, 42);
+
+    // 并发：两个 admin 同时改同一个人，后手不能拿着过期快照把先手的写入盖回去。
+    const settled = await Promise.all([updateMember(team.id, "user-set-owner", "user-set-m", { role: "member" }), updateMember(team.id, "user-set-owner", "user-set-m", { creditLimit: 99 })]);
+    const final = await member();
+    check("并发修改后角色是 member", final.role, "member");
+    check("并发修改后额度是 99", final.creditLimit, 99);
+    check("两次调用都成功返回", settled.length, 2);
+
+    // 成员列表的已用额度：按窗口批量聚合，结果必须与逐人聚合的判定口径一模一样，
+    // 否则界面上的数字和真正会拦住人的那个数字会分家。
+    const { charge, usedCreditsOfMember } = await import("./src/services/billing");
+    const { listMemberViews } = await import("./src/services/teams");
+    await repo(Team).update({ id: team.id }, { credits: 500 });
+    await repo(TeamMember).update({ teamId: team.id, userId: "user-set-m" }, { limitWindow: "day", creditLimit: 0 });
+    await charge({ kind: "team", teamId: team.id, memberId: "user-set-m" }, 12, { model: "gpt-x", path: "/x" });
+    await charge({ kind: "team", teamId: team.id, memberId: "user-set-owner" }, 30, { model: "gpt-x", path: "/x" });
+    const views = await listMemberViews("user-set-owner", team.id);
+    check("成员列表算出本人已用额度", views.find((view) => view.userId === "user-set-m")?.usedCredits, 12);
+    check("不同窗口的成员各算各的", views.find((view) => view.userId === "user-set-owner")?.usedCredits, 30);
+    check("批量聚合与判定口径一致", views.find((view) => view.userId === "user-set-m")?.usedCredits, await usedCreditsOfMember(team.id, "user-set-m", "day"));
+    const zero = await createTeam("user-zero", { name: "零消费团队" });
+    check("没花过钱的成员是 0 而不是缺字段", (await listMemberViews("user-zero", zero.id))[0].usedCredits, 0);
+}
+
+/**
+ * 平台后台。这里的每个入口都绕过团队内的权限判定，所以它自己的入参校验就是最后一道门。
+ */
+async function backstage({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { repo } = await import("./src/db/data-source");
+    const { Project, Team, TeamMember } = await import("./src/db/entities");
+    const { adminSetTeamCredits, adminUpdateTeam } = await import("./src/services/admin-teams");
+    const { createTeam, disbandTeam } = await import("./src/services/teams");
+    const { now } = await import("./src/lib/errors");
+
+    console.log("平台团队后台");
+    const team = await createTeam("user-back-owner", { name: "后台团队" });
+    await repo(TeamMember).insert({ teamId: team.id, userId: "user-back-m", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-back-owner", joinedAt: now(), updatedAt: now() });
+    await repo(Project).insert({ userId: "user-back-owner", projectId: "pb-1", title: "后台画布", data: "{}", revision: 1, deleted: false, teamId: team.id, createdAt: now(), updatedAt: now() });
+
+    // 后台只有「启用/停用」两档。放行 disbanded 的话，这里只改一列状态：成员、邀请、画布归属原封不动，
+    // 画布的付费方解析从此永远卡在「团队不可用」，主人既不能花钱也没有入口解绑，等于被永久锁死。
+    await rejects("后台不能把团队置为 disbanded", () => adminUpdateTeam(team.id, { status: "disbanded" }));
+    await rejects("后台不认无效状态", () => adminUpdateTeam(team.id, { status: "frozen" }));
+    check("被拒后团队仍是 active", (await repo(Team).findOneByOrFail({ id: team.id })).status, "active");
+    check("被拒后成员一个没少", await repo(TeamMember).countBy({ teamId: team.id }), 2);
+    check("被拒后画布归属仍在", (await repo(Project).findOneByOrFail({ userId: "user-back-owner", projectId: "pb-1" })).teamId, team.id);
+
+    check("后台可以停用", (await adminUpdateTeam(team.id, { status: "disabled" })).status, "disabled");
+    check("后台可以恢复", (await adminUpdateTeam(team.id, { status: "active" })).status, "active");
+
+    // 成员上限同样不能被 `Number(x) || 0` 折成 0——0 在这里的语义是「不限」，等于悄悄拆掉了上限。
+    await repo(Team).update({ id: team.id }, { memberLimit: 5 });
+    for (const bogus of ["abc", -1, 2.5, Number.POSITIVE_INFINITY, 100_001]) await rejects(`成员上限 ${String(bogus)} 被拒`, () => adminUpdateTeam(team.id, { memberLimit: bogus }));
+    check("被拒后成员上限没有被清零", (await repo(Team).findOneByOrFail({ id: team.id })).memberLimit, 5);
+    check("合法成员上限能改", (await adminUpdateTeam(team.id, { memberLimit: 20 })).memberLimit, 20);
+
+    // 后台改名走的必须是前台那套 normalize：绕过它的话超长名字会在数据库层被静默截断。
+    check("后台改名同样截断到 64 字", (await adminUpdateTeam(team.id, { name: "长".repeat(80) })).name.length, 64);
+    check("空名字保持原样而不是清空", (await adminUpdateTeam(team.id, { name: "   " })).name.length, 64);
+
+    // 积分：畸形请求必须 400。折成 0 的话，一次拼错字段名就把整个团队池清空了，事后从流水里也看不出本意。
+    await repo(Team).update({ id: team.id }, { credits: 300 });
+    for (const bogus of ["abc", -1, 1.5, Number.NaN, null, 1_000_000_001, undefined]) await rejects(`积分 ${String(bogus)} 被拒`, () => adminSetTeamCredits(team.id, bogus, "畸形"));
+    check("被拒后团队池没有被清零", (await repo(Team).findOneByOrFail({ id: team.id })).credits, 300);
+    check("合法积分能设", (await adminSetTeamCredits(team.id, 800, "验证")).credits, 800);
+    check("显式设成 0 仍然允许", (await adminSetTeamCredits(team.id, 0, "清零")).credits, 0);
+
+    // 解散过的团队没有成员也没有入口，后台再改它只会在列表上留下误导性的活跃感。
+    await disbandTeam(team.id, "user-back-owner");
+    await rejects("已解散的团队后台改不动", () => adminUpdateTeam(team.id, { status: "active" }));
+}
+
+/**
+ * SSE 的 ready 与事件的先后。订阅在鉴权之前完成，所以这段 await 窗口里发生的余额变化
+ * 必须排在 ready 之后再放行：直接写出去的话顺序变成「新余额、旧快照」，
+ * 客户端最后停在旧值上，而且它没有任何理由怀疑这个数。
+ */
+async function readySequencing({ check }: { check: (name: string, actual: unknown, expected: unknown) => void }) {
+    const { createBufferedWriter } = await import("./src/lib/sse");
+
+    console.log("SSE ready 竞态");
+    const written: unknown[] = [];
+    const stream = createBufferedWriter((event) => written.push(event));
+    stream.push({ type: "team.credits", credits: 200 });
+    check("ready 之前的事件先进缓冲", written.length, 0);
+    check("缓冲里确实攒着一条", stream.pending, 1);
+    stream.flush({ type: "ready", credits: 100 });
+    check("ready 排在最前", (written[0] as { type: string }).type, "ready");
+    check("窗口期事件随后补发", (written[1] as { credits: number }).credits, 200);
+    check("客户端最终看到的是新余额", (written[written.length - 1] as { credits: number }).credits, 200);
+
+    stream.push({ type: "team.credits", credits: 300 });
+    check("flush 之后转为直写", written.length, 3);
+    stream.flush({ type: "ready", credits: 999 });
+    check("重复 flush 不会再发一次 ready", written.filter((event) => (event as { type: string }).type === "ready").length, 1);
+
+    // 多条事件必须按到达顺序补发：乱序的话，客户端会把中间某个旧值当成最终余额。
+    const ordered: number[] = [];
+    const many = createBufferedWriter((event) => ordered.push((event as { credits: number }).credits));
+    for (const credits of [1, 2, 3]) many.push({ credits });
+    many.flush({ credits: 0 });
+    check("缓冲按到达顺序 flush", ordered, [0, 1, 2, 3]);
 }
 
 /**

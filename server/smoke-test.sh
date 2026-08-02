@@ -1600,6 +1600,7 @@ JOIN_CODE=$(echo "$CODE_INVITE" | jq -r .data.code)
 check "手输码长度为 10" "$(printf '%s' "$JOIN_CODE" | wc -c | tr -d ' ')" "10"
 
 check "第二个用户用链接加入" "$(curl -s -X POST "$BASE/v1/team-invites/$INVITE_TOKEN/accept" -H "Authorization: Bearer $MEMBER_TOKEN" | jq -r .data.role)" "member"
+MEMBER_ID=$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $MEMBER_TOKEN" | jq -r .data.id)
 check "成员列表有两个人" "$(curl -s "$BASE/v1/teams/$TEAM_ID/members" -H "Authorization: Bearer $USER_TOKEN" | jq '.data | length')" "2"
 check "member 无权看全员流水" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams/$TEAM_ID/credit-logs" -H "Authorization: Bearer $MEMBER_TOKEN")" "403"
 check "member 可以看自己的流水" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams/$TEAM_ID/credit-logs/mine" -H "Authorization: Bearer $MEMBER_TOKEN")" "200"
@@ -1617,6 +1618,22 @@ check "团队 owner 也访问不了平台后台" "$(curl -s -o /dev/null -w '%{h
 TOPUP=$(curl -s -X POST "$BASE/admin/teams/$TEAM_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" \
     -H 'Content-Type: application/json' -d '{"credits":500,"remark":"冒烟充值"}')
 check "管理员调整团队积分" "$(echo "$TOPUP" | jq -r .data.credits)" "500"
+# 畸形积分必须是一次失败，而不是被 Number(x)||0 解释成「把团队池清零」：
+# 清零不可逆，事后从流水里也看不出这次请求本来想改成多少。
+check "非数字积分被拒" "$(curl -s -X POST "$BASE/admin/teams/$TEAM_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":"abc"}' | jq -r .code)" "TEAM_CREDITS_INVALID"
+check "负数积分被拒" "$(curl -s -X POST "$BASE/admin/teams/$TEAM_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":-5}' | jq -r .code)" "TEAM_CREDITS_INVALID"
+check "缺字段不当作清零" "$(curl -s -X POST "$BASE/admin/teams/$TEAM_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"remark":"漏传"}' | jq -r .code)" "TEAM_CREDITS_INVALID"
+check "被拒后团队池纹丝不动" "$(curl -s "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.credits)" "500"
+# 后台只有启用/停用两档。放行 disbanded 只会改一列状态，成员、邀请、画布归属全留在原地，
+# 画布的付费方解析从此永远卡在「团队不可用」，主人既花不了钱也没有入口解绑。
+check "后台不能解散团队" "$(curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"status":"disbanded"}' | jq -r .code)" "TEAM_STATUS_INVALID"
+check "被拒后团队仍然活着" "$(curl -s "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.status)" "active"
+check "被拒后成员一个没少" "$(curl -s "$BASE/admin/teams/$TEAM_ID/members" -H "Authorization: Bearer $ADMIN_TOKEN" | jq '.data | length')" "2"
+check "非法成员上限被拒" "$(curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"memberLimit":"abc"}' | jq -r .code)" "TEAM_MEMBER_LIMIT_INVALID"
+# 角色白名单：矩阵里没有的角色写进库就是一条谁也判不了的成员记录，这个人处处被拒却没有规则能解释。
+check "非法成员角色被拒" "$(curl -s -X PATCH "$BASE/v1/teams/$TEAM_ID/members/$MEMBER_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"boss"}' | jq -r .code)" "TEAM_ROLE_INVALID"
+check "非法额度上限被拒" "$(curl -s -X PATCH "$BASE/v1/teams/$TEAM_ID/members/$MEMBER_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"creditLimit":"abc"}' | jq -r .code)" "TEAM_CREDIT_LIMIT_INVALID"
+check "被拒后成员角色未变" "$(curl -s "$BASE/v1/teams/$TEAM_ID/members" -H "Authorization: Bearer $USER_TOKEN" | jq -r --arg id "$MEMBER_ID" '.data[] | select(.userId==$id) | .role')" "member"
 check "调整写入团队流水" "$(curl -s "$BASE/v1/teams/$TEAM_ID/credit-logs" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.items[0].type')" "admin_adjust"
 check "团队流水不污染个人流水页" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="冒烟充值")] | length')" "0"
 check "全平台团队流水查得到这一笔" "$(curl -s "$BASE/admin/team-credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="冒烟充值")] | length')" "1"
