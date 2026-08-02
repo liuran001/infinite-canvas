@@ -25,6 +25,11 @@ function check(name, ok, detail = "") {
     }
 }
 
+/** 元素可能压根不存在，isVisible() 会抛；统一收敛成布尔，断言才不会因为一次异常整体崩掉。 */
+function isVisible(locator) {
+    return locator.isVisible().catch(() => false);
+}
+
 async function main() {
     const browser = await chromium.launch(EXECUTABLE ? { executablePath: EXECUTABLE } : {});
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -51,7 +56,8 @@ async function main() {
         await page.waitForTimeout(600);
     };
     // 忽略与本次改动无关的噪音（favicon、devtools、第三方图片 CDN）
-    const realErrors = () => errors.filter((e) => !/favicon|DevTools|net::ERR_(NAME_NOT_RESOLVED|CONNECTION)|jsdelivr|githubusercontent/i.test(e));
+    // 400 是几条断言故意造出来的（无效邀请链接等），它们本来就该被服务端拒绝，不是运行时故障。
+    const realErrors = () => errors.filter((e) => !/favicon|DevTools|net::ERR_(NAME_NOT_RESOLVED|CONNECTION)|jsdelivr|githubusercontent|status of 400/i.test(e));
 
     console.log("公开页面");
     await visit("/", "h1");
@@ -111,7 +117,11 @@ async function main() {
         if (agentSettings.image) {
             check("偏好设置里有 Agent 默认生图模型", (await page.getByRole("combobox", { name: "选择 Agent 默认生图模型" }).count()) > 0);
             const imageFields = await Promise.all(["Agent 默认生图尺寸", "Agent 默认生图画质", "Agent 默认生图张数", "Agent 默认生图背景"].map((label) => page.getByText(label, { exact: true }).count()));
-            check("偏好设置里有 Agent 默认生图参数", imageFields.every((count) => count > 0), `各项匹配数 ${JSON.stringify(imageFields)}`);
+            check(
+                "偏好设置里有 Agent 默认生图参数",
+                imageFields.every((count) => count > 0),
+                `各项匹配数 ${JSON.stringify(imageFields)}`,
+            );
         }
         check("偏好设置无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
     }
@@ -199,6 +209,126 @@ async function main() {
     await visit("/");
     const leftover = await page.locator('head meta[name="robots"]').count();
     check("离开分享页后清理 robots meta", leftover === 0);
+
+    console.log("团队前台");
+    // check(名称, 是否通过, 失败详情)：这里统一把断言写成布尔比较，
+    // 传一个非空字符串或数字进去会被当成「通过」，等于这条断言从此再也失败不了。
+    await visit("/teams");
+    check("团队列表页可打开", await isVisible(page.getByText("我的团队").first()));
+    check("无团队时显示创建引导", await isVisible(page.getByRole("button", { name: /创建团队/ }).first()));
+    check("提供手输邀请码入口", await isVisible(page.getByPlaceholder(/邀请码/).first()));
+
+    await page
+        .getByRole("button", { name: /创建团队/ })
+        .first()
+        .click();
+    await page.getByLabel("团队名称").fill("UI 验证团队");
+    // antd 会在两个汉字的按钮里插一个空格，可访问名因此是「确 定」，写死两字会永远等不到。
+    await page.getByRole("button", { name: /确\s*定/ }).click();
+    await page.waitForURL(/\/teams\/team-/, { timeout: 15000 }).catch(() => {});
+    const uiTeamId = new URL(page.url()).pathname.split("/")[2] || "";
+    check("创建后进入团队详情", await isVisible(page.getByText("UI 验证团队").first()), `当前地址 ${page.url()}`);
+    check("详情页展示团队积分", await isVisible(page.getByText(/团队积分/).first()));
+
+    await page.getByRole("link", { name: "成员" }).click();
+    await page.waitForTimeout(800);
+    check("成员页展示自己为 owner", await isVisible(page.getByText("owner").first()));
+
+    await page.getByRole("link", { name: "邀请" }).click();
+    await page.waitForTimeout(800);
+    await page
+        .getByRole("button", { name: /生成邀请链接/ })
+        .first()
+        .click();
+    await page.waitForTimeout(1000);
+    check("生成后展示可复制的完整链接", await isVisible(page.getByRole("button", { name: /复制链接/ }).first()));
+    await page.keyboard.press("Escape");
+    await page
+        .getByRole("button", { name: /生成邀请码/ })
+        .first()
+        .click();
+    await page.waitForTimeout(1000);
+    const inviteCode = await page
+        .getByTestId("team-invite-code")
+        .first()
+        .innerText()
+        .catch(() => "");
+    check("邀请码常驻可见", inviteCode.trim().length === 10, `当前值「${inviteCode.trim()}」`);
+
+    await visit("/join/not-a-real-token");
+    check("无效邀请链接给出明确提示", await isVisible(page.getByText(/邀请链接无效或已失效/).first()));
+    check("团队页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+
+    console.log("余额实时同步与回落开关");
+    await visit("/config");
+    const fallback = page.getByRole("switch", { name: /团队积分用尽时/ });
+    check("设置页存在回落开关", await isVisible(fallback.first()));
+    check("回落开关默认关闭", (await fallback.first().getAttribute("aria-checked")) === "false");
+    await fallback.first().click();
+    // 偏好推送带 2 秒防抖，等不够就会在还没写到服务端时刷新，看到的自然还是旧值。
+    await page.waitForTimeout(4000);
+    await visit("/config");
+    const persisted = await page
+        .getByRole("switch", { name: /团队积分用尽时/ })
+        .first()
+        .getAttribute("aria-checked");
+    check("回落开关状态被持久化", persisted === "true", `当前值 ${persisted}`);
+    await page
+        .getByRole("switch", { name: /团队积分用尽时/ })
+        .first()
+        .click();
+    await page.waitForTimeout(800);
+
+    if (uiTeamId) {
+        // 充值只有平台管理员能做，这里单独换一次管理员令牌；下面的团队页仍然停留在普通用户的登录态。
+        const teamAdminToken = await page.evaluate(
+            async ([api, username, password]) => {
+                const response = await fetch(`${api}/api/admin/login`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ username, password }),
+                });
+                return (await response.json()).data?.token || "";
+            },
+            [API, process.env.UI_ADMIN || "admin", process.env.UI_ADMIN_PASSWORD || "infinite-canvas"],
+        );
+        // 团队详情页挂着一条常驻 SSE，networkidle 永远不会到，这里只等 DOM。
+        errors.length = 0;
+        await page.goto(`${WEB}/teams/${uiTeamId}`, { waitUntil: "domcontentloaded", timeout: 45000 });
+        await page.waitForTimeout(2500);
+        const before = await page
+            .getByTestId("team-credits")
+            .first()
+            .innerText()
+            .catch(() => "");
+        // 直接从后端充值，页面不刷新，验证 SSE 真的把新余额推了下来。
+        const topped = await page.evaluate(
+            async ([api, id, token]) => {
+                const response = await fetch(`${api}/api/admin/teams/${id}/credits`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                    body: JSON.stringify({ credits: 777, remark: "UI 实时验证" }),
+                });
+                return response.ok;
+            },
+            [API, uiTeamId, teamAdminToken],
+        );
+        const pushed = topped
+            ? await page
+                  .waitForFunction((prev) => document.querySelector('[data-testid="team-credits"]')?.textContent !== prev, before, { timeout: 8000 })
+                  .then(() => true)
+                  .catch(() => false)
+            : false;
+        const after = await page
+            .getByTestId("team-credits")
+            .first()
+            .innerText()
+            .catch(() => "");
+        check("余额未刷新页面即更新", pushed && after.includes("777"), `充值 ${topped}，充值前「${before.trim()}」，充值后「${after.trim()}」`);
+        check("团队详情页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+    } else {
+        check("余额未刷新页面即更新", false, "没有拿到 UI 验证团队 id");
+    }
 
     console.log("管理后台");
     // 凭据要当参数传进去：evaluate 的回调跑在浏览器里，那边没有 process。

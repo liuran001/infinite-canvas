@@ -1,4 +1,4 @@
-import { FileText, ImagePlus, Images, Maximize2, Video } from "lucide-react";
+import { FileText, ImagePlus, Images, Maximize2, Users, Video } from "lucide-react";
 
 import type { ModelCapability } from "@/stores/use-config-store";
 
@@ -31,6 +31,11 @@ export const navigationTools: ReadonlyArray<{ slug: string; label: string; icon:
         label: "我的资产",
         icon: Images,
     },
+    {
+        slug: "teams",
+        label: "我的团队",
+        icon: Users,
+    },
 ];
 
-export type NavigationToolSlug = "canvas" | "image" | "video" | "prompts" | "assets" | "config";
+export type NavigationToolSlug = "canvas" | "image" | "video" | "prompts" | "assets" | "teams" | "config";
