@@ -41,6 +41,8 @@ const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
 type PersistedCanvasState = Pick<CanvasStore, "projects">;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let queuedPersistState: PersistedCanvasState | null = null;
+const applyingRemoteProjects = new Set<string>();
+const remoteProjectListeners = new Set<(project: CanvasProject) => void>();
 
 const canvasStorage: PersistStorage<CanvasStore> = {
     getItem: async (name) => {
@@ -124,7 +126,7 @@ export const useCanvasStore = create<CanvasStore>()(
                 set((state) => ({
                     projects: state.projects.map((project) => (project.id === id ? { ...project, title: title.trim() || project.title, updatedAt: new Date().toISOString() } : project)),
                 }));
-                pushRemote(get().projects.find((project) => project.id === id));
+                if (!applyingRemoteProjects.has(id)) pushRemote(get().projects.find((project) => project.id === id));
             },
             deleteProjects: (ids) => {
                 set((state) => {
@@ -139,7 +141,7 @@ export const useCanvasStore = create<CanvasStore>()(
                     projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch, updatedAt: new Date().toISOString() } : project)),
                 }));
                 // 平移缩放画布只改 viewport，不值得为此上传整份项目 JSON，等有内容改动再推。
-                if (Object.keys(patch).some((key) => key !== "viewport")) pushRemote(get().projects.find((project) => project.id === id));
+                if (!applyingRemoteProjects.has(id) && Object.keys(patch).some((key) => key !== "viewport")) pushRemote(get().projects.find((project) => project.id === id));
             },
         }),
         {
@@ -155,6 +157,28 @@ export const useCanvasStore = create<CanvasStore>()(
         },
     ),
 );
+
+export function applyRemoteProject(project: CanvasProject) {
+    applyingRemoteProjects.add(project.id);
+    useCanvasStore.setState((state) => ({
+        projects: state.projects.some((item) => item.id === project.id) ? state.projects.map((item) => (item.id === project.id ? project : item)) : [project, ...state.projects],
+    }));
+    remoteProjectListeners.forEach((listener) => listener(project));
+}
+
+/** 画布页处理完 React state 后显式释放，不能靠 microtask 猜 React 什么时候提交。 */
+export function finishApplyingRemoteProject(id: string) {
+    applyingRemoteProjects.delete(id);
+}
+
+export function onRemoteProjectApplied(listener: (project: CanvasProject) => void) {
+    remoteProjectListeners.add(listener);
+    return () => { remoteProjectListeners.delete(listener); };
+}
+
+export function isApplyingRemoteProject(id: string) {
+    return applyingRemoteProjects.has(id);
+}
 
 /**
  * 挑出这些节点里已经不在画布上的（用户引用了某个节点之后又把它删了）。

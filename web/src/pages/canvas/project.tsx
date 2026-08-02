@@ -43,8 +43,10 @@ import { IMAGE_FILE_ACCEPT, isImageFile } from "@/lib/image-transcode";
 import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
 import { CLOUD_AGENT_DROP_SELECTOR, CLOUD_AGENT_IMAGE_MIME } from "@/components/agent/cloud-agent-references";
 import { isServerMode, useIsServerMode, useServerStore } from "@/stores/use-server-store";
-import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { finishApplyingRemoteProject, onRemoteProjectApplied, useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { pullProject } from "@/services/remote-sync";
+import { createPresenceReporter, watchProject } from "@/services/project-realtime";
+import { useProjectPresenceStore } from "@/stores/use-project-presence-store";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
@@ -209,6 +211,7 @@ function InfiniteCanvasPage() {
     const isServerModeReady = useIsServerMode();
     const serverToken = useServerStore((state) => state.token);
     const cloudAgentEnabled = useServerStore((state) => Boolean(state.settings?.agent.enabled));
+    const remotePresence = useProjectPresenceStore((state) => (state.projectId === projectId ? state.members : []));
     const appliedCanvasReloadRef = useRef(0);
     const canvasReloadRetryRef = useRef(0);
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
@@ -257,6 +260,7 @@ function InfiniteCanvasPage() {
     const [isNodeDragging, setIsNodeDragging] = useState(false);
     const [dropTargetGroupId, setDropTargetGroupId] = useState<string | null>(null);
 
+    const presenceReporterRef = useRef<ReturnType<typeof createPresenceReporter> | null>(null);
     const nodesRef = useRef(nodes);
     const connectionsRef = useRef(connections);
     const selectedNodeIdsRef = useRef(selectedNodeIds);
@@ -415,6 +419,59 @@ function InfiniteCanvasPage() {
             cancelled = true;
         };
     }, [hydrated, isServerModeReady, navigate, openProject, projectId, serverToken]);
+
+    useEffect(() => {
+        if (!projectLoaded) return;
+        return onRemoteProjectApplied((project) => {
+            if (project.id !== projectId) return;
+            void Promise.all([hydrateCanvasImages(project.nodes), hydrateAssistantImages(project.chatSessions || [])]).then(([nextNodes, nextSessions]) => {
+                setNodes(nextNodes);
+                setConnections(project.connections);
+                setChatSessions(nextSessions);
+                setActiveChatId(project.activeChatId || null);
+                setBackgroundMode(project.backgroundMode);
+                setShowImageInfo(project.showImageInfo || false);
+                setTimeout(() => finishApplyingRemoteProject(projectId), 0);
+            });
+        });
+    }, [projectId, projectLoaded]);
+
+    useEffect(() => {
+        if (!projectLoaded || !isServerModeReady) return;
+        const controller = new AbortController();
+        const reporter = createPresenceReporter(projectId);
+        presenceReporterRef.current = reporter;
+        watchProject(
+            projectId,
+            {
+                onProject: () => {
+                    const project = useCanvasStore.getState().openProject(projectId);
+                    if (!project) return;
+                    void Promise.all([hydrateCanvasImages(project.nodes), hydrateAssistantImages(project.chatSessions || [])]).then(([nextNodes, nextSessions]) => {
+                        setNodes(nextNodes);
+                        setConnections(project.connections);
+                        setChatSessions(nextSessions);
+                        setActiveChatId(project.activeChatId || null);
+                        setBackgroundMode(project.backgroundMode);
+                        setShowImageInfo(project.showImageInfo || false);
+                    });
+                },
+                onDeleted: () => navigate("/canvas", { replace: true }),
+            },
+            controller.signal,
+        );
+        return () => {
+            controller.abort();
+            reporter.dispose();
+            presenceReporterRef.current = null;
+            useProjectPresenceStore.getState().clear();
+        };
+    }, [isServerModeReady, navigate, projectId, projectLoaded]);
+
+    useEffect(() => {
+        if (!projectLoaded || !isServerModeReady) return;
+        presenceReporterRef.current?.update([...selectedNodeIds], isNodeDragging ? "editing" : selectedNodeIds.size ? "selecting" : "idle");
+    }, [isNodeDragging, isServerModeReady, projectLoaded, selectedNodeIds]);
 
     // 云端 Agent 的会话按画布归属，进入画布就绑定：面板没打开也会挂上事件流，
     // agent 在后台改画布时画面才能实时刷新。登录态与服务端配置是异步就绪的，就绪后要再绑一次。
@@ -669,6 +726,12 @@ function InfiniteCanvasPage() {
 
         return nodes.filter((node) => !isHiddenBatchChild(node, nodes, collapsingBatchIds) && node.position.x + node.width > viewLeft && node.position.x < viewRight && node.position.y + node.height > viewTop && node.position.y < viewBottom);
     }, [collapsingBatchIds, nodes, size.height, size.width, viewport.k, viewport.x, viewport.y]);
+
+    const remotePresenceByNodeId = useMemo(() => {
+        const map = new Map<string, typeof remotePresence>();
+        remotePresence.forEach((member) => member.nodeIds.forEach((nodeId) => map.set(nodeId, [...(map.get(nodeId) || []), member])));
+        return map;
+    }, [remotePresence]);
 
     const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
     // 工具条跟随「单选节点」:点击/新建/框选/键盘选中任一节点都会显示,不再仅靠精确点中触发。
@@ -3006,6 +3069,7 @@ function InfiniteCanvasPage() {
                             key={node.id}
                             data={node}
                             scale={viewport.k}
+                            remoteEditors={remotePresenceByNodeId.get(node.id) || []}
                             isSelected={selectedNodeIds.has(node.id)}
                             isRelated={relatedHighlight.nodeIds.has(node.id)}
                             isFocusRelated={activeNodeId === node.id || cloudReferenceNodeId === node.id}

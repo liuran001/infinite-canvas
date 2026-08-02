@@ -1,7 +1,8 @@
-import { serverApi, type ServerProject, type ServerUserAsset } from "@/services/api/server";
+import { ServerApiError, serverApi, type ServerProject, type ServerUserAsset } from "@/services/api/server";
+import { mergeProjectSnapshots } from "@/services/project-merge";
 import { resolveMediaUrl } from "@/services/file-storage";
 import { resolveImageUrl } from "@/services/image-storage";
-import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
+import { applyRemoteProject, type CanvasProject } from "@/stores/canvas/use-canvas-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import type { InstalledPlugin } from "@/stores/canvas/use-plugin-store";
 import { usePluginStore } from "@/stores/canvas/use-plugin-store";
@@ -23,6 +24,18 @@ let running = 0;
 let projectSync: Promise<unknown> | null = null;
 let assetSync: Promise<unknown> | null = null;
 let pluginSync: Promise<unknown> | null = null;
+const projectSaves = new Map<string, { inflight: boolean; dirty: boolean; retries: number; base: CanvasProject | null }>();
+const confirmedProjects = new Map<string, CanvasProject>();
+
+/** 每个标签页都有独立身份；模块单例保证同一标签页内列表页和画布页共用。 */
+const projectClientId = `tab_${crypto.randomUUID().replaceAll("-", "")}`;
+export function getProjectClientId() {
+    return projectClientId;
+}
+
+export function cancelProjectPush(id: string) {
+    cancel(`project:${id}`);
+}
 
 function cancel(key: string) {
     clearTimeout(timers.get(key));
@@ -103,7 +116,7 @@ export function pushUserAsset(asset: Asset) {
 export function removeRemoteProject(id: string) {
     if (!isServerMode()) return;
     cancel(`project:${id}`);
-    pump(() => serverApi.deleteProject(id).catch((error) => console.warn("删除云端画布失败", error)));
+    pump(() => serverApi.deleteProject(id, projectClientId).catch((error) => console.warn("删除云端画布失败", error)));
 }
 
 export function removeRemoteUserAsset(id: string) {
@@ -129,29 +142,54 @@ export function pushPreferences() {
     schedule("preferences", flushPreferences);
 }
 
-/** 推送时重新读一遍最新状态，防抖期间的连续编辑都会包含进来。 */
+/** 同一项目只允许一个 PUT 在途；在途期间的修改置 dirty，成功后立即补发最新快照。 */
 async function flushProject(id: string) {
+    const state = projectSaves.get(id) || { inflight: false, dirty: false, retries: 0, base: null };
+    projectSaves.set(id, state);
+    if (state.inflight) {
+        state.dirty = true;
+        return;
+    }
     const project = useCanvasStore.getState().projects.find((item) => item.id === id);
     if (!project || !isServerMode()) return;
-    // 云端 Agent 正在改这个画布时不推本地快照：本地这份是它改之前的状态，推上去会把 agent 的改动顶掉。
-    // 跑完之后画布页会拉一次远程并回写，改动照样会同步上去。
     const cloudAgent = useCloudAgentStore.getState();
     if (cloudAgent.status === "running" && cloudAgent.projectId === id) return;
-    const store = useServerStore.getState();
-    store.setSyncState("saving");
+    state.inflight = true;
+    state.dirty = false;
+    state.base ||= confirmedProjects.get(id) || project;
+    useServerStore.getState().setSyncState("saving");
     try {
-        const saved = await serverApi.saveProject(id, { title: project.title, data: project, revision: project.revision });
-        useCanvasStore.setState((state) => ({ projects: state.projects.map((item) => (item.id === id ? { ...item, revision: saved.revision, updatedAt: saved.updatedAt } : item)) }));
+        const saved = await serverApi.saveProject(id, { title: project.title, data: project, revision: project.revision || 0, clientId: projectClientId });
+        const current = useCanvasStore.getState().projects.find((item) => item.id === id);
+        if (current) {
+            useCanvasStore.setState((store) => ({ projects: store.projects.map((item) => (item.id === id ? { ...item, revision: saved.revision, updatedAt: saved.updatedAt } : item)) }));
+            state.base = { ...project, revision: saved.revision, updatedAt: saved.updatedAt };
+            confirmedProjects.set(id, state.base);
+        }
+        state.retries = 0;
         useServerStore.getState().setSyncState("saved");
     } catch (error) {
-        console.warn("推送云端画布失败", error);
-        // 冲突不是网络问题，重新拉一次以远程为准即可，不必吓用户。
-        if (isConflict(error)) {
-            useServerStore.getState().setSyncState("saved");
-            void syncProjects();
-            return;
+        if (error instanceof ServerApiError && error.code === "REVISION_CONFLICT" && error.data && state.base && state.retries < 3) {
+            const conflictProject = error.data as ServerProject;
+            state.retries += 1;
+            const local = useCanvasStore.getState().projects.find((item) => item.id === id);
+            if (local) {
+                const remote = toProject(conflictProject);
+                const merged = mergeProjectSnapshots(state.base, local, remote);
+                applyRemoteProject(merged);
+                state.base = remote;
+                state.dirty = true;
+            }
+        } else {
+            console.warn("推送云端画布失败", error);
+            useServerStore.getState().setSyncState("failed", error instanceof Error ? error.message : "同步失败");
         }
-        useServerStore.getState().setSyncState("failed", error instanceof Error ? error.message : "同步失败");
+    } finally {
+        state.inflight = false;
+        if (state.dirty) {
+            state.dirty = false;
+            void flushProject(id);
+        }
     }
 }
 
@@ -275,10 +313,9 @@ export async function pullProject(id: string) {
     // 先取消本地待推送的防抖任务，否则刚覆盖完又会被旧状态推回服务端。
     cancel(`project:${id}`);
     const project = toProject(item);
+    confirmedProjects.set(id, project);
     // 本地可能压根没有这张画布（换设备、或直接打开画布链接），这时要补进列表而不是只替换。
-    useCanvasStore.setState((state) => ({
-        projects: state.projects.some((current) => current.id === id) ? state.projects.map((current) => (current.id === id ? project : current)) : [project, ...state.projects],
-    }));
+    applyRemoteProject(project);
     return project;
 }
 

@@ -63,11 +63,28 @@ export type ServerAgentEvent = { type: "message"; message: ServerAgentMessage } 
 export type ServerJobEvent = { type: "job"; seq: number; job: ServerJob } | { type: "text"; id: string; offset: number; text: string } | { type: "ready"; seq: number };
 
 export type ServerProject = { id: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
+export type ServerProjectPresence = { clientId: string; principalId: string; displayName: string; avatarUrl: string; color: string; nodeIds: string[]; activity: "idle" | "selecting" | "editing"; updatedAt: string };
+export type ServerProjectEvent =
+    | { type: "project.saved"; projectId: string; revision: number; writerClientId: string }
+    | { type: "project.deleted"; projectId: string; revision: number; writerClientId: string }
+    | { type: "presence.sync"; projectId: string; members: ServerProjectPresence[] }
+    | { type: "ready"; revision: number; members: ServerProjectPresence[] };
 export type ServerUserAsset = { id: string; kind: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerUserPlugin = { id: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerPasskey = { id: string; name: string; createdAt: string };
 
-type ApiEnvelope<T> = { code: number; data: T; msg: string };
+type ApiEnvelope<T> = { code: string | number; data: T; msg: string };
+
+export class ServerApiError<T = unknown> extends Error {
+    constructor(
+        message: string,
+        readonly status: number,
+        readonly code: string | number,
+        readonly data: T | null,
+    ) {
+        super(message);
+    }
+}
 
 export function serverBaseUrl() {
     return useServerStore.getState().baseUrl;
@@ -102,7 +119,7 @@ async function readEnvelope<T>(response: Response, fallback: string): Promise<T>
     } catch {
         throw new Error(response.ok ? `${fallback}：服务端返回了无法解析的内容` : `${fallback}（HTTP ${response.status}）`);
     }
-    if (!response.ok || payload.code !== 0) throw new Error(payload.msg || `${fallback}（HTTP ${response.status}）`);
+    if (!response.ok || payload.code !== 0) throw new ServerApiError(payload.msg || `${fallback}（HTTP ${response.status}）`, response.status, payload.code, payload.data ?? null);
     return payload.data;
 }
 
@@ -176,8 +193,11 @@ export const serverApi = {
 
     projects: (since = "") => serverRequest<{ items: ServerProject[] }>(`/v1/projects${since ? `?since=${encodeURIComponent(since)}` : ""}`, {}, "读取云端画布失败"),
     project: (id: string) => serverRequest<ServerProject>(`/v1/projects/${id}`, {}, "读取云端画布失败"),
-    saveProject: (id: string, body: { title: string; data: unknown; revision?: number }) => serverRequest<ServerProject>(`/v1/projects/${id}`, { method: "PUT", ...jsonBody(body) }, "保存云端画布失败"),
-    deleteProject: (id: string) => serverRequest<boolean>(`/v1/projects/${id}`, { method: "DELETE" }, "删除云端画布失败"),
+    saveProject: (id: string, body: { title: string; data: unknown; revision: number; clientId: string }) => serverRequest<ServerProject>(`/v1/projects/${id}`, { method: "PUT", ...jsonBody(body) }, "保存云端画布失败"),
+    deleteProject: (id: string, clientId: string) => serverRequest<boolean>(`/v1/projects/${id}`, { method: "DELETE", headers: { "X-Client-Id": clientId } }, "删除云端画布失败"),
+    updateProjectPresence: (id: string, body: { clientId: string; nodeIds: string[]; activity: ServerProjectPresence["activity"] }) =>
+        serverRequest<{ members: ServerProjectPresence[] }>(`/v1/projects/${id}/presence`, { method: "POST", ...jsonBody(body) }, "更新协作状态失败"),
+    removeProjectPresence: (id: string, clientId: string) => serverRequest<{ members: ServerProjectPresence[] }>(`/v1/projects/${id}/presence/${encodeURIComponent(clientId)}`, { method: "DELETE" }, "清理协作状态失败"),
 
     userAssets: (since = "") => serverRequest<{ items: ServerUserAsset[] }>(`/v1/user-assets${since ? `?since=${encodeURIComponent(since)}` : ""}`, {}, "读取云端素材失败"),
     saveUserAsset: (id: string, body: { kind: string; title: string; data: unknown; revision?: number }) => serverRequest<ServerUserAsset>(`/v1/user-assets/${id}`, { method: "PUT", ...jsonBody(body) }, "保存云端素材失败"),
@@ -200,6 +220,20 @@ export const serverApi = {
     /** 回应 status 为 awaiting 时挂起的那条请求。批准就接着跑，拒绝就收尾，两种请求共用这一个接口。 */
     resolveAgentSession: (id: string, approved: boolean) => serverRequest<ServerAgentSession>(`/v1/agent/sessions/${id}/resolve`, { method: "POST", ...jsonBody({ approved }) }, "回应 Agent 请求失败"),
 };
+
+export async function serverProjectStream(projectId: string, clientId: string, sinceRevision: number, onEvent: (event: ServerProjectEvent) => void, signal: AbortSignal) {
+    const params = new URLSearchParams({ clientId, sinceRevision: String(sinceRevision) });
+    const response = await fetch(serverApiUrl(`/v1/projects/${encodeURIComponent(projectId)}/realtime?${params}`), { headers: authHeaders({ Accept: "text/event-stream" }), signal }).catch(() => {
+        throw new Error("画布实时连接失败：无法连接服务端，请检查网络");
+    });
+    if (response.status === 401) {
+        useServerStore.getState().clearSession();
+        useServerStore.getState().setLoginOpen(true);
+        throw new Error("登录状态已失效，请重新登录");
+    }
+    if (!response.ok) throw new Error(`画布实时连接失败（HTTP ${response.status}）`);
+    await readServerSse(response, (data) => onEvent(JSON.parse(data) as ServerProjectEvent), "画布实时连接没有返回内容");
+}
 
 /**
  * Agent 事件流。鉴权靠请求头带令牌，EventSource 不支持自定义头，只能自己 fetch + 读流解析 SSE。

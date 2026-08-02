@@ -8,6 +8,7 @@ import { getNodeDefinition } from "@/lib/canvas/node-registry";
 import { buildNodeContext } from "@/lib/canvas/plugin-node-context";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { CanvasResourceMentionTextarea } from "./canvas-resource-mention-textarea";
+import type { ServerProjectPresence } from "@/services/api/server";
 import { CanvasNodeType, type CanvasNodeData, type Position } from "@/types/canvas";
 import type { CanvasNodeContext, CanvasPluginHost } from "@/types/canvas-plugin";
 import type { CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
@@ -19,6 +20,7 @@ type CanvasNodeProps = {
     data: CanvasNodeData;
     scale: number;
     isSelected: boolean;
+    remoteEditors?: ServerProjectPresence[];
     isRelated: boolean;
     isFocusRelated: boolean;
     isConnectionTarget: boolean;
@@ -81,6 +83,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     data,
     scale,
     isSelected,
+    remoteEditors = [],
     isRelated,
     isFocusRelated,
     isConnectionTarget,
@@ -311,6 +314,17 @@ export const CanvasNode = React.memo(function CanvasNode({
             onMouseDownCapture={(event) => onSelectCapture?.(event, data.id)}
             onContextMenu={(event) => onContextMenu(event, data.id)}
         >
+            {remoteEditors.length ? (
+                <>
+                    <div data-remote-presence className="pointer-events-none absolute inset-[-3px] z-[60] rounded-[26px] border-2" style={{ borderColor: remoteEditors[0].color }} />
+                    <div className="pointer-events-none absolute -top-6 left-0 z-[70] flex gap-1 text-[11px] text-white">
+                        {remoteEditors.slice(0, 2).map((editor) => (
+                            <span key={editor.clientId} className="rounded px-1.5 py-0.5" style={{ backgroundColor: editor.color }}>{editor.displayName || "协作者"}</span>
+                        ))}
+                        {remoteEditors.length > 2 ? <span className="rounded bg-slate-600 px-1.5 py-0.5">+{remoteEditors.length - 2}</span> : null}
+                    </div>
+                </>
+            ) : null}
             {(isSelected || hovered || isEditingTitle) && (
                 <div className="absolute left-3 top-[-28px] z-[65] max-w-[calc(100%-24px)]" onMouseDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
                     {isEditingTitle ? (
