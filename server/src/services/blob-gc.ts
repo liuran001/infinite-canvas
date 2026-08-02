@@ -42,3 +42,8 @@ export function startBlobGarbageCollector() {
 export async function markBlobPending(checksum: string) {
     await repo(PhysicalBlob).update({ checksum, refCount: 0, state: "active" }, { state: "pending_delete", pendingSince: now() });
 }
+
+/** 有新引用要挂上来时把待回收 blob 拉回 active，GC 下一轮就不会再看它。 */
+export async function reviveBlob(checksum: string) {
+    await repo(PhysicalBlob).update({ checksum, state: "pending_delete" }, { state: "active", pendingSince: "" });
+}

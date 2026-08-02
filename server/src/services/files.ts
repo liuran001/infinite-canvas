@@ -5,9 +5,9 @@ import mime from "mime-types";
 import { dataSource, repo } from "../db/data-source";
 import { PhysicalBlob, StoredFile } from "../db/entities";
 import { fail, newId, now } from "../lib/errors";
-import { markBlobPending } from "./blob-gc";
+import { markBlobPending, reviveBlob } from "./blob-gc";
 import { assertQuota } from "./quota";
-import { configuredFileStorage, putObject } from "./storage";
+import { configuredFileStorage, deleteObject, putObject } from "./storage";
 
 const IMAGE_MAX_BYTES = 30 << 20;
 const VIDEO_MAX_BYTES = 200 << 20;
@@ -61,7 +61,12 @@ export async function saveFile(userId: string, body: Buffer, mimeType: string, m
     const checksum = createHash("sha256").update(body).digest("hex");
     return withBlobLock(checksum, async () => {
         const existing = await repo(StoredFile).findOneBy({ userId, checksum });
-        if (existing) return existing;
+        if (existing) {
+            // 同用户重复上传命中去重，但物理对象可能因为对账漂移或跨实例删除被标成待回收；
+            // 直接返回会让这个引用等着被 GC 抽走底下的对象，所以先无条件复活。
+            await reviveBlob(checksum);
+            return existing;
+        }
         await assertQuota(userId, body.length);
         const id = newId("file");
         const imageMeta = readImageMeta(body, type);
@@ -73,8 +78,12 @@ export async function saveFile(userId: string, body: Buffer, mimeType: string, m
             const candidate = repo(PhysicalBlob).create({ checksum, bytes: body.length, kind, mimeType: type, width: meta.width || imageMeta.width || 0, height: meta.height || imageMeta.height || 0, durationMs: meta.durationMs || 0, storage, path, refCount: 0, state: "active", pendingSince: "", createdAt: now() });
             await repo(PhysicalBlob).insert(candidate).catch(() => undefined);
             blob = await repo(PhysicalBlob).findOneByOrFail({ checksum });
+            // 多实例同时首传时只有一个 insert 能赢。输家写出的对象没人引用，必须回收；
+            // 但只允许删自己刚写的那个 key，胜出 blob 的 path 一个字节都不能碰。
+            if (blob.path !== path || blob.storage !== storage) await deleteObject(path, storage).catch((error) => console.warn(`并发上传落选对象回收失败 ${storage}:${path}:`, error));
+            if (blob.state === "pending_delete") await reviveBlob(checksum);
         } else if (blob.state === "pending_delete") {
-            await repo(PhysicalBlob).update({ checksum }, { state: "active", pendingSince: "" });
+            await reviveBlob(checksum);
         }
         const file = repo(StoredFile).create({ id, userId, kind: blob.kind, mimeType: blob.mimeType, bytes: Number(blob.bytes), width: blob.width, height: blob.height, durationMs: blob.durationMs, storage: blob.storage, path: blob.path, checksum, createdAt: now() });
         await dataSource.transaction(async (manager) => {

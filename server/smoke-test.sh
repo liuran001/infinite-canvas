@@ -105,6 +105,16 @@ check "文件直链返回正确类型" "$(curl -s -o /dev/null -w '%{content_typ
 check "文件直链支持 Range" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Range: bytes=0-3' "$BASE/files/$FILE_ID/content")" "206"
 SAME_ID=$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $USER_TOKEN" -F "file=@$WORK/tiny.png;type=image/png" | jq -r .data.id)
 check "相同内容重复上传复用记录" "$SAME_ID" "$FILE_ID"
+# 跨用户去重只在 HTTP 层验收「各自 fileId、各自可读、各自照常计费」；
+# refCount、GC、并发这些内部语义由 server/verify-storage.ts 覆盖，放在这里会让 smoke 变得极脆。
+DEDUP_TOKEN=$(curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' -d '{"username":"dedup-user","password":"dedup-pass"}' | jq -r .data.token)
+DEDUP_FILE=$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $DEDUP_TOKEN" -F "file=@$WORK/tiny.png;type=image/png" | jq -r .data.id)
+check "另一个用户上传同内容拿到独立 fileId" "$([ "$DEDUP_FILE" != "null" ] && [ "$DEDUP_FILE" != "$FILE_ID" ] && echo yes || echo no)" "yes"
+check "两个用户的直链都能读" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/files/$DEDUP_FILE/content")$(curl -s -o /dev/null -w '%{http_code}' "$BASE/files/$FILE_ID/content")" "200200"
+check "去重不影响第二个用户的逻辑用量" "$(curl -s "$BASE/v1/storage" -H "Authorization: Bearer $DEDUP_TOKEN" | jq -r .data.used)" "$(stat -c %s "$WORK/tiny.png")"
+curl -s -X DELETE "$BASE/v1/files/$DEDUP_FILE" -H "Authorization: Bearer $DEDUP_TOKEN" >/dev/null
+check "删除一个用户的引用后另一个用户仍可读" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/files/$FILE_ID/content")" "200"
+check "删除后第二个用户用量清零" "$(curl -s "$BASE/v1/storage" -H "Authorization: Bearer $DEDUP_TOKEN" | jq -r .data.used)" "0"
 
 echo "画布项目同步"
 curl -s -X PUT "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"我的画布","revision":0,"clientId":"smoke-client","data":{"nodes":[1,2,3]}}' >/dev/null
