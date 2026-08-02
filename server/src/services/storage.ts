@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 
 import { config } from "../config";
+import type { FileStorage } from "../db/entities";
 import { fail } from "../lib/errors";
 
 export type ObjectRange = { start: number; end: number };
@@ -27,9 +28,10 @@ function s3Key(key: string) {
 }
 
 export const useS3 = config.fileDriver === "s3";
+export const configuredFileStorage = (): FileStorage => (useS3 ? "s3" : "local");
 
-export async function putObject(key: string, body: Buffer, mimeType: string) {
-    if (!useS3) {
+export async function putObject(key: string, body: Buffer, mimeType: string, storage: FileStorage = configuredFileStorage()) {
+    if (storage !== "s3") {
         const target = path.join(localRoot, key);
         await fs.promises.mkdir(path.dirname(target), { recursive: true });
         await fs.promises.writeFile(target, body);
@@ -39,8 +41,8 @@ export async function putObject(key: string, body: Buffer, mimeType: string) {
     await client.send(new PutObjectCommand({ Bucket: config.s3.bucket, Key: s3Key(key), Body: body, ContentType: mimeType }));
 }
 
-export async function getObject(key: string, range?: ObjectRange): Promise<ObjectBody> {
-    if (!useS3) {
+export async function getObject(key: string, range?: ObjectRange, storage: FileStorage = configuredFileStorage()): Promise<ObjectBody> {
+    if (storage !== "s3") {
         const target = path.join(localRoot, key);
         const stat = await fs.promises.stat(target).catch(() => null);
         if (!stat) throw fail("文件不存在");
@@ -56,8 +58,8 @@ export async function getObject(key: string, range?: ObjectRange): Promise<Objec
     return { stream: result.Body as Readable, bytes: Number(result.ContentLength) || 0 };
 }
 
-export async function deleteObject(key: string) {
-    if (!useS3) {
+export async function deleteObject(key: string, storage: FileStorage = configuredFileStorage()) {
+    if (storage !== "s3") {
         await fs.promises.rm(path.join(localRoot, key), { force: true });
         return;
     }

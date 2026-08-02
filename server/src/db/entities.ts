@@ -148,6 +148,26 @@ export class Asset {
     @Column(short) updatedAt!: string;
 }
 
+export type BlobState = "active" | "pending_delete";
+
+/** 全局物理对象。用户归属和配额仍由 StoredFile 表表达。 */
+@Entity("file_blobs")
+export class PhysicalBlob {
+    @PrimaryColumn({ type: "varchar", length: 64 }) checksum!: string;
+    @Column({ type: "bigint", default: 0 }) bytes!: number;
+    @Column({ type: "varchar", length: 32, default: "other" }) kind!: string;
+    @Column({ type: "varchar", length: 128, default: "application/octet-stream" }) mimeType!: string;
+    @Column({ type: "int", default: 0 }) width!: number;
+    @Column({ type: "int", default: 0 }) height!: number;
+    @Column({ type: "int", default: 0 }) durationMs!: number;
+    @Column({ type: "varchar", length: 16, default: "local" }) storage!: FileStorage;
+    @Column({ type: "varchar", length: 512, default: "" }) path!: string;
+    @Column({ type: "int", default: 0 }) refCount!: number;
+    @Index() @Column({ type: "varchar", length: 16, default: "active" }) state!: BlobState;
+    @Column(short) pendingSince!: string;
+    @Index() @Column(short) createdAt!: string;
+}
+
 /** 服务端文件对象，图片、视频、音频与参考素材统一走这里。 */
 @Entity("files")
 export class StoredFile {
@@ -326,4 +346,4 @@ export class AgentMessage {
     @Column(short) createdAt!: string;
 }
 
-export const entities = [User, CreditLog, Setting, InviteCode, InviteUse, Prompt, PromptCategory, Asset, StoredFile, Project, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage];
+export const entities = [User, CreditLog, Setting, InviteCode, InviteUse, Prompt, PromptCategory, Asset, PhysicalBlob, StoredFile, Project, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage];

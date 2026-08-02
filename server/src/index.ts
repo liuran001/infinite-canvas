@@ -6,11 +6,15 @@ import { initDatabase } from "./db/data-source";
 import { publicBaseUrlWarning } from "./routes/files";
 import { resetRunningAgentSessions } from "./services/agent";
 import { ensureDefaultAdmin } from "./services/auth";
+import { startBlobGarbageCollector } from "./services/blob-gc";
+import { migratePhysicalBlobs } from "./services/file-migration";
 import { startJobWorker } from "./services/jobs";
 import { ensurePromptCategories, refreshPromptSyncScheduler } from "./services/prompts";
 
 async function main() {
     await initDatabase();
+    await migratePhysicalBlobs();
+    startBlobGarbageCollector();
     await ensureDefaultAdmin();
     await ensurePromptCategories();
     await refreshPromptSyncScheduler();

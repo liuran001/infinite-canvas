@@ -2,17 +2,19 @@ import { createHash } from "node:crypto";
 import { imageSize } from "image-size";
 import mime from "mime-types";
 
-import { repo } from "../db/data-source";
-import { StoredFile } from "../db/entities";
+import { dataSource, repo } from "../db/data-source";
+import { PhysicalBlob, StoredFile } from "../db/entities";
 import { fail, newId, now } from "../lib/errors";
+import { markBlobPending } from "./blob-gc";
 import { assertQuota } from "./quota";
-import { deleteObject, putObject, useS3 } from "./storage";
+import { configuredFileStorage, putObject } from "./storage";
 
 const IMAGE_MAX_BYTES = 30 << 20;
 const VIDEO_MAX_BYTES = 200 << 20;
 const AUDIO_MAX_BYTES = 30 << 20;
-
 export type FileMeta = { width?: number; height?: number; durationMs?: number };
+const checksumLocks = new Map<string, Promise<void>>();
+const column = (name: string) => dataSource.driver.escape(name);
 
 export function fileKind(mimeType: string) {
     if (mimeType.startsWith("image/")) return "image";
@@ -20,123 +22,98 @@ export function fileKind(mimeType: string) {
     if (mimeType.startsWith("audio/")) return "audio";
     return "other";
 }
-
-function maxBytes(kind: string) {
-    if (kind === "image") return IMAGE_MAX_BYTES;
-    if (kind === "video") return VIDEO_MAX_BYTES;
-    if (kind === "audio") return AUDIO_MAX_BYTES;
-    return IMAGE_MAX_BYTES;
-}
-
-function sizeMessage(kind: string) {
-    if (kind === "video") return "视频超过大小限制，请使用 200MB 以内的文件";
-    if (kind === "audio") return "音频超过大小限制，请使用 30MB 以内的文件";
-    return "图片超过大小限制，请使用 30MB 以内的文件";
-}
-
+function maxBytes(kind: string) { return kind === "video" ? VIDEO_MAX_BYTES : kind === "audio" ? AUDIO_MAX_BYTES : IMAGE_MAX_BYTES; }
+function sizeMessage(kind: string) { return kind === "video" ? "视频超过大小限制，请使用 200MB 以内的文件" : kind === "audio" ? "音频超过大小限制，请使用 30MB 以内的文件" : "图片超过大小限制，请使用 30MB 以内的文件"; }
 function objectKey(id: string, mimeType: string) {
-    const extension = mime.extension(mimeType) || "bin";
     const date = new Date();
-    return `${date.getUTCFullYear()}/${String(date.getUTCMonth() + 1).padStart(2, "0")}/${id}.${extension}`;
+    return `${date.getUTCFullYear()}/${String(date.getUTCMonth() + 1).padStart(2, "0")}/${id}.${mime.extension(mimeType) || "bin"}`;
 }
-
-/** 图片宽高由服务端解析，视频/音频时长解析需要 ffprobe，交由上传方回传。 */
 function readImageMeta(body: Buffer, mimeType: string): FileMeta {
     if (!mimeType.startsWith("image/")) return {};
-    try {
-        const size = imageSize(body);
-        return { width: size.width, height: size.height };
-    } catch {
-        return {};
-    }
+    try { const size = imageSize(body); return { width: size.width, height: size.height }; } catch { return {}; }
+}
+export function imageTypeOf(body: Buffer) { try { return imageSize(body).type || ""; } catch { return ""; } }
+
+export async function withBlobLock<T>(checksum: string, work: () => Promise<T>) {
+    const previous = checksumLocks.get(checksum) || Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const queued = previous.then(() => current);
+    checksumLocks.set(checksum, queued);
+    await previous;
+    try { return await work(); } finally { release(); if (checksumLocks.get(checksum) === queued) checksumLocks.delete(checksum); }
 }
 
-/**
- * 按字节魔数认出图片格式，返回 image-size 的格式名（png / jpg / webp / gif / avif ...），认不出来返回空串。
- * 从外部地址下载的内容只能这样判断：URL 扩展名和响应头都是对方随便写的，
- * 一个改名成 .png 的 HTML 或可执行文件必须在落库之前就被认出来。
- */
-export function imageTypeOf(body: Buffer) {
-    try {
-        return imageSize(body).type || "";
-    } catch {
-        return "";
-    }
+export async function physicalBlobOf(file: StoredFile) {
+    return repo(PhysicalBlob).findOneBy({ checksum: file.checksum });
+}
+export async function storedObjectOf(file: StoredFile) {
+    const blob = await physicalBlobOf(file);
+    return blob ? { path: blob.path, storage: blob.storage } : { path: file.path, storage: file.storage };
 }
 
-/**
- * 写入文件对象。相同内容（同 owner + 同 sha256）直接复用已有记录，
- * 避免同一张参考图反复上传占用存储；命中复用时不产生新增占用，因此不校验配额。
- */
+/** 全局物理去重；每个用户仍获得独立 fileId 和逻辑配额引用。 */
 export async function saveFile(userId: string, body: Buffer, mimeType: string, meta: FileMeta = {}) {
     const type = (mimeType || "application/octet-stream").split(";")[0].trim().toLowerCase() || "application/octet-stream";
     const kind = fileKind(type);
     if (!body.length) throw fail("上传文件为空");
     if (body.length > maxBytes(kind)) throw fail(sizeMessage(kind));
-
-    const files = repo(StoredFile);
     const checksum = createHash("sha256").update(body).digest("hex");
-    const existing = await files.findOneBy({ userId, checksum });
-    if (existing) return existing;
-    await assertQuota(userId, body.length);
-
-    const id = newId("file");
-    const key = objectKey(id, type);
-    await putObject(key, body, type);
-    const imageMeta = readImageMeta(body, type);
-    return files.save({
-        id,
-        userId,
-        kind,
-        mimeType: type,
-        bytes: body.length,
-        width: meta.width || imageMeta.width || 0,
-        height: meta.height || imageMeta.height || 0,
-        durationMs: meta.durationMs || 0,
-        storage: useS3 ? "s3" : "local",
-        path: key,
-        checksum,
-        createdAt: now(),
-    } as StoredFile);
+    return withBlobLock(checksum, async () => {
+        const existing = await repo(StoredFile).findOneBy({ userId, checksum });
+        if (existing) return existing;
+        await assertQuota(userId, body.length);
+        const id = newId("file");
+        const imageMeta = readImageMeta(body, type);
+        let blob = await repo(PhysicalBlob).findOneBy({ checksum });
+        if (!blob) {
+            const storage = configuredFileStorage();
+            const path = objectKey(id, type);
+            await putObject(path, body, type, storage);
+            const candidate = repo(PhysicalBlob).create({ checksum, bytes: body.length, kind, mimeType: type, width: meta.width || imageMeta.width || 0, height: meta.height || imageMeta.height || 0, durationMs: meta.durationMs || 0, storage, path, refCount: 0, state: "active", pendingSince: "", createdAt: now() });
+            await repo(PhysicalBlob).insert(candidate).catch(() => undefined);
+            blob = await repo(PhysicalBlob).findOneByOrFail({ checksum });
+        } else if (blob.state === "pending_delete") {
+            await repo(PhysicalBlob).update({ checksum }, { state: "active", pendingSince: "" });
+        }
+        const file = repo(StoredFile).create({ id, userId, kind: blob.kind, mimeType: blob.mimeType, bytes: Number(blob.bytes), width: blob.width, height: blob.height, durationMs: blob.durationMs, storage: blob.storage, path: blob.path, checksum, createdAt: now() });
+        await dataSource.transaction(async (manager) => {
+            await manager.getRepository(StoredFile).insert(file);
+            await manager.getRepository(PhysicalBlob).createQueryBuilder().update().set({ refCount: () => `${column("refCount")} + 1`, state: "active", pendingSince: "" }).where("checksum = :checksum", { checksum }).execute();
+        });
+        return file;
+    });
 }
 
 export async function saveFileFromDataUrl(userId: string, dataUrl: string, meta?: FileMeta) {
-    const matched = /^data:([^;,]+)?(;base64)?,/.exec(dataUrl);
-    if (!matched) throw fail("图片数据格式不正确");
-    const payload = dataUrl.slice(matched[0].length);
-    const body = matched[2] ? Buffer.from(payload, "base64") : Buffer.from(decodeURIComponent(payload), "utf8");
-    return saveFile(userId, body, matched[1] || "image/png", meta);
+    const matched = /^data:([^;,]+)?(;base64)?,/.exec(dataUrl); if (!matched) throw fail("图片数据格式不正确");
+    const payload = dataUrl.slice(matched[0].length); return saveFile(userId, matched[2] ? Buffer.from(payload, "base64") : Buffer.from(decodeURIComponent(payload), "utf8"), matched[1] || "image/png", meta);
 }
-
 export async function saveFileFromUrl(userId: string, url: string, meta?: FileMeta) {
     if (url.startsWith("data:")) return saveFileFromDataUrl(userId, url, meta);
-    const response = await fetch(url, { signal: AbortSignal.timeout(300000) }).catch(() => {
-        throw fail("下载生成结果失败");
-    });
+    const response = await fetch(url, { signal: AbortSignal.timeout(300000) }).catch(() => { throw fail("下载生成结果失败"); });
     if (!response.ok) throw fail(`下载生成结果失败：${response.status}`);
-    const body = Buffer.from(await response.arrayBuffer());
-    return saveFile(userId, body, response.headers.get("content-type") || "application/octet-stream", meta);
+    return saveFile(userId, Buffer.from(await response.arrayBuffer()), response.headers.get("content-type") || "application/octet-stream", meta);
 }
-
 export async function getFile(id: string, userId?: string) {
-    const file = await repo(StoredFile).findOneBy({ id });
-    if (!file) throw fail("文件不存在");
-    if (userId !== undefined && file.userId && file.userId !== userId) throw fail("无权访问该文件");
-    return file;
+    const file = await repo(StoredFile).findOneBy({ id }); if (!file) throw fail("文件不存在");
+    if (userId !== undefined && file.userId && file.userId !== userId) throw fail("无权访问该文件"); return file;
 }
-
 export async function deleteFile(id: string, userId: string) {
     const file = await getFile(id, userId);
-    await deleteObject(file.path);
-    await repo(StoredFile).delete({ id });
+    await withBlobLock(file.checksum, async () => {
+        await dataSource.transaction(async (manager) => {
+            const deleted = await manager.getRepository(StoredFile).delete({ id, userId });
+            if (!deleted.affected) return;
+            await manager.getRepository(PhysicalBlob).createQueryBuilder().update().set({ refCount: () => `CASE WHEN ${column("refCount")} > 0 THEN ${column("refCount")} - 1 ELSE 0 END` }).where("checksum = :checksum", { checksum: file.checksum }).execute();
+        });
+        const actual = await repo(StoredFile).countBy({ checksum: file.checksum });
+        await repo(PhysicalBlob).update({ checksum: file.checksum }, { refCount: actual });
+        if (actual <= 0) await markBlobPending(file.checksum);
+    });
 }
-
 export async function listFiles(userId: string, ids: string[]) {
     if (!ids.length) return [];
-    const files = await repo(StoredFile).find({ where: ids.map((id) => ({ id })) });
-    return files.filter((file) => !file.userId || file.userId === userId);
+    const files = await repo(StoredFile).find({ where: ids.map((id) => ({ id })) }); return files.filter((file) => !file.userId || file.userId === userId);
 }
-
-export function publicFileUrl(baseUrl: string, id: string) {
-    return `${baseUrl}/api/files/${id}/content`;
-}
+export function publicFileUrl(baseUrl: string, id: string) { return `${baseUrl}/api/files/${id}/content`; }

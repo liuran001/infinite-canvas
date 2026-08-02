@@ -1,6 +1,7 @@
 import type { StoredFile } from "../db/entities";
 import { fail } from "../lib/errors";
 import { upstreamBinary, upstreamJson, upstreamMessage, upstreamStream } from "../lib/upstream";
+import { storedObjectOf } from "./files";
 import { getObject } from "./storage";
 import { buildChannelUrl, isArkPlanChannel, isSeedanceModel, type ModelChannel } from "./settings";
 
@@ -41,7 +42,8 @@ function authHeaders(channel: ModelChannel, contentType?: string) {
 }
 
 async function readFileBuffer(file: StoredFile) {
-    const object = await getObject(file.path);
+    const stored = await storedObjectOf(file);
+    const object = await getObject(stored.path, undefined, stored.storage);
     const chunks: Buffer[] = [];
     for await (const chunk of object.stream) chunks.push(Buffer.from(chunk as Buffer));
     return Buffer.concat(chunks);

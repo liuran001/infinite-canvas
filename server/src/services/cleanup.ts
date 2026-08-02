@@ -1,5 +1,5 @@
 import { repo } from "../db/data-source";
-import { Project, UserAsset } from "../db/entities";
+import { AgentMessage, Job, Project, UserAsset } from "../db/entities";
 import { deleteFile } from "./files";
 
 /** 画布与素材里的文件引用一律是 server:<fileId>，直接从 JSON 文本里扫出来比对。 */
@@ -16,7 +16,18 @@ function fileIdsIn(data: string) {
 export async function releaseFiles(userId: string, data: string) {
     const ids = fileIdsIn(data || "");
     if (!ids.size) return;
-    const [projects, assets] = await Promise.all([repo(Project).findBy({ userId, deleted: false }), repo(UserAsset).findBy({ userId, deleted: false })]);
-    const kept = fileIdsIn([...projects, ...assets].map((row) => row.data || "").join("\n"));
+    const [projects, assets, jobs, messages] = await Promise.all([
+        repo(Project).findBy({ userId, deleted: false }),
+        repo(UserAsset).findBy({ userId, deleted: false }),
+        repo(Job).findBy({ userId }),
+        repo(AgentMessage).findBy({ userId }),
+    ]);
+    const kept = fileIdsIn([
+        ...projects.map((row) => row.data || ""),
+        ...assets.map((row) => row.data || ""),
+        ...messages.map((row) => `${row.content || ""}\n${row.toolResult || ""}\n${JSON.stringify(row.references || [])}`),
+    ].join("\n"));
+    jobs.forEach((job) => [...(job.inputFileIds || []), ...(job.outputFileIds || [])].forEach((id) => kept.add(id)));
+    messages.forEach((message) => (message.attachments || []).forEach((id) => kept.add(id)));
     for (const id of ids) if (!kept.has(id)) await deleteFile(id, userId).catch(() => undefined);
 }

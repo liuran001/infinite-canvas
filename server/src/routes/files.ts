@@ -5,7 +5,7 @@ import { config } from "../config";
 import { fail } from "../lib/errors";
 import { handle, ok } from "../lib/response";
 import { requireUser, userAuth } from "../middleware/auth";
-import { deleteFile, getFile, saveFile } from "../services/files";
+import { deleteFile, getFile, saveFile, storedObjectOf } from "../services/files";
 import { storageOf } from "../services/quota";
 import { getObject } from "../services/storage";
 
@@ -65,6 +65,7 @@ fileRouter.delete(
  */
 const serveContent = handle(async (req, res) => {
     const file = await getFile(String(req.params.id));
+    const stored = await storedObjectOf(file);
     const total = Number(file.bytes);
     const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ""));
     res.setHeader("Content-Type", file.mimeType);
@@ -78,14 +79,14 @@ const serveContent = handle(async (req, res) => {
             res.status(416).setHeader("Content-Range", `bytes */${total}`);
             return res.end();
         }
-        const object = await getObject(file.path, { start, end });
+        const object = await getObject(stored.path, { start, end }, stored.storage);
         res.status(206);
         res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
         res.setHeader("Content-Length", String(end - start + 1));
         return object.stream.pipe(res);
     }
 
-    const object = await getObject(file.path);
+    const object = await getObject(stored.path, undefined, stored.storage);
     if (object.bytes) res.setHeader("Content-Length", String(object.bytes));
     if (req.method === "HEAD") return res.end();
     return object.stream.pipe(res);
