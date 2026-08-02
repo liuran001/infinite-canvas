@@ -162,6 +162,44 @@ async function main() {
     check("Agent 面板无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
     await page.screenshot({ path: "ui-check-agent.png" }).catch(() => {});
 
+    console.log("画布分享");
+    const projectUrl = page.url();
+    await page.goto(projectUrl, { waitUntil: "networkidle", timeout: 45000 });
+    await page.waitForTimeout(1200);
+    errors.length = 0;
+    const shareButton = page.getByRole("button", { name: "分享", exact: true });
+    check("画布页有分享入口", (await shareButton.count()) > 0);
+    if (await shareButton.count()) {
+        await shareButton.first().click();
+        await page.waitForTimeout(900);
+        check("分享面板可打开", (await page.getByText("新建链接").count()) > 0);
+        check("分享面板有角色切换", (await page.getByText("可编辑", { exact: true }).count()) > 0);
+        check("分享面板有匿名开关", (await page.getByText("允许匿名访问").count()) > 0);
+        check("分享面板有克隆开关", (await page.getByText("允许保存到自己账号").count()) > 0);
+        check("分享面板有过期设置", (await page.getByText("过期时间").count()) > 0);
+        check("分享面板无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+        await page.keyboard.press("Escape");
+        await page.waitForTimeout(400);
+    }
+
+    // 分享页在登录守卫之外：无效 token 也应当渲染失效提示，而不是被踢回首页。
+    await visit("/s/invalid-token-for-ui-check");
+    check("无效分享链接渲染失效提示", (await page.getByText("链接不存在或已失效").count()) > 0, `当前地址 ${page.url()}`);
+    check("分享页不会被登录守卫踢回首页", new URL(page.url()).pathname.startsWith("/s/"), `当前地址 ${page.url()}`);
+    const robotsMeta = await page
+        .locator('head meta[name="robots"]')
+        .getAttribute("content")
+        .catch(() => null);
+    check("分享页注入 robots meta", (robotsMeta || "").includes("noindex"), `当前值 ${robotsMeta}`);
+    const robotsTxt = await page.evaluate(async (web) => (await fetch(`${web}/robots.txt`)).text(), WEB);
+    check("robots.txt 屏蔽 /s/", robotsTxt.includes("Disallow: /s/"));
+    check("分享页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+
+    // 离开分享页后运行时注入的 meta 必须被清理，否则整站都会带上 noindex。
+    await visit("/");
+    const leftover = await page.locator('head meta[name="robots"]').count();
+    check("离开分享页后清理 robots meta", leftover === 0);
+
     console.log("管理后台");
     // 凭据要当参数传进去：evaluate 的回调跑在浏览器里，那边没有 process。
     const adminToken = await page.evaluate(

@@ -1,6 +1,7 @@
 import { createBrowserRouter, Outlet } from "react-router-dom";
 
 import { AnalyticsTracker } from "@/components/layout/analytics-tracker";
+import { LoginModal } from "@/components/layout/login-modal";
 import AdminLayout from "@/layouts/admin-layout";
 import UserLayout from "@/layouts/user-layout";
 import AdminAssetsPage from "@/pages/admin/assets";
@@ -20,6 +21,7 @@ import ImagePage from "@/pages/image";
 import LoginPage from "@/pages/login";
 import NotFound from "@/pages/not-found";
 import PromptsPage from "@/pages/prompts";
+import ShareCanvasPage from "@/pages/share/share-canvas";
 import VideoPage from "@/pages/video";
 
 export const router = createBrowserRouter([
@@ -42,6 +44,20 @@ export const router = createBrowserRouter([
         ],
     },
     { path: "/login", element: <LoginPage /> },
+    /*
+     * 分享页刻意放在 UserLayout 与 LoginGuard 之外（与 /login 同级）：
+     * 它允许匿名访问，挂在守卫里会被直接判成未登录踢回首页；也不该带上全站导航、
+     * Agent 面板这些属于账号的入口。登录弹窗单独挂一份，供「登录后继续克隆」使用。
+     */
+    {
+        path: "/s/:token",
+        element: (
+            <>
+                <ShareCanvasPage />
+                <LoginModal />
+            </>
+        ),
+    },
     {
         path: "/admin",
         element: <AdminLayout />,

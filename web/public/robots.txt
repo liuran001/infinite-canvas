@@ -1,0 +1,6 @@
+# 分享页是「拿到链接即可访问」的私有内容，不应进入搜索引擎索引。
+# 这是三重 noindex 的第一层（抓取前生效），另外两层是部署层的 X-Robots-Tag 响应头
+# 与分享页运行时注入的 robots meta。
+User-agent: *
+Disallow: /s/
+Allow: /
