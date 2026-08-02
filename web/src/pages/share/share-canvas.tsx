@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { App, Button, Tooltip } from "antd";
-import { CloudOff, Eye, Link2Off, Loader2, LogIn, Pencil, Save, Users } from "lucide-react";
+import { CloudOff, Eye, ImagePlus, Link2Off, Loader2, LogIn, Pencil, Save, Users } from "lucide-react";
 
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { ConnectionPath } from "@/components/canvas/canvas-connections";
@@ -10,15 +10,19 @@ import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useNoIndexMeta } from "@/hooks/use-noindex-meta";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { hydrateCanvasImages } from "@/lib/canvas/canvas-generation-helpers";
+import { imageMetadata } from "@/lib/canvas/canvas-node-factory";
+import { fitNodeSize } from "@/lib/canvas/canvas-node-size";
 import { isHiddenBatchChild, isHiddenBatchConnectionEndpoint } from "@/lib/canvas/canvas-node-geometry";
+import { IMAGE_FILE_ACCEPT, isImageFile } from "@/lib/image-transcode";
 import { shareApi, isShareGone } from "@/services/api/share";
+import { uploadShareImage } from "@/services/share-upload";
 import { openShareSession, rememberPendingClone, refreshShareSession, takePendingClone } from "@/services/share-session";
 import { createSharePresenceReporter, flushShareProject, loadShareProject, pushShareProject, resetShareSync, watchShareProject } from "@/services/share-sync";
 import { useServerStore } from "@/stores/use-server-store";
 import { useShareStore } from "@/stores/use-share-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
-import type { CanvasNodeData, ViewportTransform } from "@/types/canvas";
+import { CanvasNodeType, type CanvasNodeData, type ViewportTransform } from "@/types/canvas";
 
 /**
  * 独立的分享画布页 `/s/:token`。
@@ -54,9 +58,12 @@ export default function ShareCanvasPage() {
     const [nodes, setNodes] = useState<CanvasNodeData[]>([]);
     const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(new Set());
     const [isMiniMapOpen, setIsMiniMapOpen] = useState(false);
+    const [uploading, setUploading] = useState(false);
+    const fileInputRef = useRef<HTMLInputElement>(null);
     const nodesRef = useRef<CanvasNodeData[]>([]);
     const viewportRef = useRef(viewport);
     const selectedRef = useRef(selectedNodeIds);
+    const editableRef = useRef(editable);
     const didCenterRef = useRef(false);
     const dragRef = useRef({ active: false, moved: false, startX: 0, startY: 0, initial: [] as Array<{ id: string; x: number; y: number }> });
     const rafRef = useRef<number | null>(null);
@@ -70,6 +77,10 @@ export default function ShareCanvasPage() {
         viewportRef.current = viewport;
         selectedRef.current = selectedNodeIds;
     }, [nodes, selectedNodeIds, viewport]);
+
+    useEffect(() => {
+        editableRef.current = editable;
+    }, [editable]);
 
     const connections = useMemo(() => project?.connections || [], [project]);
     const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
@@ -154,6 +165,70 @@ export default function ShareCanvasPage() {
         const merged: CanvasProject = { ...current, nodes: next, updatedAt: new Date().toISOString() };
         pushShareProject(merged);
     }, []);
+
+    /**
+     * 访客上传：粘贴、拖拽、按钮三个入口都汇到这里，与项目页一样落成图片节点。
+     * 上传走的是分享通道（guest 令牌 + projectId），文件记在画布所有者名下并按访客单独限流。
+     * 只读访客拿不到入口，这里再拦一次，避免键盘粘贴之类的路径绕过 UI。
+     */
+    const addImageFiles = useCallback(
+        async (files: File[], at?: { clientX: number; clientY: number }) => {
+            if (!editableRef.current) return;
+            const images = files.filter(isImageFile);
+            if (!images.length) return;
+            const rect = containerRef.current?.getBoundingClientRect();
+            const current = viewportRef.current;
+            const localX = at ? at.clientX - (rect?.left || 0) : (rect?.width || 0) / 2;
+            const localY = at ? at.clientY - (rect?.top || 0) : (rect?.height || 0) / 2;
+            const center = { x: (localX - current.x) / current.k, y: (localY - current.y) / current.k };
+            setUploading(true);
+            const hide = message.loading("正在上传图片…", 0);
+            try {
+                const created: CanvasNodeData[] = [];
+                for (const [index, file] of images.entries()) {
+                    const image = await uploadShareImage(file);
+                    const size = fitNodeSize(image.width, image.height);
+                    created.push({
+                        id: `image-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                        type: CanvasNodeType.Image,
+                        title: file.name,
+                        position: { x: center.x - size.width / 2 + index * 24, y: center.y - size.height / 2 + index * 24 },
+                        width: size.width,
+                        height: size.height,
+                        metadata: imageMetadata(image),
+                    });
+                }
+                const next = [...nodesRef.current, ...created];
+                nodesRef.current = next;
+                setNodes(next);
+                setSelectedNodeIds(new Set(created.map((node) => node.id)));
+                commitNodes(next);
+                message.success(`已添加 ${created.length} 张图片`);
+            } catch (uploadError) {
+                // 只读、超频、配额不足的中文文案都由服务端给出，原样展示。
+                message.error(uploadError instanceof Error ? uploadError.message : "上传失败，请重试");
+            } finally {
+                hide();
+                setUploading(false);
+            }
+        },
+        [commitNodes, message],
+    );
+
+    /** 粘贴图片。输入框里的粘贴不劫持，否则会把节点里的文本编辑弄坏。 */
+    useEffect(() => {
+        if (!editable) return;
+        const onPaste = (event: ClipboardEvent) => {
+            const target = event.target instanceof Element ? event.target : null;
+            if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target?.closest("[contenteditable='true']")) return;
+            const files = Array.from(event.clipboardData?.files || []).filter(isImageFile);
+            if (!files.length) return;
+            event.preventDefault();
+            void addImageFiles(files);
+        };
+        window.addEventListener("paste", onPaste);
+        return () => window.removeEventListener("paste", onPaste);
+    }, [addImageFiles, editable]);
 
     const handleNodeMouseDown = useCallback((event: React.MouseEvent, nodeId: string) => {
         event.stopPropagation();
@@ -287,7 +362,33 @@ export default function ShareCanvasPage() {
 
     return (
         <main className="relative flex h-dvh w-full flex-col overflow-hidden" style={{ background: theme.canvas.background, color: theme.node.text }}>
-            <ShareTopBar title={project.title || "未命名画布"} editable={editable} allowClone={allowClone} cloning={cloning} viewerName={displayName} viewers={members.length} onClone={() => void cloneToMyAccount()} />
+            <ShareTopBar
+                title={project.title || "未命名画布"}
+                editable={editable}
+                allowClone={allowClone}
+                cloning={cloning}
+                uploading={uploading}
+                viewerName={displayName}
+                viewers={members.length}
+                onClone={() => void cloneToMyAccount()}
+                onUpload={() => fileInputRef.current?.click()}
+            />
+
+            {/* 上传入口只在可编辑分享上存在；viewer 连这个 input 都不渲染。 */}
+            {editable ? (
+                <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept={IMAGE_FILE_ACCEPT}
+                    multiple
+                    className="hidden"
+                    onChange={(event) => {
+                        const files = Array.from(event.target.files || []);
+                        event.target.value = "";
+                        void addImageFiles(files);
+                    }}
+                />
+            ) : null}
 
             <section className="relative min-h-0 flex-1">
                 <InfiniteCanvas
@@ -298,6 +399,17 @@ export default function ShareCanvasPage() {
                     onCanvasDeselect={() => setSelectedNodeIds(new Set())}
                     // 只读时右键菜单整体不可用；可编辑时分享态也不开放右键菜单里的生成类操作，一律拦掉。
                     onContextMenu={(event) => event.preventDefault()}
+                    // 拖拽上传只在可编辑分享上挂；viewer 连 onDrop 都不接，拖进来的文件由浏览器默认处理。
+                    onDrop={
+                        editable
+                            ? (event) => {
+                                  const files = Array.from(event.dataTransfer?.files || []).filter(isImageFile);
+                                  if (!files.length) return;
+                                  event.preventDefault();
+                                  void addImageFiles(files, { clientX: event.clientX, clientY: event.clientY });
+                              }
+                            : undefined
+                    }
                 >
                     <svg className="absolute left-0 top-0 h-[10000px] w-[10000px] overflow-visible" style={{ pointerEvents: "none", transform: "translateZ(0)", zIndex: 0 }}>
                         {connections
@@ -363,7 +475,27 @@ export default function ShareCanvasPage() {
     );
 }
 
-function ShareTopBar({ title, editable, allowClone, cloning, viewerName, viewers, onClone }: { title: string; editable: boolean; allowClone: boolean; cloning: boolean; viewerName: string; viewers: number; onClone: () => void }) {
+function ShareTopBar({
+    title,
+    editable,
+    allowClone,
+    cloning,
+    uploading,
+    viewerName,
+    viewers,
+    onClone,
+    onUpload,
+}: {
+    title: string;
+    editable: boolean;
+    allowClone: boolean;
+    cloning: boolean;
+    uploading: boolean;
+    viewerName: string;
+    viewers: number;
+    onClone: () => void;
+    onUpload: () => void;
+}) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const syncState = useShareStore((state) => state.syncState);
     const syncError = useShareStore((state) => state.syncError);
@@ -406,6 +538,13 @@ function ShareTopBar({ title, editable, allowClone, cloning, viewerName, viewers
                         {viewers + 1}
                     </span>
                 </Tooltip>
+                {editable ? (
+                    <Tooltip title="也可以直接粘贴或把图片拖进画布">
+                        <Button icon={<ImagePlus className="size-4" />} loading={uploading} onClick={onUpload}>
+                            上传图片
+                        </Button>
+                    </Tooltip>
+                ) : null}
                 {allowClone ? (
                     <Button type="primary" icon={<Save className="size-4" />} loading={cloning} onClick={onClone}>
                         保存到我的账号

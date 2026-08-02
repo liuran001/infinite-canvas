@@ -1,5 +1,5 @@
 import { serverApiUrl } from "@/services/api/server";
-import type { ServerProject, ServerProjectEvent, ServerProjectPresence } from "@/services/api/server";
+import type { ServerFile, ServerProject, ServerProjectEvent, ServerProjectPresence } from "@/services/api/server";
 import { useServerStore } from "@/stores/use-server-store";
 
 /**
@@ -142,6 +142,20 @@ export const shareApi = {
     /** 克隆到自己的账号，必须带真实账号身份（匿名要先登录）。 */
     clone: (token: string, guestToken: string) =>
         shareRequest<ServerProject>(`/v1/shares/${encodeURIComponent(token)}/clone`, { method: "POST", headers: userToken() ? { "X-User-Authorization": `Bearer ${userToken()}` } : {} }, "保存到我的账号失败", guestToken),
+
+    /**
+     * 访客上传素材。projectId 是必须的：服务端靠它走 resolveProjectAccess(ctx, projectId, "write")
+     * 判权并把文件记在**所有者**名下（只读分享 403，超频 429），漏传就会退回按账号身份上传。
+     */
+    uploadFile: (projectId: string, guestToken: string, file: Blob, meta?: { width?: number; height?: number; durationMs?: number; filename?: string }) => {
+        const form = new FormData();
+        form.append("file", file, meta?.filename || "upload");
+        form.append("projectId", projectId);
+        if (meta?.width) form.append("width", String(meta.width));
+        if (meta?.height) form.append("height", String(meta.height));
+        if (meta?.durationMs) form.append("durationMs", String(meta.durationMs));
+        return shareRequest<ServerFile>("/v1/files", { method: "POST", body: form }, "上传文件失败", guestToken);
+    },
 
     /** 以下是分享态下的画布读写，走的仍是现有项目接口，只是换成 guest 令牌。 */
     project: (projectId: string, guestToken: string) => shareRequest<ServerProject>(`/v1/projects/${encodeURIComponent(projectId)}`, {}, "读取分享画布失败", guestToken),

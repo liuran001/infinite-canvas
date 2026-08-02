@@ -59,5 +59,24 @@ check("保存被拒时识别只读", /isShareReadOnly\(error\)/.test(shareSync),
 check("识别只读后切换角色", /setRole\("viewer"\)/.test(shareSync), "识别到只读却没收权");
 check("重连时同步服务端角色", /event\.role/.test(shareSync), "ready 事件带了角色但前端不读，降级要等到下次续期才生效");
 
+// 访客上传：后端按 projectId 判权并把文件记在所有者名下，漏掉任一条都会退化成「按账号身份上传」或直接 401。
+const shareUpload = read("services/share-upload.ts");
+const uploadSignature = /uploadFile:\s*\(([^)]*)\)/.exec(shareApi);
+check("分享通道提供上传接口", Boolean(uploadSignature), "share.ts 里没有 uploadFile，分享页只能走公共通道");
+check("分享上传要求 projectId 与 guestToken", /projectId/.test(uploadSignature?.[1] || "") && /guestToken/.test(uploadSignature?.[1] || ""), "上传接口签名缺少 projectId 或 guestToken");
+check("分享上传把 projectId 放进表单", /form\.append\("projectId"/.test(shareApi), "不带 projectId，服务端会按账号身份判权，访客直接 401");
+check("分享上传走带 guest 令牌的分享请求", /shareRequest<ServerFile>\("\/v1\/files"[^;]*guestToken\)/s.test(shareApi), "上传没有带上 guest 令牌");
+check("分享上传工具不引入公共 API 通道的请求器", !/\bserverApi\b/.test(shareUpload), "share-upload 不能调用 serverApi，401 会清掉账号会话");
+check("分享上传工具只调用分享通道", /shareApi\.uploadFile\(/.test(shareUpload), "share-upload 没有走 shareApi.uploadFile");
+check("分享上传前先确认是可编辑访客", /role\s*!==\s*"editor"/.test(shareUpload), "只读访客也能触发上传，服务端 403 会变成用户可见的报错风暴");
+
+// 上传入口必须挂在 editable 上：viewer 看到按钮就等于把 403 当交互展示给用户。
+check("分享页从分享上传通道取上传能力", /from\s+"@\/services\/share-upload"/.test(sharePage), "分享页没有接上分享上传通道");
+check("分享页上传按钮只给可编辑访客", /\{editable \? \(\s*<Tooltip[\s\S]{0,200}?上传图片/.test(sharePage), "上传按钮没有被 editable 包住，viewer 也会看到");
+check("分享页文件选择框只给可编辑访客", /\{editable \? \(\s*<input/.test(sharePage), "隐藏的 file input 对 viewer 也渲染了");
+check("分享页拖拽上传只给可编辑访客", /onDrop=\{\s*editable/.test(sharePage), "onDrop 没有按 editable 收口");
+check("分享页粘贴上传只给可编辑访客", /if \(!editable\) return;[\s\S]{0,600}?addEventListener\("paste"/.test(sharePage), "粘贴监听没有按 editable 收口");
+check("分享页上传前再兜一次权限", /if \(!editableRef\.current\) return;/.test(sharePage), "上传函数自身没有拦只读，绕过 UI 的路径会打到服务端");
+
 console.log(`\n通过 ${pass}，失败 ${fail}`);
 process.exit(fail ? 1 : 0);

@@ -21,6 +21,7 @@ async function main() {
     const { cloneSharedProject } = await import("./src/services/project-clone");
     const { currentAuthUser } = await import("./src/services/auth");
     const { saveFile } = await import("./src/services/files");
+    const { storageOf } = await import("./src/services/quota");
     const { saveProject } = await import("./src/services/sync");
     const { now } = await import("./src/lib/errors");
 
@@ -219,6 +220,32 @@ async function main() {
     check("克隆事件不节流", await logs.countBy({ shareId: editor.share.id, event: "clone" }), 3);
     check("日志只存 IP 哈希", (await logs.findOneByOrFail({ shareId: editor.share.id, event: "clone" })).ipHash.includes("203.0.113.9"), false);
     check("日志记下了访问来源", (await logs.findOneByOrFail({ shareId: editor.share.id, event: "clone" })).userAgent, "smoke-agent");
+
+    console.log("访客上传");
+    resetShareRuntimeState();
+    // 复刻 POST /v1/files 里访客分支的三步：按 projectId 判权 → 访客限流 → 以所有者身份落库。
+    // 路由本身只是这三步的拼装，语义都在服务层，端到端只能看到状态码。
+    const guestUpload = async (ctx: typeof editorCtx | typeof viewerCtx, body: Buffer) => {
+        const access = await resolveProjectAccess(ctx, "p1", "write");
+        assertShareUploadAllowed(access.share!.id, access.actorId, body.length);
+        return saveFile(access.ownerId, body, "image/png");
+    };
+    const uploadPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA3fxQ8gAAAABJRU5ErkJggg==", "base64");
+    const ownerFilesBefore = await files.countBy({ userId: "owner-1" });
+    const guestUsedBefore = await files.countBy({ userId: editorSession.actorId });
+    const uploaded = await guestUpload(editorCtx, uploadPng);
+    check("可编辑访客能上传", Boolean(uploaded.id), true);
+    check("上传的文件记在所有者名下", (await files.findOneByOrFail({ id: uploaded.id })).userId, "owner-1");
+    check("所有者名下多出一条文件记录", await files.countBy({ userId: "owner-1" }), ownerFilesBefore + 1);
+    check("访客名下不留文件记录", await files.countBy({ userId: editorSession.actorId }), guestUsedBefore);
+    check("上传计的是所有者的用量", (await storageOf("owner-1")).used > (await storageOf(editorSession.actorId)).used, true);
+    check("只读访客上传被拒", await status(() => guestUpload(viewerCtx, uploadPng)), 403);
+    check("只读访客上传有稳定错误码", await codeOf(() => guestUpload(viewerCtx, uploadPng)), "SHARE_READ_ONLY");
+    check("只读访客被拒后没留下文件", await files.countBy({ userId: "owner-1" }), ownerFilesBefore + 1);
+    resetShareRuntimeState();
+    for (let index = 0; index < 20; index += 1) assertShareUploadAllowed(editor.share.id, editorSession.actorId, 1);
+    check("超过频次上限的访客上传被拒", await status(() => guestUpload(editorCtx, uploadPng)), 429);
+    check("被限流的上传不会落库", await files.countBy({ userId: "owner-1" }), ownerFilesBefore + 1);
 
     console.log("访客上传限流");
     resetShareRuntimeState();
