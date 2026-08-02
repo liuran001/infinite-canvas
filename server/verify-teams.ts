@@ -799,8 +799,41 @@ async function main() {
     await memberSettings({ check, rejects });
     await backstage({ check, rejects });
     await readySequencing({ check });
+    await numericInput({ check, rejects });
 
     finish(env.root);
+}
+
+/**
+ * 非负整数入参的边界。这个函数是「畸形请求会不会被解释成一次清零」的唯一裁判，
+ * 而 JS 的隐式转换在这里全是陷阱：Number("")、Number("   ")、Number([]) 统统是 0，
+ * Number(false) 是 0，Number("0x10") 是 16，Number("1e2") 是 100。
+ * 任何一条漏网，一次拼错字段名或前端传空的请求就会被照单执行成「把积分/额度/上限改成某个数」。
+ */
+async function numericInput({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { nonNegativeInteger } = await import("./src/lib/validate");
+
+    console.log("非负整数入参校验");
+    const parse = (value: unknown) => nonNegativeInteger(value, 7, 1000, "非法", "BAD");
+    const refuses = (value: unknown) => rejects(`拒绝 ${typeof value} ${JSON.stringify(value) ?? String(value)}`, async () => parse(value));
+
+    // 空值系列：全都会被 Number() 折成 0，也就是「清零」，而它们的真实含义是「这个字段没填」。
+    for (const value of ["", "   ", "\t\n", [], {}, null, true, false, [5]]) await refuses(value);
+    // 进制与科学计数：用户以为自己写的是十进制，落库的却是另一个数量级。
+    for (const value of ["0x10", "0b11", "0o17", "1e2", "1E2", " 0x10 "]) await refuses(value);
+    // 形似数字但不是纯十进制的写法，一律不猜用户的意思。
+    for (const value of ["1_000", "12.0", "+12", "1,000", "12px", "Infinity", "NaN", "1n"]) await refuses(value);
+    // number 类型自身的非法取值。
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, 1.5, -0.5, 1001, Number.MAX_SAFE_INTEGER]) await refuses(value);
+
+    check("接受 number 型非负整数", parse(0), 0);
+    check("接受上界本身", parse(1000), 1000);
+    check("接受纯十进制字符串", parse("42"), 42);
+    check("接受带空白的纯十进制字符串", parse("  42  "), 42);
+    check("接受前导零", parse("007"), 7);
+    check("undefined 表示这次不改", parse(undefined), 7);
+    // -0 与 0 在库里没有区别，但 Object.is 分得清；归一成 0 免得它顺着写进流水里。
+    check("负零归一为零", Object.is(parse(-0), 0), true);
 }
 
 /**
@@ -916,7 +949,7 @@ async function backstage({ check, rejects }: { check: (name: string, actual: unk
  * 客户端最后停在旧值上，而且它没有任何理由怀疑这个数。
  */
 async function readySequencing({ check }: { check: (name: string, actual: unknown, expected: unknown) => void }) {
-    const { createBufferedWriter } = await import("./src/lib/sse");
+    const { createBufferedWriter, sseWriter } = await import("./src/lib/sse");
 
     console.log("SSE ready 竞态");
     const written: unknown[] = [];
@@ -940,6 +973,31 @@ async function readySequencing({ check }: { check: (name: string, actual: unknow
     for (const credits of [1, 2, 3]) many.push({ credits });
     many.flush({ credits: 0 });
     check("缓冲按到达顺序 flush", ordered, [0, 1, 2, 3]);
+
+    // 连接结束后一律不再写。被挂起或移除的成员由 closeTeamConnectionsOf 直接 res.end()，
+    // 而它可能正好落在 flush 补发的中途：结束后再写会抛 ERR_STREAM_WRITE_AFTER_END，
+    // 那一抛在 flush 的循环里，剩下的事件全被截断。
+    const chunks: string[] = [];
+    const fake = { writableEnded: false, write: (chunk: string) => chunks.push(chunk) };
+    const writeTo = sseWriter(fake);
+    writeTo({ type: "ready" });
+    check("连接活着时正常写出", chunks.length, 1);
+    check("写出的是 SSE 数据帧", chunks[0], 'data: {"type":"ready"}\n\n');
+    fake.writableEnded = true;
+    writeTo({ type: "team.credits" });
+    check("连接结束后静默丢弃", chunks.length, 1);
+
+    // 中途被关掉：ready 写得出去，补发的部分整段丢弃，而且不能抛错——抛在这里就是一条截断的流。
+    const midway: unknown[] = [];
+    const closing = { writableEnded: false, write: (chunk: string) => midway.push(chunk) };
+    const guarded = createBufferedWriter((event) => {
+        sseWriter(closing)(event);
+        closing.writableEnded = true;
+    });
+    guarded.push({ credits: 1 });
+    guarded.push({ credits: 2 });
+    guarded.flush({ type: "ready" });
+    check("中途关闭后只写出了 ready", midway.length, 1);
 }
 
 /**
