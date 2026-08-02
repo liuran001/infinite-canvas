@@ -58,9 +58,29 @@ async function usedByMember(manager: EntityManager, teamId: string, userId: stri
     return -Number(row?.total || 0);
 }
 
-/** 成员本窗口已用额度的只读视图，给成员列表用。判定路径一律走事务内的 usedByMember，不用这个。 */
+/** 单个成员本窗口已用额度的只读视图。判定路径一律走事务内的 usedByMember，不用这个。 */
 export async function usedCreditsOfMember(teamId: string, userId: string, window: TeamLimitWindow) {
     return serialTransaction((manager) => usedByMember(manager, teamId, userId, window));
+}
+
+/**
+ * 整个团队在某个窗口里各成员的已用额度，一次 GROUP BY 出结果。
+ * 成员列表原先按人各查一次，且每次都要排进全进程唯一的事务队列——一个几十人的团队打开一次列表，
+ * 就把扣费和领邀请堵在后面几十个来回。这里是纯读、不参与任何判定，因此不进事务队列。
+ * 判定路径依旧只走事务内的 usedByMember，两者用的是同一套过滤条件。
+ */
+export async function usedCreditsOfTeam(teamId: string, window: TeamLimitWindow) {
+    const start = windowStart(window);
+    const query = repo(TeamCreditLog)
+        .createQueryBuilder("log")
+        .select("log.userId", "userId")
+        .addSelect("SUM(log.amount)", "total")
+        .where("log.teamId = :teamId", { teamId })
+        .andWhere("log.type IN (:...types)", { types: ["ai_consume", "ai_refund"] })
+        .groupBy("log.userId");
+    if (start) query.andWhere("log.createdAt >= :start", { start });
+    const rows = await query.getRawMany<{ userId: string; total: string | number | null }>();
+    return new Map(rows.map((row) => [row.userId, -Number(row.total || 0)]));
 }
 
 /** 团队消费的资格：团队在用、成员在册且状态正常、角色允许花钱。三者缺一都不能动团队池。 */

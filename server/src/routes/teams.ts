@@ -1,6 +1,7 @@
 import { Router } from "express";
 
 import { handle, ok, parseQuery } from "../lib/response";
+import { createBufferedWriter } from "../lib/sse";
 import { requireUser, userAuth } from "../middleware/auth";
 import { requireTeamRole } from "../services/team-access";
 import { acceptTeamInvite, createTeamInvite, deleteTeamInvite, listTeamInvites, previewTeamInvite, updateTeamInvite } from "../services/team-invites";
@@ -86,16 +87,29 @@ teamRouter.get("/v1/team-invites/:token", handle(async (req, res) => ok(res, awa
 teamRouter.post("/v1/team-invites/:token/accept", handle(async (req, res) => ok(res, await acceptTeamInvite(String(req.params.token), requireUser(req).id))));
 
 /**
- * 团队 SSE。先鉴权再订阅：反过来的话，鉴权失败那条路径上已经挂好的 listener 要靠 catch 收干净，
- * 漏一次就是一个永久泄漏的订阅。团队事件没有「错过就补不回来」的语义（余额事件带的是绝对值），
- * 所以不需要 project SSE 那套 buffered 缓冲。
+ * 团队 SSE。先订阅再读库，鉴权与读团队的 await 窗口里发生的事件先进 buffered，
+ * 等 ready 写完再按序 flush：反过来的话，订阅之后拿着旧快照写下的 ready 会带着一个过期余额，
+ * 而这期间真正发生的 team.credits 已经先一步发了出去，客户端最后落在旧值上，
+ * 而且它没有任何理由怀疑这个数——界面上的余额会一直错到用户自己刷新。
+ * 鉴权失败那条路径必须显式退订，否则就是一个永久泄漏的 listener。
  */
 teamRouter.get(
     "/v1/teams/:id/realtime",
     handle(async (req, res) => {
         const teamId = String(req.params.id);
         const userId = requireUser(req).id;
-        const { team, role } = await requireTeamRole(userId, teamId, "team.read");
+        // sink 一开始只往缓冲里塞，响应头都还没发；flush 之后才真正写进这条连接。
+        let sink: (event: unknown) => void = () => undefined;
+        const stream = createBufferedWriter((event) => sink(event));
+        const unsubscribe = subscribeTeam(teamId, userId, (event: TeamRealtimeEvent) => stream.push(event), () => res.end());
+        let team;
+        let role;
+        try {
+            ({ team, role } = await requireTeamRole(userId, teamId, "team.read"));
+        } catch (error) {
+            unsubscribe();
+            throw error;
+        }
 
         res.status(200);
         res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -103,11 +117,15 @@ teamRouter.get(
         res.setHeader("Connection", "keep-alive");
         res.setHeader("X-Accel-Buffering", "no");
         res.flushHeaders();
-        const write = (event: unknown) => void res.write(`data: ${JSON.stringify(event)}\n\n`);
         // 被移除或降级时由服务层调 closeTeamConnectionsOf 关掉这条连接，同时退订总线 listener。
-        const unsubscribe = subscribeTeam(teamId, userId, (event: TeamRealtimeEvent) => write(event), () => res.end());
-        write({ type: "ready", teamId, role, credits: team.credits });
-        const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 25_000);
+        sink = (event: unknown) => void res.write(`data: ${JSON.stringify(event)}\n\n`);
+        stream.flush({ type: "ready", teamId, role, credits: team.credits });
+        // 连接可能已经被 closeTeamConnectionsOf 关掉（res.end()），此时再写会抛 ERR_STREAM_WRITE_AFTER_END，
+        // 而这个错误发生在定时器里，没有任何调用栈能接住它，会直接掀翻整个进程。
+        const keepAlive = setInterval(() => {
+            if (res.writableEnded) return clearInterval(keepAlive);
+            res.write(": keep-alive\n\n");
+        }, 25_000);
         req.on("close", () => {
             clearInterval(keepAlive);
             unsubscribe();

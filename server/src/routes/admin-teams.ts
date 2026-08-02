@@ -21,6 +21,8 @@ adminTeamRouter.get("/teams/:id", handle(async (req, res) => ok(res, await admin
 
 adminTeamRouter.patch("/teams/:id", handle(async (req, res) => ok(res, await adminUpdateTeam(String(req.params.id), req.body || {}))));
 
-adminTeamRouter.post("/teams/:id/credits", handle(async (req, res) => ok(res, await adminSetTeamCredits(String(req.params.id), Number(req.body?.credits) || 0, String(req.body?.remark || "")))));
+// credits 原样传给服务层校验：在这里 Number(...) || 0 会把畸形请求变成一次「清零」，
+// 而服务层再也分不清收到的 0 是管理员的本意还是一次拼错。
+adminTeamRouter.post("/teams/:id/credits", handle(async (req, res) => ok(res, await adminSetTeamCredits(String(req.params.id), (req.body || {}).credits, String(req.body?.remark || "")))));
 
 adminTeamRouter.get("/teams/:id/members", handle(async (req, res) => ok(res, await adminListTeamMembers(String(req.params.id)))));
