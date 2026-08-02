@@ -723,7 +723,9 @@ async function legacyCompatibility({ check, rejects }: { check: (name: string, a
 
     await refund(receipt, { model: "gpt-x", path: "/v1/ai/chat/completions" });
     check("旧路径退款余额还原", (await users.findOneByOrFail({ id: "legacy-solo" })).credits, 200);
-    check("旧路径退款流水 type 不变", (await repo(CreditLog).findOneOrFail({ where: { userId: "legacy-solo" }, order: { createdAt: "DESC" } })).type, "ai_refund");
+    // createdAt 只到毫秒，扣费与退款常落在同一毫秒里，按时间倒序取「最后一条」会随机取回扣费那行。
+    // 退款流水本来就用 refundOf 指回原始扣费，直接照这个关系取，断言才是确定性的。
+    check("旧路径退款流水 type 不变", (await repo(CreditLog).findOneByOrFail({ userId: "legacy-solo", refundOf: receipt.logId })).type, "ai_refund");
     check("旧路径退款也不写团队流水", await repo(TeamCreditLog).countBy({ userId: "legacy-solo" }), 0);
 
     await rejects("旧路径余额不足仍然抛错", () => charge({ kind: "user", userId: "legacy-solo" }, 9999, { model: "gpt-x", path: "/x" }));
