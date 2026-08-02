@@ -517,25 +517,61 @@ async function main() {
             createdAt: now(),
         }),
     );
-    // 生成器撞码时要重试而不是把冲突甩给调用方；用纯函数验证，生产接口上不留测试开关。
-    const { pickUniqueInviteCode } = await import("./src/services/team-invites");
+    // 生成器撞码时要靠唯一约束本身兜住，而不是先查再写——两次查询之间的窗口期正是真实冲突发生的地方。
+    const { insertWithUniqueCode, isUniqueViolation } = await import("./src/services/team-invites");
     const scripted = ["AAAAAAAAAA", "AAAAAAAAAA", "BBBBBBBBBB"];
     let picked = 0;
+    const conflict = () => Object.assign(new Error("UNIQUE constraint failed"), { code: "SQLITE_CONSTRAINT_UNIQUE" });
     check(
-        "撞码后换一个新码",
-        await pickUniqueInviteCode(
+        "写入撞唯一约束后换一个新码重试",
+        await insertWithUniqueCode(
             () => scripted[picked++],
-            async (code: string) => code === "AAAAAAAAAA",
+            async (code: string) => {
+                if (code === "AAAAAAAAAA") throw conflict();
+            },
         ),
         "BBBBBBBBBB",
     );
     check("撞码重试确实换过码", picked, 3);
     await rejects("一直撞码则明确报错而不是死循环", () =>
-        pickUniqueInviteCode(
+        insertWithUniqueCode(
             () => "AAAAAAAAAA",
-            async () => true,
+            async () => {
+                throw conflict();
+            },
         ),
     );
+    // 不是唯一冲突的错误必须原样抛出：换几次码结果一样，吞掉只会把真故障伪装成「邀请码生成失败」。
+    let attempts = 0;
+    await rejects("非唯一冲突的错误不重试直接抛出", () =>
+        insertWithUniqueCode(
+            () => "CCCCCCCCCC",
+            async () => {
+                attempts += 1;
+                throw new Error("connection lost");
+            },
+        ),
+    );
+    check("非唯一冲突只尝试一次", attempts, 1);
+    check("识别 SQLite 唯一冲突", isUniqueViolation(conflict()), true);
+    check("识别 MySQL 唯一冲突", isUniqueViolation({ code: "ER_DUP_ENTRY" }), true);
+    check("识别 Postgres 唯一冲突", isUniqueViolation({ driverError: { code: "23505" } }), true);
+    check("普通错误不算唯一冲突", isUniqueViolation(new Error("boom")), false);
+
+    // 真实数据库上的冲突恢复：把生成器钉死在一个已被占用的码上一次，第二次给新码，必须成功落库。
+    const occupied = (await repo(TeamInvite).findOneByOrFail({ id: dup.id })).code as string;
+    const replacement = "ZZZZZZZZZZ";
+    const retryId = newId("team-invite");
+    const sequence = [occupied, replacement];
+    let cursor = 0;
+    const settled = await insertWithUniqueCode(
+        () => sequence[cursor++],
+        async (code: string) => {
+            await repo(TeamInvite).insert({ id: retryId, teamId: host.id, kind: "code", tokenHash: "", tokenPrefix: "", code, role: "member", maxUses: 1, usedCount: 0, enabled: true, expiresAt: "", createdBy: "user-host", note: "", createdAt: now() });
+        },
+    );
+    check("真实唯一冲突后重试写入成功", settled, replacement);
+    check("重试后落库的是新码", (await repo(TeamInvite).findOneByOrFail({ id: retryId })).code, replacement);
 
     // 带时区偏移的过期时间必须归一化成 UTC ISO：直接原样入库的话，
     // claimSlot 的字符串比较与 Date.parse 判定会分家，已过期的邀请在并发路径上还能被领走。
@@ -575,6 +611,37 @@ async function main() {
     publishTeamMember(host.id, { type: "member.joined", userId: "user-none", role: "member" });
     check("退订后不再收到事件", events.length, before);
     check("没有连接时断连返回 0", closeTeamConnectionsOf(host.id, "user-nobody"), 0);
+
+    // 断连必须连同总线 listener 一起退订。只关连接不退订的话，被移除的人页面早就没了，
+    // 进程里还留着他的回调，团队每变更一次就白跑一遍，重新入队时还会收到两份事件。
+    const { teamListenerCount } = await import("./src/services/team-realtime");
+    check("退订后总线上不留 listener", teamListenerCount(host.id), 0);
+    const leaked: unknown[] = [];
+    subscribeTeam(host.id, "user-leak", (event) => leaked.push(event), () => undefined);
+    check("订阅后总线上有一个 listener", teamListenerCount(host.id), 1);
+    check("断连返回被关闭的连接数", closeTeamConnectionsOf(host.id, "user-leak"), 1);
+    check("断连后总线 listener 已退订", teamListenerCount(host.id), 0);
+    publishTeamMember(host.id, { type: "member.joined", userId: "user-none", role: "member" });
+    check("断连后不再收到事件", leaked.length, 0);
+    // 断连之后调用方再退订一次不能把别人的 listener 误伤掉，也不能报错。
+    const stopLeak = subscribeTeam(host.id, "user-leak2", () => undefined);
+    const stopKeeper = subscribeTeam(host.id, "user-keeper", () => undefined);
+    closeTeamConnectionsOf(host.id, "user-leak2");
+    stopLeak();
+    check("重复退订不影响其他订阅者", teamListenerCount(host.id), 1);
+    stopKeeper();
+    check("全部退订后归零", teamListenerCount(host.id), 0);
+
+    console.log("转让广播");
+    const relay = await createTeam("user-relay-a", { name: "转让广播团队" });
+    await repo(TeamMember).insert({ teamId: relay.id, userId: "user-relay-b", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-relay-a", joinedAt: now(), updatedAt: now() });
+    const relayEvents: Array<{ type: string; userId: string; role: string }> = [];
+    const stopRelay = subscribeTeam(relay.id, "user-relay-a", (event) => relayEvents.push(event));
+    await transferOwner(relay.id, "user-relay-a", "user-relay-b");
+    // 只广播新 owner 的话，其他人页面上会同时挂着两个 owner，旧 owner 那边还留着他已经点不动的入口。
+    check("转让广播新 owner 的 roleChanged", relayEvents.filter((event) => event.type === "member.roleChanged" && event.userId === "user-relay-b" && event.role === "owner").length, 1);
+    check("转让广播旧 owner 降为 admin", relayEvents.filter((event) => event.type === "member.roleChanged" && event.userId === "user-relay-a" && event.role === "admin").length, 1);
+    stopRelay();
 
     console.log("邀请状态校验");
     // 停用与过期各用一条独立的、名额充足的邀请：共用一条的话后一个用例会被前一个吃掉的名额掩盖，

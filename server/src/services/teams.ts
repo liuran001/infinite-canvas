@@ -178,6 +178,11 @@ export async function transferOwner(teamId: string, actorId: string, targetId: s
         await members.update({ teamId, userId: targetId }, { role: "owner", updatedAt: now() });
         await manager.getRepository(Team).update({ id: teamId }, { ownerId: targetId, updatedAt: now() });
     });
+    // 广播放在提交之后：事务里发出去的话，回滚时事件已经收不回来，界面会显示一次没发生的转让。
+    // 新旧 owner 各发一条：只发新 owner 的话，其他人页面上会同时看到两个 owner，
+    // 而旧 owner 自己的界面还留着「解散团队」这种他已经点不动的入口。
+    publishTeamMember(teamId, { type: "member.roleChanged", userId: actorId, role: "admin" });
+    publishTeamMember(teamId, { type: "member.roleChanged", userId: targetId, role: "owner" });
 }
 
 /**

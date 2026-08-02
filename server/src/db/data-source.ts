@@ -5,6 +5,7 @@ import { DataSource, type EntityManager } from "typeorm";
 
 import { config } from "../config";
 import { entities } from "./entities";
+import { finishTeamInviteUpgrade, prepareTeamInviteUpgrade } from "./upgrade";
 
 function driverType() {
     const driver = config.databaseDriver;
@@ -46,10 +47,31 @@ function buildDataSource() {
 
 export const dataSource = buildDataSource();
 
+/**
+ * 只用来看一眼旧表结构的临时连接：`synchronize: false`，绝不建表。
+ * 用正式连接做检查是来不及的——initialize 一返回，synchronize 已经跑完（或者已经炸了）。
+ */
+function buildInspector() {
+    const type = driverType();
+    const common = { entities, synchronize: false, logging: false } as const;
+    if (type === "sqlite") return new DataSource({ type: "better-sqlite3", database: config.databaseDsn, ...common });
+    return new DataSource({ type, url: config.databaseDsn, ...common });
+}
+
 export async function initDatabase() {
     const type = driverType();
     if (type !== "sqlite") await ensureDatabase(type);
+    // 旧库要先兜住 TeamInvite.code 的约束变更，否则 synchronize 建唯一索引时直接抛错、进程起不来。
+    const inspector = buildInspector();
+    await inspector.initialize();
+    let pending = false;
+    try {
+        pending = await prepareTeamInviteUpgrade(inspector);
+    } finally {
+        await inspector.destroy();
+    }
     await dataSource.initialize();
+    await finishTeamInviteUpgrade(dataSource, pending);
     fs.mkdirSync(config.dataDir, { recursive: true });
 }
 

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { imageSize } from "image-size";
 import mime from "mime-types";
 
-import { dataSource, repo } from "../db/data-source";
+import { dataSource, repo, serialTransaction } from "../db/data-source";
 import { PhysicalBlob, StoredFile } from "../db/entities";
 import { fail, newId, now } from "../lib/errors";
 import { markBlobPending, reviveBlob } from "./blob-gc";
@@ -76,6 +76,10 @@ export async function saveFile(userId: string, body: Buffer, mimeType: string, m
             const path = objectKey(id, type);
             await putObject(path, body, type, storage);
             const candidate = repo(PhysicalBlob).create({ checksum, bytes: body.length, kind, mimeType: type, width: meta.width || imageMeta.width || 0, height: meta.height || imageMeta.height || 0, durationMs: meta.durationMs || 0, storage, path, refCount: 0, state: "active", pendingSince: "", createdAt: now() });
+            // 这个 catch 只允许吞「别人抢先插进去了」这一种情况：紧接着的 findOneByOrFail 会重新读一次，
+            // 读得到说明确实是并发落选，读不到就在那里抛错。所以真实故障（列长度、连接断开）不会被这层吞掉，
+            // 只是把报错点从 insert 挪到了下一行——不能把 catch 去掉换成判断错误码，
+            // 三种驱动的唯一冲突标识各不相同，而这里的正确性本来就不依赖区分错误类型。
             await repo(PhysicalBlob).insert(candidate).catch(() => undefined);
             blob = await repo(PhysicalBlob).findOneByOrFail({ checksum });
             // 多实例同时首传时只有一个 insert 能赢。输家写出的对象没人引用，必须回收；
@@ -86,7 +90,10 @@ export async function saveFile(userId: string, body: Buffer, mimeType: string, m
             await reviveBlob(checksum);
         }
         const file = repo(StoredFile).create({ id, userId, kind: blob.kind, mimeType: blob.mimeType, bytes: Number(blob.bytes), width: blob.width, height: blob.height, durationMs: blob.durationMs, storage: blob.storage, path: blob.path, checksum, createdAt: now() });
-        await dataSource.transaction(async (manager) => {
+        // 走全局串行队列而不是 dataSource.transaction：SQLite 全程只有一条连接，
+        // 绕过队列直接 BEGIN 会撞上别人已经打开的事务（「cannot start a transaction within a transaction」），
+        // 更糟的是落进别人的事务里，对方一回滚就把这次引用计数一起抹掉。
+        await serialTransaction(async (manager) => {
             await manager.getRepository(StoredFile).insert(file);
             await manager.getRepository(PhysicalBlob).createQueryBuilder().update().set({ refCount: () => `${column("refCount")} + 1`, state: "active", pendingSince: "" }).where("checksum = :checksum", { checksum }).execute();
         });
@@ -111,7 +118,7 @@ export async function getFile(id: string, userId?: string) {
 export async function deleteFile(id: string, userId: string) {
     const file = await getFile(id, userId);
     await withBlobLock(file.checksum, async () => {
-        await dataSource.transaction(async (manager) => {
+        await serialTransaction(async (manager) => {
             const deleted = await manager.getRepository(StoredFile).delete({ id, userId });
             if (!deleted.affected) return;
             await manager.getRepository(PhysicalBlob).createQueryBuilder().update().set({ refCount: () => `CASE WHEN ${column("refCount")} > 0 THEN ${column("refCount")} - 1 ELSE 0 END` }).where("checksum = :checksum", { checksum: file.checksum }).execute();

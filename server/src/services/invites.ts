@@ -1,34 +1,16 @@
-import { randomInt } from "node:crypto";
 import { In, Like } from "typeorm";
 
 import { dataSource, repo } from "../db/data-source";
 import { InviteCode, InviteUse, User } from "../db/entities";
 import { fail, newId, now } from "../lib/errors";
+// 码值规则住在 lib：启动时的旧库升级也要用同一套，而它不能依赖任何 service。
+import { newInviteCode, normalizeInviteCode } from "../lib/invite-code";
 import type { Query } from "../lib/response";
 
-/**
- * 码值字母表刻意去掉 0/O/1/I/L 这些形近字：邀请码是要人手抄手输的，
- * 留着它们的唯一结果就是用户反复输错然后来问「为什么说我的码无效」。
- */
-const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-const CODE_LENGTH = 10;
+export { newInviteCode, normalizeInviteCode };
+
 /** 一次批量生成的上限。挡住手滑把 count 填成 100000 直接把库刷爆。 */
 const MAX_BATCH = 200;
-
-/** 用 CSPRNG 逐位取字符，31^10 ≈ 8e14 种组合，既猜不出也扫不完，不会被枚举出来。 */
-export function newInviteCode() {
-    let code = "";
-    for (let index = 0; index < CODE_LENGTH; index += 1) code += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
-    return code;
-}
-
-/**
- * 大小写策略：字母表本来就只有大写，所以存与比对一律先 trim 再转大写，
- * 用户输 abc 还是 ABC 都能命中，各个入口不用各写一套归一化。
- */
-export function normalizeInviteCode(code: string) {
-    return String(code || "").trim().toUpperCase();
-}
 
 /** 原子更新里要拼列名，各方言的引号不同，交给驱动去转义。 */
 const column = (name: string) => dataSource.driver.escape(name);

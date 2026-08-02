@@ -1,6 +1,6 @@
 import type { EntityManager } from "typeorm";
 
-import { dataSource, repo } from "../db/data-source";
+import { dataSource, repo, serialTransaction } from "../db/data-source";
 import { DEFAULT_STORAGE_QUOTA, PhysicalBlob, Project, ProjectShare, StoredFile, User } from "../db/entities";
 import { CLONE_DISABLED, fail, FORBIDDEN, newId, now, QUOTA_EXCEEDED } from "../lib/errors";
 import { withBlobLock } from "./files";
@@ -33,7 +33,7 @@ export async function cloneSharedProject(share: ProjectShare, clonerId: string, 
     if (!shareUsable(share)) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
     if (!share.allowClone) throw fail("这条分享链接不允许保存副本", 403, CLONE_DISABLED);
 
-    const cloned = await dataSource.transaction(async (manager) => {
+    const cloned = await serialTransaction(async (manager) => {
         const source = await manager.getRepository(Project).findOneBy({ userId: share.ownerId, projectId: share.projectId });
         if (!source || source.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
 

@@ -3,9 +3,10 @@ import type { EntityManager } from "typeorm";
 
 import { dataSource, repo, serialTransaction } from "../db/data-source";
 import { Team, TeamInvite, TeamInviteUse, TeamMember, type TeamInviteKind, type TeamRole } from "../db/entities";
+import { canonicalExpiresAt } from "../db/upgrade";
 import { fail, newId, now } from "../lib/errors";
 // 手输码的字母表与长度只此一份：复制第二份的下场是某天有人改了形近字规则，另一处还在发旧格式的码。
-import { newInviteCode, normalizeInviteCode } from "./invites";
+import { newInviteCode, normalizeInviteCode } from "../lib/invite-code";
 import { requireTeamRole } from "./team-access";
 import { publishTeamMember } from "./team-realtime";
 
@@ -34,26 +35,43 @@ export function teamInviteTokenHash(token: string) {
  * 过期时间归一化成 UTC ISO。库里存什么格式决定了 `claimSlot` 的字符串比较是否等价于时间比较：
  * 原样存下 `2026-08-04T00:00:00+08:00` 的话，它与 `...Z` 的字典序和真实先后毫无关系，
  * 于是 `assertUsable`（Date.parse）说已过期、`claimSlot`（字符串）说还能领，并发路径就漏了。
+ * 规则本身在 db/upgrade 里，升级旧数据与新写入必须用同一套，否则升级完的库仍然是分裂的。
  */
 function normalizeExpiresAt(value: unknown) {
-    const raw = String(value ?? "").trim();
-    if (!raw) return "";
-    const at = Date.parse(raw);
-    if (Number.isNaN(at)) throw fail("过期时间格式不正确", 400, "TEAM_INVITE_INVALID");
-    return new Date(at).toISOString();
+    const canonical = canonicalExpiresAt(value);
+    if (canonical === null) throw fail("过期时间格式不正确", 400, "TEAM_INVITE_INVALID");
+    return canonical;
 }
 
 /**
- * 生成一个库里还没有的手输码。撞码本身几乎不会发生，但一旦发生，
- * 让唯一约束把 500 甩给点「创建邀请」的管理员是最没道理的处理方式。
- * 生成器与查重都从参数进来，测试可以直接喂脚本化的序列，生产接口上不留任何测试开关。
+ * 生成一个库里还没有的手输码并把邀请写进去。
+ *
+ * 关键在于重试的是 insert 而不是「先查再写」：先 countBy 再 insert 之间隔着一次网络往返，
+ * 两个管理员同时创建时完全可能双双查到「没人用」，然后其中一个撞在唯一约束上收到 500。
+ * 唯一索引是唯一可信的裁判，所以直接写、写失败就换个码重来；查重那一步连做都不做。
+ * 生成器与写入都从参数进来，测试可以喂脚本化的序列和会冲突的写入，生产接口上不留任何测试开关。
  */
-export async function pickUniqueInviteCode(generate: () => string, taken: (code: string) => Promise<boolean>) {
+export async function insertWithUniqueCode(generate: () => string, insert: (code: string) => Promise<void>) {
     for (let attempt = 0; attempt < CODE_RETRIES; attempt += 1) {
         const code = generate();
-        if (!(await taken(code))) return code;
+        try {
+            await insert(code);
+            return code;
+        } catch (error) {
+            // 只有唯一冲突值得换个码重来。列长度、外键、连接断开这些换几次码也是一样的结果，
+            // 吞掉它们只会把真正的故障拖成一条「邀请码生成失败」的假线索。
+            if (attempt + 1 >= CODE_RETRIES || !isUniqueViolation(error)) throw error;
+        }
     }
     throw fail("邀请码生成失败，请重试", 500, "TEAM_INVITE_CODE_EXHAUSTED");
+}
+
+/** 三种驱动报唯一冲突的方式各不相同，这里按各自的稳定标识判断，不去猜中文/英文错误文案。 */
+export function isUniqueViolation(error: unknown) {
+    const carrier = error as { code?: unknown; errno?: unknown; driverError?: { code?: unknown } } | null;
+    const code = String(carrier?.driverError?.code ?? carrier?.code ?? "");
+    // SQLite: SQLITE_CONSTRAINT_UNIQUE / SQLITE_CONSTRAINT；MySQL: ER_DUP_ENTRY(1062)；Postgres: 23505。
+    return code.startsWith("SQLITE_CONSTRAINT") || code === "ER_DUP_ENTRY" || String(carrier?.errno ?? "") === "1062" || code === "23505";
 }
 
 /** 列表视图只回前缀：链接明文只在创建响应里出现一次，之后服务端自己也拿不回来。 */
@@ -86,14 +104,13 @@ export async function createTeamInvite(teamId: string, actorId: string, input: T
     const maxUses = input.maxUses === undefined ? (kind === "code" ? 1 : 0) : Math.max(0, Math.floor(Number(input.maxUses) || 0));
     const expiresAt = normalizeExpiresAt(input.expiresAt);
     const token = kind === "link" ? randomBytes(TOKEN_BYTES).toString("base64url") : "";
-    const code = kind === "code" ? await pickUniqueInviteCode(newInviteCode, async (candidate) => Boolean(await repo(TeamInvite).countBy({ code: candidate }))) : null;
     const invite = repo(TeamInvite).create({
         id: newId("team-invite"),
         teamId,
         kind,
         tokenHash: token ? teamInviteTokenHash(token) : "",
         tokenPrefix: token.slice(0, TOKEN_PREFIX_LENGTH),
-        code,
+        code: null,
         role,
         maxUses,
         usedCount: 0,
@@ -103,7 +120,15 @@ export async function createTeamInvite(teamId: string, actorId: string, input: T
         note: String(input.note || "").trim(),
         createdAt: now(),
     });
-    await repo(TeamInvite).insert(invite);
+    if (kind === "code") {
+        // 码由 insert 本身定夺：撞上唯一索引就换一个再写，不做「先查再写」那种有窗口期的预检。
+        invite.code = await insertWithUniqueCode(newInviteCode, async (candidate) => {
+            invite.code = candidate;
+            await repo(TeamInvite).insert(invite);
+        });
+    } else {
+        await repo(TeamInvite).insert(invite);
+    }
     return { ...teamInviteView(invite), token };
 }
 

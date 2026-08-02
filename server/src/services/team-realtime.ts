@@ -16,26 +16,36 @@ export type TeamMemberEvent = { type: "member.joined" | "member.left" | "member.
 const bus = new EventEmitter();
 bus.setMaxListeners(0);
 const channel = (teamId: string) => `team:${teamId}`;
-/** 每条长连接登记自己属于哪个用户，成员被移除时才找得到该关谁。 */
-const closers = new Map<string, Set<() => void>>();
+
+/**
+ * 每条长连接登记成一个「订阅句柄」：总线 listener 与断连回调绑在一起。
+ * 早先只登记 onClose，退订 listener 得靠路由自己在断连回调里再调一次返回的函数——
+ * 漏掉一次就是一个永久泄漏的 listener，被移除的成员早已看不到页面，进程里却还留着他的回调，
+ * 而且他被重新拉回团队时会收到两份事件。现在退订由本模块自己保证，调用方漏不掉。
+ */
+type Subscription = { listener: (event: TeamMemberEvent) => void; onClose?: () => void };
+const subscriptions = new Map<string, Set<Subscription>>();
 const closerKey = (teamId: string, userId: string) => `${teamId}:${userId}`;
 
 export function subscribeTeam(teamId: string, userId: string, listener: (event: TeamMemberEvent) => void, onClose?: () => void) {
     const key = channel(teamId);
+    const mapKey = closerKey(teamId, userId);
+    const subscription: Subscription = { listener, onClose };
     bus.on(key, listener);
-    const closeKey = closerKey(teamId, userId);
-    if (onClose) {
-        const set = closers.get(closeKey) || new Set<() => void>();
-        set.add(onClose);
-        closers.set(closeKey, set);
-    }
-    return () => {
-        bus.off(key, listener);
-        if (!onClose) return;
-        const set = closers.get(closeKey);
-        if (!set?.delete(onClose)) return;
-        if (!set.size) closers.delete(closeKey);
-    };
+    const set = subscriptions.get(mapKey) || new Set<Subscription>();
+    set.add(subscription);
+    subscriptions.set(mapKey, set);
+    // 退订与「被踢下线」走同一条清理路径，两边都只会执行一次。
+    return () => dropSubscription(teamId, userId, subscription);
+}
+
+function dropSubscription(teamId: string, userId: string, subscription: Subscription) {
+    const mapKey = closerKey(teamId, userId);
+    const set = subscriptions.get(mapKey);
+    if (!set?.delete(subscription)) return false;
+    if (!set.size) subscriptions.delete(mapKey);
+    bus.off(channel(teamId), subscription.listener);
+    return true;
 }
 
 export function publishTeamMember(teamId: string, event: Omit<TeamMemberEvent, "teamId">) {
@@ -43,24 +53,29 @@ export function publishTeamMember(teamId: string, event: Omit<TeamMemberEvent, "
 }
 
 /**
- * 主动断开某个成员在该团队下的长连接。
+ * 主动断开某个成员在该团队下的长连接，并同时退订他的总线 listener。
  * 移除成员只删数据库行是不够的：SSE 建好之后不重连就不会重新鉴权，
  * 被移出的人页面上会一直挂着旧角色的团队视图，直到他自己刷新。
+ * 退订必须在这里一并做掉——指望调用方的断连回调里再退一次，就是指望每个路由都记得，记不住的那次就是泄漏。
  */
 export function closeTeamConnectionsOf(teamId: string, userId: string) {
-    const key = closerKey(teamId, userId);
-    const set = closers.get(key);
+    const set = subscriptions.get(closerKey(teamId, userId));
     if (!set) return 0;
-    closers.delete(key);
     let closed = 0;
-    for (const close of set) {
+    for (const subscription of [...set]) {
+        dropSubscription(teamId, userId, subscription);
         closed += 1;
         // 对端可能已经断了，关不掉不该影响剩下的连接。
         try {
-            close();
+            subscription.onClose?.();
         } catch (error) {
             console.warn("关闭被移除成员的团队连接失败：", error);
         }
     }
     return closed;
+}
+
+/** 仅供验证脚本使用：确认退订之后总线上真的一个 listener 都不剩。 */
+export function teamListenerCount(teamId: string) {
+    return bus.listenerCount(channel(teamId));
 }
