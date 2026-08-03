@@ -15,7 +15,7 @@ async function main() {
     const { check, rejects, finish } = createChecker();
     const { initDatabase, repo } = await import("./src/db/data-source");
     const { PhysicalBlob, Project, ProjectAccessLog, ProjectShare, StoredFile, User } = await import("./src/db/entities");
-    const { createShare, findShareByToken, guestSessionOf, logShareAccess, resetShareRuntimeState, shareRevokesAccess, shareTokenHash, signGuestToken, updateShare, verifyGuestToken, assertShareUploadAllowed } = await import("./src/services/project-share");
+    const { createShare, findShareByToken, guestSessionOf, listShares, logShareAccess, ownerShareView, resetShareRuntimeState, shareRevokesAccess, shareTokenHash, shareView, signGuestToken, updateShare, verifyGuestToken, assertShareUploadAllowed } = await import("./src/services/project-share");
     const { resolveProjectAccess } = await import("./src/services/project-access");
     const { disconnectShare, listProjectPresence, subscribeProject, updateProjectPresence } = await import("./src/services/project-realtime");
     const { cloneSharedProject } = await import("./src/services/project-clone");
@@ -80,8 +80,34 @@ async function main() {
     await shares.delete({ projectId: "p1", role: "viewer", allowClone: false });
     check("清理批量生成的分享后只剩一条只读分享", await shares.countBy({ projectId: "p1" }), 1);
 
+    console.log("明文回显与可复制状态");
+    // 分享链接要随时可复制，所以明文与哈希各存一列。哈希仍是校验的唯一入口，明文只负责回显。
+    check("明文落库供所有者随时取回", (await shares.findOneByOrFail({ id: viewer.share.id })).token, viewer.token);
+    const owned = ownerShareView(await shares.findOneByOrFail({ id: viewer.share.id }));
+    check("所有者视图带出完整明文", owned.token, viewer.token);
+    check("所有者视图标记为可复制", owned.copyable, true);
+    check("列表里同样能取回明文", (await listShares("p1", "owner-1")).find((row) => row.id === viewer.share.id)?.token, viewer.token);
+    // 默认视图是给一切非所有者路径用的，它永远不能带明文——带出去的可能是一条能编辑别人画布的链接。
+    const anonymousView = shareView(await shares.findOneByOrFail({ id: viewer.share.id })) as { token?: string; copyable: boolean };
+    check("默认视图不带明文", anonymousView.token, undefined);
+    check("默认视图恒为不可复制", anonymousView.copyable, false);
+    check("默认视图仍然给出前缀", shareView(await shares.findOneByOrFail({ id: viewer.share.id })).tokenPrefix, viewer.share.tokenPrefix);
+    // 存量记录建于「只存哈希」的年代，明文不可逆推。它必须表现成「不可复制」，
+    // 而不是给前端一个空串让它自己猜——猜错就是把残缺链接渲染成可复制的样子让用户发出去。
+    await shares.update({ id: viewer.share.id }, { token: "" });
+    const legacy = ownerShareView(await shares.findOneByOrFail({ id: viewer.share.id }));
+    check("存量记录标记为不可复制", legacy.copyable, false);
+    check("存量记录不给出残缺明文", legacy.token, undefined);
+    check("存量记录仍然给出前缀", legacy.tokenPrefix, viewer.share.tokenPrefix);
+    // 最要紧的一条：明文列为空绝不能影响校验，校验走的是 tokenHash。
+    check("存量记录的 token 校验照常通过", (await findShareByToken(viewer.token))?.id, viewer.share.id);
+    await shares.update({ id: viewer.share.id }, { token: viewer.token });
+
     console.log("token 校验");
     check("正确 token 能查到分享", (await findShareByToken(viewer.token))?.id, viewer.share.id);
+    // 校验一律按哈希等值查询定位。改成认明文列的话，存量记录（明文为空）会全部失效，
+    // 而且空串会互相撞在一起，一条空明文能匹配到任意一条老分享。
+    check("明文对不上哈希时查不到", await findShareByToken(`${viewer.token}x`), null);
     check("错误 token 查不到", await findShareByToken("deadbeefdeadbeefdeadbeef"), null);
     check("空 token 查不到", await findShareByToken(""), null);
     await shares.update({ id: viewer.share.id }, { enabled: false });

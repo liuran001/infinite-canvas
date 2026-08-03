@@ -425,6 +425,19 @@ export class ProjectShare {
     /** 创建分享时的项目所有者，冗余存储，配额归属与审计都以它为准。 */
     @Index() @Column(short) ownerId!: string;
     @Index({ unique: true }) @Column({ type: "varchar", length: 128 }) tokenHash!: string;
+    /**
+     * 明文 token，空串表示这条记录建于「只存哈希」的年代、再也取不回完整链接。
+     *
+     * 存明文是一个被明确权衡过的决定：分享链接需要随时可复制，而哈希不可逆，
+     * 只显示一次的链接用户一旦没存下来就只能重建一条、把已经发出去的旧链接作废。
+     * 代价是数据库被拖库或备份泄露时，所有分享链接（含可编辑链接）可以直接使用——
+     * 这一点已经知情并接受。因此这一列绝不能出现在任何非所有者可达的响应里。
+     *
+     * 校验路径一个字都不走这一列：定位仍靠 tokenHash 上的唯一索引做等值查询。
+     * 改成按明文查的话要再建一条索引，而且等于把「能不能登录进来」这件事挂到了一列
+     * 随时可能为空的历史数据上。这一列只负责回显。
+     */
+    @Column(short) token!: string;
     /** 明文前若干字符，只够管理界面区分「这是哪一条链接」，不足以还原 token。 */
     @Column({ type: "varchar", length: 16, default: "" }) tokenPrefix!: string;
     @Column({ type: "varchar", length: 16, default: "viewer" }) role!: ShareRole;

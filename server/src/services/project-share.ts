@@ -6,7 +6,17 @@ import { repo } from "../db/data-source";
 import { ProjectAccessLog, ProjectShare, type ShareAccessEvent, type ShareRole } from "../db/entities";
 import { fail, newId, now, RATE_LIMITED } from "../lib/errors";
 
-/** 192 bit 随机值，base64url 后固定 32 个字符。 */
+/**
+ * 分享 token 的存储形态：哈希与明文各存一列，职责完全分开。
+ *
+ * tokenHash 是校验的唯一入口——唯一索引上的等值查询，一个字都不走明文列。
+ * token 是明文，只为了让所有者随时能把链接复制出来；这是一个知情的取舍：
+ * 只显示一次的链接，用户没存下来就只能重建一条、作废已经发出去的旧链接，
+ * 代价则是拖库或备份泄露时所有链接（含可编辑链接）直接可用。
+ *
+ * 由此引出这个模块最要紧的一条规矩：明文只允许经 ownerShareView 出去，
+ * 默认的 shareView 永远不带它。改这里之前先想清楚新的调用点是谁在调。
+ */
 const TOKEN_BYTES = 24;
 const TOKEN_PREFIX_LENGTH = 8;
 /** 短 TTL 让撤销的爆炸半径有上界；长连接的撤销由实时总线当场处理，不靠过期兜底。 */
@@ -57,13 +67,21 @@ export function shareUsable(share: ProjectShare, at = Date.now()) {
     return !share.expiresAt || Date.parse(share.expiresAt) > at;
 }
 
+/**
+ * 对外的分享视图。**这个函数永远不带明文 token**，是给所有非所有者路径用的默认形态。
+ *
+ * 做成「默认安全的函数 + 一个显式的所有者版本」，而不是「一个函数加个 includeToken 参数」：
+ * 加参数的话，将来任何一个新调用点只要忘了传（或者传错），泄露的就是一条能直接编辑别人画布的链接，
+ * 而这种遗漏在 review 里几乎看不出来。现在要泄露必须主动改用另一个名字里就写着 owner 的函数。
+ */
 export function shareView(share: ProjectShare) {
     return {
         id: share.id,
         projectId: share.projectId,
         role: share.role,
-        // 明文只在创建响应里出现一次，列表接口一律只回前缀。
         tokenPrefix: share.tokenPrefix,
+        // 恒为 false：这个视图本来就不带明文，调用方不必再自己判断身份。
+        copyable: false,
         allowAnonymous: share.allowAnonymous,
         allowClone: share.allowClone,
         enabled: share.enabled,
@@ -73,6 +91,18 @@ export function shareView(share: ProjectShare) {
     };
 }
 
+/**
+ * 画布所有者视角的分享视图，带完整明文链接。只允许在已经确认过所有者身份之后调用。
+ *
+ * copyable 是给前端的显式状态，而不是让它拿 token 是否为空串去猜：
+ * 「旧链接取不回明文」和「这次请求出了别的岔子」在前端看来都是一个空字符串，
+ * 猜错的后果是把一条残缺链接渲染成可复制的样子让用户发出去。
+ */
+export function ownerShareView(share: ProjectShare) {
+    const token = share.token || "";
+    return { ...shareView(share), copyable: Boolean(token), ...(token ? { token } : {}) };
+}
+
 export async function createShare(ownerId: string, projectId: string, input: ShareInput) {
     const token = randomBytes(TOKEN_BYTES).toString("base64url");
     const share = repo(ProjectShare).create({
@@ -80,6 +110,7 @@ export async function createShare(ownerId: string, projectId: string, input: Sha
         projectId,
         ownerId,
         tokenHash: shareTokenHash(token),
+        token,
         tokenPrefix: token.slice(0, TOKEN_PREFIX_LENGTH),
         role: input.role,
         allowAnonymous: input.allowAnonymous,
@@ -93,8 +124,9 @@ export async function createShare(ownerId: string, projectId: string, input: Sha
     return { share, token };
 }
 
+/** 查询条件里带着 ownerId，所以这里返回的每一条都属于调用者本人，可以带明文。 */
 export async function listShares(projectId: string, ownerId: string) {
-    return (await repo(ProjectShare).find({ where: { projectId, ownerId }, order: { createdAt: "DESC" } })).map(shareView);
+    return (await repo(ProjectShare).find({ where: { projectId, ownerId }, order: { createdAt: "DESC" } })).map(ownerShareView);
 }
 
 export async function getOwnedShare(shareId: string, projectId: string, ownerId: string) {

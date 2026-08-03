@@ -7,12 +7,21 @@ import { requestOrigin } from "../services/auth";
 import { cloneSharedProject } from "../services/project-clone";
 import { resolveProjectAccess } from "../services/project-access";
 import { disconnectShare } from "../services/project-realtime";
-import { createShare, findShareByToken, getOwnedShare, guestSessionOf, guestTokenTtl, listShareLogs, listShares, logShareAccess, shareRevokesAccess, shareView, signGuestToken, updateShare, verifyGuestToken, type ShareInput } from "../services/project-share";
+import { createShare, findShareByToken, getOwnedShare, guestSessionOf, guestTokenTtl, listShareLogs, listShares, logShareAccess, ownerShareView, shareRevokesAccess, signGuestToken, updateShare, verifyGuestToken, type ShareInput } from "../services/project-share";
 
 // 鉴权逐个路由挂：分享管理必须是本人，token 交换却要给未登录的访客留入口，整段套一个中间件必然堵死其中一边。
 export const shareRouter = Router();
 
 const MAX_LOG_PAGE = 200;
+
+/**
+ * 拼出完整分享地址。在路由层拼而不是在 service 里：主机名只有请求头知道，
+ * 反向代理后面尤其如此，service 拿不到也不该去猜。
+ * 取不回明文的历史记录不带 url——给一条 `/s/` 结尾的残缺地址，用户照样会把它复制出去。
+ */
+function withShareUrl<T extends { token?: string }>(req: Parameters<typeof requestOrigin>[0], view: T) {
+    return view.token ? { ...view, url: `${requestOrigin(req)}/s/${view.token}` } : view;
+}
 
 function readShareInput(body: Record<string, unknown>): ShareInput {
     const role = body.role === "editor" ? "editor" : "viewer";
@@ -34,9 +43,8 @@ shareRouter.post(
     handle(async (req, res) => {
         const projectId = String(req.params.id);
         const access = await ownerAccess(req, projectId);
-        const { share, token } = await createShare(access.ownerId, projectId, readShareInput(req.body || {}));
-        // 明文只在这一次响应里出现，之后连所有者自己都取不回来，只能重新建一条。
-        ok(res, { ...shareView(share), token, url: `${requestOrigin(req)}/s/${token}` });
+        const { share } = await createShare(access.ownerId, projectId, readShareInput(req.body || {}));
+        ok(res, withShareUrl(req, ownerShareView(share)));
     }),
 );
 
@@ -46,7 +54,7 @@ shareRouter.get(
     handle(async (req, res) => {
         const projectId = String(req.params.id);
         const access = await ownerAccess(req, projectId);
-        ok(res, await listShares(projectId, access.ownerId));
+        ok(res, (await listShares(projectId, access.ownerId)).map((view) => withShareUrl(req, view)));
     }),
 );
 
@@ -71,7 +79,7 @@ shareRouter.patch(
         const updated = await updateShare(share, patch);
         // 撤销、降级、关掉匿名或过期之后还挂着的 SSE 不会重新鉴权，必须当场把它们踢下线。
         if (shareRevokesAccess(share, updated)) disconnectShare(access.ownerId, projectId, share.id);
-        ok(res, shareView(updated));
+        ok(res, withShareUrl(req, ownerShareView(updated)));
     }),
 );
 

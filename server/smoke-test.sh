@@ -479,15 +479,23 @@ TOKEN=$(echo "$SHARE" | jq -r .data.token)
 SHARE_ID=$(echo "$SHARE" | jq -r .data.id)
 check "创建分享返回明文 token" "$(printf '%s' "$TOKEN" | wc -c | tr -d ' ')" "32"
 check "创建分享返回完整链接" "$(echo "$SHARE" | jq -r .data.url | grep -c "/s/$TOKEN\$")" "1"
+check "创建分享标记为可复制" "$(echo "$SHARE" | jq -r .data.copyable)" "true"
+# 分享链接要随时可复制，所以列表也回明文——这是相对「只显示一次」的一次有意改动。
 LIST=$(curl -s "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN")
-check "列表不返回明文 token" "$(echo "$LIST" | jq -r '.data[0].token // "absent"')" "absent"
-check "列表只给出 token 前缀" "$(echo "$LIST" | jq -r '.data[0].tokenPrefix')" "$(printf '%s' "$TOKEN" | cut -c1-8)"
+check "所有者随时能取回明文 token" "$(echo "$LIST" | jq -r '.data[0].token')" "$TOKEN"
+check "列表里每条都带完整链接" "$(echo "$LIST" | jq -r '.data[0].url' | grep -c "/s/$TOKEN\$")" "1"
+check "列表标记为可复制" "$(echo "$LIST" | jq -r '.data[0].copyable')" "true"
+check "列表仍然给出 token 前缀" "$(echo "$LIST" | jq -r '.data[0].tokenPrefix')" "$(printf '%s' "$TOKEN" | cut -c1-8)"
 check "他人管理分享按画布不存在处理" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $ADMIN_TOKEN")" "404"
 
 SESSION=$(curl -s -X POST "$BASE/v1/shares/$TOKEN/session")
 GUEST=$(echo "$SESSION" | jq -r .data.token)
 check "匿名换取 guest 令牌" "$(echo "$SESSION" | jq -r .data.role)" "viewer"
 check "换令牌时带出画布元信息" "$(echo "$SESSION" | jq -r '"\(.data.project.title)/\(.data.project.revision)"')" "分享画布/1"
+# 明文只给画布所有者。访客换令牌的响应里出现它的话，一条只读链接的持有者就能拿到
+# 同一条分享的原始 token——而这条 token 正是他手里那条，但更要紧的是这条路径绝不能有任何
+# 分享记录的明文外泄，否则改天多一条「顺手把别的分享也带出去」的字段就成了越权。
+check "换令牌响应不含分享明文" "$(echo "$SESSION" | jq -r '[.. | objects | select(has("copyable"))] | length')" "0"
 check "匿名访客拿到访客昵称" "$(echo "$SESSION" | jq -r .data.displayName | grep -c '^访客-')" "1"
 check "刷新页面沿用同一个匿名 id" "$(curl -s -X POST "$BASE/v1/shares/$TOKEN/session" -H 'Content-Type: application/json' -d "{\"previousToken\":\"$GUEST\"}" | jq -r .data.actorId)" "$(echo "$SESSION" | jq -r .data.actorId)"
 FORGED_ACTOR=$(curl -s -X POST "$BASE/v1/shares/$TOKEN/session" -H 'Content-Type: application/json' -d '{"previousToken":"forged-guest-token"}' | jq -r .data.actorId)
@@ -583,6 +591,29 @@ check "撤销后长连接被主动断开" "$([ "$(($(date +%s) - REVOKE_AT))" -l
 check "撤销后旧 guest 令牌读画布返回 404" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST")" "404"
 check "撤销后旧 guest 令牌写入返回 404" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":9,"clientId":"share-editor-1"}')" "404"
 check "撤销后原始 token 也换不到令牌" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$ETOKEN/session")" "404"
+# 存量记录建于「只存哈希」的年代。它必须表现成「不可复制」并且不给出残缺链接，
+# 前端据 copyable 决定是给复制按钮还是给「旧链接只能看前缀」的说明，不能靠空串去猜。
+LEGACY=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"viewer","allowAnonymous":true,"allowClone":true}')
+LEGACY_TOKEN=$(echo "$LEGACY" | jq -r .data.token)
+LEGACY_ID=$(echo "$LEGACY" | jq -r .data.id)
+# 造一条「只存哈希」年代的记录：明文不可逆推，只能直接把这一列清掉。
+# 走 better-sqlite3 而不是 sqlite3 命令行，与上面种 Passkey 同一套做法——命令行工具不一定装了。
+cat >"$WORK/clear-share-token.js" <<'EOF'
+const [dbPath, shareId] = process.argv.slice(2);
+const db = require("better-sqlite3")(dbPath);
+db.prepare("UPDATE project_shares SET token = '' WHERE id = ?").run(shareId);
+db.close();
+EOF
+NODE_PATH="$ROOT/node_modules" node "$WORK/clear-share-token.js" "$WORK/test.db" "$LEGACY_ID"
+LEGACY_ROW=$(curl -s "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" | jq -r "[.data[] | select(.id==\"$LEGACY_ID\")][0]")
+check "存量记录标记为不可复制" "$(echo "$LEGACY_ROW" | jq -r .copyable)" "false"
+check "存量记录不给出残缺明文" "$(echo "$LEGACY_ROW" | jq -r '.token // "absent"')" "absent"
+check "存量记录不给出残缺链接" "$(echo "$LEGACY_ROW" | jq -r '.url // "absent"')" "absent"
+check "存量记录仍然给出前缀" "$(echo "$LEGACY_ROW" | jq -r .tokenPrefix)" "$(printf '%s' "$LEGACY_TOKEN" | cut -c1-8)"
+# 校验走的是 tokenHash，与明文列有没有值完全无关。
+check "存量记录的链接照样能用" "$(curl -s -X POST "$BASE/v1/shares/$LEGACY_TOKEN/session" | jq -r .data.role)" "viewer"
+curl -s -X DELETE "$BASE/v1/projects/share-p1/shares/$LEGACY_ID" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
+
 check "撤销后分享仍能查到（软删除）" "$(curl -s "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" | jq -r "[.data[] | select(.id==\"$ESHARE_ID\")][0].enabled")" "false"
 
 # 停用与过期都按「链接不存在」处理，不给 token 探测留任何信号。
