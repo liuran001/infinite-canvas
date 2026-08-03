@@ -23,7 +23,7 @@ async function main() {
     const blobs = repo(PhysicalBlob);
     const users = repo(User);
     const makeUser = async (id: string, quota: number) =>
-        users.insert({ id, username: id, password: "", email: "", displayName: id, avatarUrl: "", role: "user", credits: 0, storageQuota: quota, affCode: id, affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
+        users.insert({ id, username: id, password: "", email: "", displayName: id, displayNameCustomized: false, avatarUrl: "", role: "user", credits: 0, storageQuota: quota, affCode: id, affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
 
     await makeUser("user-a", 1 << 20);
     await makeUser("user-b", 1 << 20);
@@ -122,6 +122,17 @@ async function main() {
     check("重复删除不会把 refCount 扣穿", (await blobs.findOneByOrFail({ checksum: guarded.checksum })).refCount, 1);
     await rejects("不能删除他人的文件", () => deleteFile(stale.id, "user-b"));
     check("越权删除不影响原引用", await files.countBy({ id: stale.id }), 1);
+
+    // 团队维度加进来之后，没有团队的用户必须一个字节的行为都不变——这一节就是那条底线的回归。
+    console.log("无团队用户的行为不变");
+    const soloFirst = await saveFile("user-b", Buffer.from("solo-payload"), "text/plain");
+    check("不传 teamId 时归属仍是个人", soloFirst.teamId, "");
+    check("不传 teamId 时重复上传仍命中去重", (await saveFile("user-b", Buffer.from("solo-payload"), "text/plain")).id, soloFirst.id);
+    check("个人用量把这条算进去", await usedBytes("user-b"), otherPng.length + "solo-payload".length);
+    // 显式传空串与不传必须完全等价，否则调用方少写一个参数就换了一本账。
+    check("显式传空 teamId 等价于不传", (await saveFile("user-b", Buffer.from("solo-payload"), "text/plain", {}, "")).id, soloFirst.id);
+    await deleteFile(soloFirst.id, "user-b");
+    check("删除后个人用量退回去", await usedBytes("user-b"), otherPng.length);
 
     // 并发首传的输家会撞 file_blobs 的主键，那一条必须吞掉（下一行重新读就拿到赢家的记录）；
     // 别的错误吞掉就会被翻译成一条毫无线索的「找不到记录」。判定得认「表 + 列」这组身份：

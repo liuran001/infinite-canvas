@@ -14,8 +14,14 @@ function mb(bytes: number) {
     return `${(bytes / (1 << 20)).toFixed(1)}MB`;
 }
 
+/** 与 quota.usedBytesOf 同一套口径：团队文件占的是团队的空间，不能算进克隆者的个人用量。 */
 async function usedBytesIn(manager: EntityManager, userId: string) {
-    const row = await manager.getRepository(StoredFile).createQueryBuilder("file").select("SUM(file.bytes)", "total").where("file.userId = :userId", { userId }).getRawOne<{ total: string | number | null }>();
+    const row = await manager
+        .getRepository(StoredFile)
+        .createQueryBuilder("file")
+        .select("SUM(file.bytes)", "total")
+        .where("file.userId = :userId AND file.teamId = :teamId", { userId, teamId: "" })
+        .getRawOne<{ total: string | number | null }>();
     return Number(row?.total || 0);
 }
 
@@ -48,12 +54,15 @@ export async function cloneSharedProject(share: ProjectShare, clonerId: string, 
             const file = await files.findOneBy({ id: sourceId, userId: share.ownerId });
             if (!file) continue;
             // 克隆者已经有同一份内容时直接复用自己的引用，不给同一内容再记一次账。
-            const owned = file.checksum ? await files.findOneBy({ userId: clonerId, checksum: file.checksum }) : null;
+            // 只认克隆者个人名下的那一条：他在某个团队里有同一份内容，不代表这张个人副本能白用团队的空间。
+            const owned = file.checksum ? await files.findOneBy({ userId: clonerId, teamId: "", checksum: file.checksum }) : null;
             if (owned) {
                 mapping.set(sourceId, owned.id);
                 continue;
             }
-            const copy = files.create({ ...file, id: newId("file"), userId: clonerId, bytes: Number(file.bytes), createdAt: now() });
+            // teamId 显式清空：源文件可能挂在源画布的团队名下，照抄过来等于让访客往别人的团队空间里写东西，
+            // 而副本本身是归个人的（下面建的 Project 也是 teamId: ""）。
+            const copy = files.create({ ...file, id: newId("file"), userId: clonerId, teamId: "", bytes: Number(file.bytes), createdAt: now() });
             mapping.set(sourceId, copy.id);
             created.push(copy);
             incoming += Number(file.bytes);

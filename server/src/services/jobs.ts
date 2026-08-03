@@ -8,6 +8,7 @@ import { fail, newId, now, SafeError } from "../lib/errors";
 import { charge, payerOfJob, payerOfProject, receiptOfJob, refund } from "./billing";
 import { listFiles, publicFileUrl, saveFile, saveFileFromUrl } from "./files";
 import { createVideoTask, fileToDataUrl, generateAudio, generateImages, generateText, pollVideoTask, type GenerationParams } from "./generation";
+import { storageTeamOfProject } from "./project-team";
 import { modelCost, publicSettings, selectModelChannel } from "./settings";
 
 export type JobInput = {
@@ -124,6 +125,8 @@ export async function createJob(userId: string, input: JobInput) {
     // 付费方在创建时解析一次并固化到任务行上：任务可能跑几分钟，期间用户可能被移出团队，
     // 而退款必须回到当初扣钱的那个池子。解析只认按 userId 查得到的自己的画布，查不到就是个人。
     const payer = input.billingProjectId ? await payerOfProject(userId, input.billingProjectId) : ({ kind: "user", userId } as const);
+    // 产出文件的云空间归属单独解析并单独固化：它跟画布走，不跟着付费方回落。
+    const storageTeamId = await storageTeamOfProject(userId, input.billingProjectId || "");
 
     const job = await jobs().save({
         id: newId("job"),
@@ -146,6 +149,7 @@ export async function createJob(userId: string, input: JobInput) {
         payerKind: payer.kind,
         payerTeamId: payer.kind === "team" ? payer.teamId : "",
         payerLogId: "",
+        storageTeamId,
         createdAt: now(),
         updatedAt: now(),
         finishedAt: "",
@@ -258,7 +262,7 @@ async function runImageJob(job: Job, signal: AbortSignal) {
     const images = await generateImages(channel, job.model, settings.modelChannel.systemPrompt, job.prompt, params, references.images, signal);
     await patchJob(job, { progress: 80 });
     const files = [];
-    for (const image of images) files.push(await saveFileFromUrl(job.userId, image));
+    for (const image of images) files.push(await saveFileFromUrl(job.userId, image, undefined, job.storageTeamId || ""));
     return files.map((file) => file.id);
 }
 
@@ -278,7 +282,7 @@ async function runVideoJob(job: Job, signal: AbortSignal) {
         const state = await pollVideoTask(channel, job.model, taskId, signal);
         if (state.status === "failed") throw fail(state.error);
         if (state.status === "completed") {
-            const file = state.body ? await saveFile(job.userId, state.body, state.mimeType || "video/mp4") : await saveFileFromUrl(job.userId, state.url || "");
+            const file = state.body ? await saveFile(job.userId, state.body, state.mimeType || "video/mp4", {}, job.storageTeamId || "") : await saveFileFromUrl(job.userId, state.url || "", undefined, job.storageTeamId || "");
             return [file.id];
         }
         if (attempt % 6 === 5) await patchJob(job, { progress: Math.min(90, 20 + Math.floor((attempt / VIDEO_POLL_LIMIT) * 70)) });
@@ -290,7 +294,7 @@ async function runAudioJob(job: Job, signal: AbortSignal) {
     const channel = await selectModelChannel(job.model);
     const params = JSON.parse(job.params || "{}") as GenerationParams;
     const result = await generateAudio(channel, job.model, job.prompt, params, signal);
-    const file = await saveFile(job.userId, result.body, result.mimeType);
+    const file = await saveFile(job.userId, result.body, result.mimeType, {}, job.storageTeamId || "");
     return [file.id];
 }
 

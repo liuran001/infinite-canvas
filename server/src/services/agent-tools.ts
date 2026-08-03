@@ -5,6 +5,7 @@ import { imageTypeOf, listFiles, publicFileUrl, saveFile } from "./files";
 import type { GenerationParams } from "./generation";
 import { createJob, getJob, toJobView } from "./jobs";
 import type { AgentGenerationPreference } from "./preferences";
+import { storageTeamOfProject } from "./project-team";
 import { safeWebUrl, webFetch, webSearch } from "./search";
 import { publicSettings, type ModelCapability, type PublicSetting } from "./settings";
 import { readProjectCanvas, renameProjectCanvas, updateProjectCanvas, type CanvasNodeData, type CanvasProjectData } from "./sync";
@@ -671,7 +672,8 @@ async function importImage(ctx: ToolContext, args: Record<string, unknown>) {
     if (!mimeType) throw fail(`暂不支持 ${type} 格式的图片，请换一张 png、jpeg 或 webp 的图片地址`);
 
     // 走和用户上传同一条 saveFile：同样占云空间配额、同样按内容去重，配额不够时由它抛中文错误。
-    const file = await saveFile(ctx.userId, body, mimeType);
+    // 归属跟着画布走：团队画布里导进来的图记团队的账，和用户手动上传落在同一本账上。
+    const file = await saveFile(ctx.userId, body, mimeType, {}, await storageTeamOfProject(ctx.userId, ctx.projectId));
     return {
         storageKey: storageKeyOf(file.id),
         mimeType: file.mimeType,

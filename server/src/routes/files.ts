@@ -45,7 +45,9 @@ fileRouter.post(
             height: Number(req.body?.height) || undefined,
             durationMs: Number(req.body?.durationMs) || undefined,
         };
-        const file = await saveFile(ownerId, req.file.buffer, req.file.mimetype, meta);
+        // 团队画布里传的图记团队的账，个人画布记所有者的账。归属取的是已经解析出来的那张画布，
+        // 不读请求体里的 teamId：读了的话，一次夹带 teamId 的上传就能把文件塞进别人团队的空间。
+        const file = await saveFile(ownerId, req.file.buffer, req.file.mimetype, meta, access?.project.teamId || "");
         ok(res, { id: file.id, kind: file.kind, mimeType: file.mimeType, bytes: Number(file.bytes), width: file.width, height: file.height, durationMs: file.durationMs });
     }),
 );

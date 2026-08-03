@@ -35,6 +35,8 @@ export type AgentPendingAction = { type: "continue"; roundsUsed: number; credits
 
 /** 默认云空间配额 100MB，管理员可按用户单独调整。 */
 export const DEFAULT_STORAGE_QUOTA = 100 << 20;
+/** 团队云空间的默认配额。与个人同一起点，但两者是各自独立的账，改其中一个不影响另一个。 */
+export const DEFAULT_TEAM_STORAGE_QUOTA = 100 << 20;
 
 @Entity("users")
 export class User {
@@ -191,6 +193,13 @@ export class PhysicalBlob {
 export class StoredFile {
     @PrimaryColumn(id) id!: string;
     @Index() @Column(short) userId!: string;
+    /**
+     * 云空间的计费归属，空串表示记在 userId 的个人配额上。存量行读出来就是空串，所以加这一列不改变任何既有行为。
+     * 只由上传时画布的 Project.teamId 决定，与上传者是谁无关：团队画布里传的图记团队的账，
+     * 否则一个成员往团队画布里传素材，吃掉的是画布所有者的个人空间。
+     * userId 仍然保留：它决定的是「谁能查到、删掉这一行」，与计费归属是两件事。
+     */
+    @Index() @Column(short) teamId!: string;
     @Column({ type: "varchar", length: 32, default: "image" }) kind!: string;
     @Column({ type: "varchar", length: 128, default: "application/octet-stream" }) mimeType!: string;
     @Column({ type: "bigint", default: 0 }) bytes!: number;
@@ -313,6 +322,12 @@ export class Job {
      * 只有把它落在任务行上，退款流水才能通过 relatedId 指回原始那笔扣费，对账时「扣」与「退」能一一对上。
      */
     @Column(short) payerLogId!: string;
+    /**
+     * 产出文件记谁的云空间，空串表示记发起人个人名下。与 payerTeamId 刻意分成两列：
+     * 付费方在团队池不足时可能回落到个人，而文件归属只跟画布走——合成一列的话，一次回落就会让
+     * 团队画布里生成的图挂到某个成员名下，他一退出团队那张图就该被清掉，可团队的空间从没为它付过账。
+     */
+    @Column(short) storageTeamId!: string;
     @Column(short) createdAt!: string;
     @Index() @Column(short) updatedAt!: string;
     @Column(short) finishedAt!: string;
@@ -444,6 +459,12 @@ export class Team {
     /** 冗余当前 owner，列出「我拥有的团队」时不必再连 team_members。 */
     @Index() @Column(short) ownerId!: string;
     @Column({ type: "int", default: 0 }) credits!: number;
+    /**
+     * 团队云空间上限（字节）。建团队时取当时的系统默认值并落库，之后只由平台管理员单独调整——
+     * 与 User.storageQuota 之于 storage.defaultQuota 是同一个语义：改默认值只影响新建的团队，
+     * 已有团队的额度是管理员看得见、算得清的一个数，不会因为改了一处设置就集体变动。
+     */
+    @Column({ type: "bigint", default: DEFAULT_TEAM_STORAGE_QUOTA }) storageQuota!: number;
     /** 成员数上限，0 表示不限。 */
     @Column({ type: "int", default: 0 }) memberLimit!: number;
     @Column({ type: "varchar", length: 32, default: "active" }) status!: TeamStatus;

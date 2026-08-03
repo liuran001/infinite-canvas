@@ -27,3 +27,15 @@ export async function getProjectTeam(userId: string, projectId: string) {
     if (!project || project.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
     return { id: projectId, teamId: project.teamId || "" };
 }
+
+/**
+ * 这张画布里产生的文件该记谁的云空间。查不到画布就回落到个人：
+ * 抛错的话，一次画布刚被删掉的生成任务会连产出都存不下来，而它本来只需要记在发起人自己名下。
+ * 与付费方解析刻意分开：付费方在团队池不足时可能回落到个人，而文件归属跟着画布走，
+ * 两者纠缠在一起的话，一次回落就会让团队画布里的图悄悄挂到某个成员名下，他一退出就该被清掉。
+ */
+export async function storageTeamOfProject(userId: string, projectId: string) {
+    if (!projectId) return "";
+    const project = await repo(Project).findOneBy({ userId, projectId });
+    return project && !project.deleted ? project.teamId || "" : "";
+}

@@ -7,7 +7,7 @@ import { PhysicalBlob, StoredFile } from "../db/entities";
 import { isBlobChecksumConflict } from "../lib/db-errors";
 import { fail, newId, now } from "../lib/errors";
 import { markBlobPending, reviveBlob } from "./blob-gc";
-import { assertQuota } from "./quota";
+import { assertQuota, ownerOfUpload } from "./quota";
 import { configuredFileStorage, deleteObject, putObject } from "./storage";
 
 const IMAGE_MAX_BYTES = 30 << 20;
@@ -53,22 +53,32 @@ export async function storedObjectOf(file: StoredFile) {
     return blob ? { path: blob.path, storage: blob.storage } : { path: file.path, storage: file.storage };
 }
 
-/** 全局物理去重；每个用户仍获得独立 fileId 和逻辑配额引用。 */
-export async function saveFile(userId: string, body: Buffer, mimeType: string, meta: FileMeta = {}) {
+/**
+ * 全局物理去重；每个归属方仍获得独立 fileId 和逻辑配额引用。
+ *
+ * teamId 决定这份文件记谁的账。去重键是 (userId, teamId, checksum) 而不是只看 teamId：
+ * 一行文件的可见性与删除权仍然由 userId 决定（getFile / deleteFile 都按它判），
+ * 跨 userId 复用同一行的话，团队里另一个人的画布会引到一个他自己既读不到也删不掉的 fileId。
+ * 于是同一份内容最多可能有「个人一条 + 每个画布所有者在该团队下一条」，物理对象始终只有一个，
+ * refCount 按逻辑记录数算——个人那条绝不能顶替团队那条，否则团队画布里的图挂在个人名下，
+ * 他一退出就该被清掉，而团队的空间从来没为它付过账。
+ */
+export async function saveFile(userId: string, body: Buffer, mimeType: string, meta: FileMeta = {}, teamId = "") {
     const type = (mimeType || "application/octet-stream").split(";")[0].trim().toLowerCase() || "application/octet-stream";
     const kind = fileKind(type);
     if (!body.length) throw fail("上传文件为空");
     if (body.length > maxBytes(kind)) throw fail(sizeMessage(kind));
+    const owner = ownerOfUpload(userId, teamId);
     const checksum = createHash("sha256").update(body).digest("hex");
     return withBlobLock(checksum, async () => {
-        const existing = await repo(StoredFile).findOneBy({ userId, checksum });
+        const existing = await repo(StoredFile).findOneBy({ userId, teamId, checksum });
         if (existing) {
-            // 同用户重复上传命中去重，但物理对象可能因为对账漂移或跨实例删除被标成待回收；
+            // 重复上传命中去重，但物理对象可能因为对账漂移或跨实例删除被标成待回收；
             // 直接返回会让这个引用等着被 GC 抽走底下的对象，所以先无条件复活。
             await reviveBlob(checksum);
             return existing;
         }
-        await assertQuota(userId, body.length);
+        await assertQuota(owner, body.length);
         const id = newId("file");
         const imageMeta = readImageMeta(body, type);
         let blob = await repo(PhysicalBlob).findOneBy({ checksum });
@@ -93,7 +103,7 @@ export async function saveFile(userId: string, body: Buffer, mimeType: string, m
         } else if (blob.state === "pending_delete") {
             await reviveBlob(checksum);
         }
-        const file = repo(StoredFile).create({ id, userId, kind: blob.kind, mimeType: blob.mimeType, bytes: Number(blob.bytes), width: blob.width, height: blob.height, durationMs: blob.durationMs, storage: blob.storage, path: blob.path, checksum, createdAt: now() });
+        const file = repo(StoredFile).create({ id, userId, teamId, kind: blob.kind, mimeType: blob.mimeType, bytes: Number(blob.bytes), width: blob.width, height: blob.height, durationMs: blob.durationMs, storage: blob.storage, path: blob.path, checksum, createdAt: now() });
         // 走全局串行队列而不是 dataSource.transaction：SQLite 全程只有一条连接，
         // 绕过队列直接 BEGIN 会撞上别人已经打开的事务（「cannot start a transaction within a transaction」），
         // 更糟的是落进别人的事务里，对方一回滚就把这次引用计数一起抹掉。
@@ -105,15 +115,15 @@ export async function saveFile(userId: string, body: Buffer, mimeType: string, m
     });
 }
 
-export async function saveFileFromDataUrl(userId: string, dataUrl: string, meta?: FileMeta) {
+export async function saveFileFromDataUrl(userId: string, dataUrl: string, meta?: FileMeta, teamId = "") {
     const matched = /^data:([^;,]+)?(;base64)?,/.exec(dataUrl); if (!matched) throw fail("图片数据格式不正确");
-    const payload = dataUrl.slice(matched[0].length); return saveFile(userId, matched[2] ? Buffer.from(payload, "base64") : Buffer.from(decodeURIComponent(payload), "utf8"), matched[1] || "image/png", meta);
+    const payload = dataUrl.slice(matched[0].length); return saveFile(userId, matched[2] ? Buffer.from(payload, "base64") : Buffer.from(decodeURIComponent(payload), "utf8"), matched[1] || "image/png", meta, teamId);
 }
-export async function saveFileFromUrl(userId: string, url: string, meta?: FileMeta) {
-    if (url.startsWith("data:")) return saveFileFromDataUrl(userId, url, meta);
+export async function saveFileFromUrl(userId: string, url: string, meta?: FileMeta, teamId = "") {
+    if (url.startsWith("data:")) return saveFileFromDataUrl(userId, url, meta, teamId);
     const response = await fetch(url, { signal: AbortSignal.timeout(300000) }).catch(() => { throw fail("下载生成结果失败"); });
     if (!response.ok) throw fail(`下载生成结果失败：${response.status}`);
-    return saveFile(userId, Buffer.from(await response.arrayBuffer()), response.headers.get("content-type") || "application/octet-stream", meta);
+    return saveFile(userId, Buffer.from(await response.arrayBuffer()), response.headers.get("content-type") || "application/octet-stream", meta, teamId);
 }
 export async function getFile(id: string, userId?: string) {
     const file = await repo(StoredFile).findOneBy({ id }); if (!file) throw fail("文件不存在");
