@@ -148,6 +148,19 @@ check "项目流收到 Presence" "$([ "$(grep -c '"type":"presence.sync"' "$WORK
 check "他人无法订阅项目流" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/p1/realtime?clientId=smoke-other-user&sinceRevision=0" -H "Authorization: Bearer $ADMIN_TOKEN")" "404"
 check "他人无法上报 Presence" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/projects/p1/presence" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"clientId":"smoke-other-user","nodeIds":[],"activity":"idle"}')" "404"
 check "他人无法读取该项目" "$(curl -s "$BASE/v1/projects/p1" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .msg)" "画布项目不存在"
+
+# 真实 WebSocket：握手、订阅、ready、presence 上行。SSE 那几条断言仍然保留在上面——
+# 迁移期间两条链路都在跑，只验新的等于把降级路径变成没人测过的代码。
+echo "WebSocket 实时链路"
+WS_TICKET=$(curl -s -X POST "$BASE/v1/realtime/tickets" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.ticket)
+check "取到 WebSocket 票据" "$([ -n "$WS_TICKET" ] && [ "$WS_TICKET" != "null" ] && echo yes || echo no)" "yes"
+WS_PROBE_STATUS=0
+node ws-probe.mjs "ws://127.0.0.1:$PORT/api/v1/realtime?ticket=$WS_TICKET" p1 smoke-ws-client 6000 >"$WORK/ws-probe.txt" 2>"$WORK/ws-probe.err" || WS_PROBE_STATUS=$?
+check "探针正常退出" "$WS_PROBE_STATUS" "0"
+check "WebSocket 订阅收到 ready" "$(jq -rs '[.[] | select(.type=="ready" and .channel=="project:p1")] | length' "$WORK/ws-probe.txt")" "1"
+check "ready 带上画布 revision" "$(jq -rs '[.[] | select(.type=="ready") | .payload.revision] | last // ""' "$WORK/ws-probe.txt")" "3"
+check "presence 上行广播回同一条频道" "$(jq -rs --arg id smoke-ws-client '[.[] | select(.payload.type=="presence.sync") | .payload.members[] | select(.clientId==$id) | .activity] | last // ""' "$WORK/ws-probe.txt")" "editing"
+check "无票据无法建立 WebSocket" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==' "$BASE/v1/realtime")" "401"
 curl -s -X DELETE "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H "X-Client-Id: smoke-client" >/dev/null
 check "删除后仍能同步到删除标记" "$(curl -s "$BASE/v1/projects" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.items[] | select(.id=="p1")][0].deleted')" "true"
 

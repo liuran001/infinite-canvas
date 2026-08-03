@@ -66,7 +66,7 @@ async function main() {
     resetRealtimeTickets();
 
     const server = http.createServer(createApp());
-    attachRealtime(server);
+    const wss = attachRealtime(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as { port: number }).port;
     const base = `ws://127.0.0.1:${port}`;
@@ -189,7 +189,106 @@ async function main() {
     check("缺省 payload 解析为 undefined", unsubscribed2.ok && "payload" in unsubscribed2.frame && unsubscribed2.frame.payload === undefined, true);
 
     live.terminate();
+
+    console.log("真实连接上的频道多路复用");
+    const { publishProjectSaved, listProjectPresence } = await import("./src/services/project-realtime");
+    const { publishTeamCredits, teamListenerCount } = await import("./src/services/team-realtime");
+    const { Team, TeamMember } = await import("./src/db/entities");
+    const { MAX_SUBSCRIPTIONS: maxSubs } = protocol;
+
+    const teamId = "team-rt-1";
+    await repo(Team).insert({ id: teamId, name: "实时团队", description: "", avatarUrl: "", ownerId: "owner-1", credits: 100, storageQuota: 1 << 20, memberLimit: 0, status: "active", createdAt: now(), updatedAt: now() });
+    await repo(TeamMember).insert({ teamId, userId: "owner-1", role: "owner", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "", joinedAt: now(), updatedAt: now() });
+
+    const ownerIdentity = { userId: "owner-1", displayName: "画布主", avatarUrl: "", guest: null };
+    /** 一条真实连接，帧按到达顺序全存下来：断言顺序（先 ready 后 event）正是这里要看的东西。 */
+    async function openClient(identity: { userId: string; displayName: string; avatarUrl: string; guest: unknown }) {
+        const socket = await connectWs(`${base}/api/v1/realtime?ticket=${issueTicket(identity as never, Date.now())}`, origin);
+        const frames: Array<{ type: string; id?: string; channel?: string; payload?: Record<string, unknown> }> = [];
+        socket.on("message", (data) => frames.push(JSON.parse(String(data))));
+        const send = (frame: Record<string, unknown>) => socket.send(JSON.stringify({ v: 1, ...frame }));
+        /** 等一帧。轮询而不是一次性 await 某个事件：一次交互可能先来 event 再来 ready，等错帧就会永久挂住。 */
+        const wait = async (id: string, type: string, timeoutMs = 3000) => {
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline) {
+                const hit = frames.find((frame) => frame.id === id && frame.type === type);
+                if (hit) return hit;
+                await new Promise<void>((resolve) => setTimeout(resolve, 10));
+            }
+            return null;
+        };
+        return { socket, frames, send, wait };
+    }
+
+    const client = await openClient(ownerIdentity);
+    // sinceRevision 给到当前值：不然 ready 之前还会补一帧「你落后了」的 project.saved，
+    // 那一帧是对的，但会把下面这条断言指到错误的帧上。补齐本身由 sinceRevision=0 的分支覆盖。
+    client.send({ type: "subscribe", id: "p", channel: "project:p1", payload: { clientId: "ws-client-1", sinceRevision: 1 } });
+    client.send({ type: "subscribe", id: "t", channel: `team:${teamId}`, payload: {} });
+    client.send({ type: "subscribe", id: "j", channel: "jobs", payload: { sinceSeq: 0 } });
+    const projectReady = await client.wait("p", "ready");
+    const teamReady = await client.wait("t", "ready");
+    const jobsReady = await client.wait("j", "ready");
+    check("project 频道 ready 带 revision", projectReady?.payload?.revision, 1);
+    check("project 频道 ready 带角色", projectReady?.payload?.role, "owner");
+    check("team 频道 ready 带绝对余额", teamReady?.payload?.credits, 100);
+    check("team 频道 ready 带云空间用量", (teamReady?.payload?.storage as { used: number } | undefined)?.used, 0);
+    check("jobs 频道 ready 带 seq", jobsReady?.payload?.seq, 0);
+    check("三条频道复用同一条 socket", client.socket.readyState, WebSocket.OPEN);
+
+    publishProjectSaved("owner-1", "p1", 2, "remote-client");
+    const saved = await client.wait("p", "event");
+    check("project 事件按订阅 id 回发", [saved?.channel, (saved?.payload as { type: string; revision: number } | undefined)?.revision], ["project:p1", 2]);
+    publishTeamCredits(teamId, 42);
+    const creditsEvent = await client.wait("t", "event");
+    check("team 余额事件带绝对值", (creditsEvent?.payload as { credits: number } | undefined)?.credits, 42);
+
+    client.send({ type: "presence.update", id: "p", payload: { clientId: "ws-client-1", nodeIds: ["n1"], activity: "editing" } });
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    check("presence 上行写进项目 presence", listProjectPresence("owner-1", "p1").map((member) => member.activity), ["editing"]);
+    client.send({ type: "presence.update", id: "p", payload: { clientId: "ws-client-1", nodeIds: [], activity: "idle" } });
+    const limited = await client.wait("p", "error");
+    check("200ms 内重复 presence 被限流", (limited?.payload as { code: string } | undefined)?.code, "RATE_LIMITED");
+
+    console.log("订阅错误与上限不影响物理连接");
+    client.send({ type: "subscribe", id: "bad", channel: "team:team-not-mine", payload: {} });
+    const denied = await client.wait("bad", "error");
+    check("订不到别人的团队", (denied?.payload as { code: string } | undefined)?.code, "TEAM_NOT_FOUND");
+    check("订阅失败不关物理连接", client.socket.readyState, WebSocket.OPEN);
+
+    for (let index = 0; index < maxSubs; index += 1) client.send({ type: "subscribe", id: `extra-${index}`, channel: "jobs", payload: {} });
+    const overflow = await client.wait(`extra-${maxSubs - 1}`, "error");
+    check("超过订阅上限被拒", (overflow?.payload as { code: string } | undefined)?.code, "TOO_MANY_SUBSCRIPTIONS");
+    check("超上限后连接仍然开着", client.socket.readyState, WebSocket.OPEN);
+
+    console.log("退订与断连清理");
+    client.send({ type: "unsubscribe", id: "t" });
+    await client.wait("t", "unsubscribed");
+    check("退订后团队总线上不留 listener", teamListenerCount(teamId), 0);
+    const closedClient = new Promise<void>((resolve) => client.socket.on("close", () => resolve()));
+    client.socket.close();
+    await closedClient;
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    check("断连清空该连接的 presence", listProjectPresence("owner-1", "p1"), []);
+
+    console.log("访客频道隔离");
+    const guestTicketIdentity = { userId: "", displayName: "访客", avatarUrl: "", guest: guestSessionOf(await repo(ProjectShare).findOneByOrFail({ id: share.id }), { accountId: "", actorId: "guest-1", displayName: "访客", avatarUrl: "" }) };
+    const guestClient = await openClient(guestTicketIdentity as never);
+    guestClient.send({ type: "subscribe", id: "gp", channel: "project:p1", payload: { clientId: "guest-client-1" } });
+    guestClient.send({ type: "subscribe", id: "gt", channel: `team:${teamId}`, payload: {} });
+    guestClient.send({ type: "subscribe", id: "gj", channel: "jobs", payload: {} });
+    guestClient.send({ type: "subscribe", id: "ga", channel: "agent:s1", payload: {} });
+    check("访客可以订阅被分享的画布", (await guestClient.wait("gp", "ready"))?.payload?.role, "editor");
+    // 游标落后时 ready 之前补一帧当前 revision：不补的话刚连上的客户端要一直等到下一次别人保存才知道自己是旧的。
+    check("落后游标会补一帧当前 revision", (await guestClient.wait("gp", "event"))?.payload, { type: "project.saved", projectId: "p1", revision: 1, writerClientId: "" });
+    const guestCodes = await Promise.all(["gt", "gj", "ga"].map(async (id) => ((await guestClient.wait(id, "error"))?.payload as { code: string } | undefined)?.code));
+    check("访客订不到 team/jobs/agent", guestCodes, ["FORBIDDEN", "FORBIDDEN", "FORBIDDEN"]);
+    guestClient.socket.terminate();
+
     server.closeAllConnections();
+    // 心跳定时器挂在 wss 上，server.close() 不会带上它；不显式关掉，脚本跑完会一直挂着不退出。
+    for (const socket of wss.clients) socket.terminate();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
     await new Promise<void>((resolve) => server.close(() => resolve()));
     finish(env.root);
 }
