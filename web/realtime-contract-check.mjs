@@ -37,6 +37,7 @@ const hub = read(join(server, "services/realtime-hub.ts"));
 const channels = read(join(server, "services/realtime-channels.ts"));
 const ticketsRoute = read(join(server, "routes/realtime.ts"));
 const projectRealtime = read(join(web, "services/project-realtime.ts"));
+const shareSync = read(join(web, "services/share-sync.ts"));
 const teamRealtime = read(join(web, "services/team-realtime.ts"));
 const jobStream = read(join(web, "services/api/job-stream.ts"));
 const cloudAgent = read(join(web, "stores/use-cloud-agent-store.ts"));
@@ -67,7 +68,7 @@ check("取票端点与服务端路由一致", /serverApiUrl\("\/v1\/realtime\/ti
 
 console.log("重连与订阅");
 // 票据一次性且 30 秒过期：复用旧票在重连时必然 401，而且是「网好了却连不上」这种最难查的形态。
-check("每次重连都重新取票", /connect\(\)[\s\S]{0,600}?await fetchTicket\(\)/.test(connection));
+check("每次重连都重新取票", /async function connect\(pool[\s\S]{0,900}?await fetchTicket\(pool\.scope\)/.test(connection));
 // 重订阅必须取调用方此刻的游标，取首次订阅时的快照会把断线期间处理过的事件再放一遍。
 check("订阅参数是每次求值的函数", /payload\?: \(\) => unknown/.test(clientProtocol) === false && /payload\?\.\(\)/.test(connection));
 for (const [name, source] of [
@@ -84,14 +85,55 @@ check("连续 3 次失败通知降级", /FAILURES_BEFORE_DEGRADE = 3/.test(conne
 check("ready 之后通知恢复", /recoverEntry\(entry\)/.test(connection));
 // 降级与恢复必须按逻辑频道算：全局标志会让一条频道 ready 就把另一条还没接回来的频道的降级路径关掉。
 check("降级按频道各算各的", /entry\.degraded/.test(connection) && /^let degraded/m.test(connection) === false);
-check("非终态订阅错误按频道退避重订", /scheduleEntryRetry\(entry\)/.test(connection));
-check("realtimeAvailable 为假时仍然排重连", /realtimeAvailable\(\)\)\s*\{[\s\S]{0,400}?scheduleReconnect\(\)/.test(connection));
+check("非终态订阅错误按频道退避重订", /scheduleEntryRetry\(pool, entry\)/.test(connection));
+check("realtimeAvailable 为假时仍然排重连", /realtimeAvailable\(pool\.scope\)\)\s*\{[\s\S]{0,400}?scheduleReconnect\(pool\)/.test(connection));
 // presence 上行被拒只说明这一次上报没被接受，按订阅失败处理会把整条画布频道打成未就绪。
 check("presence 错误与订阅错误分开", /scope === "presence"/.test(connection) && /scope: "presence"/.test(hub));
 check("presence 发送结果如实返回", /presence: \(payload: unknown\) => boolean/.test(connection));
-// 终态错误若把整条连接拖去重连，另外三条正常频道会被一条无解的订阅反复打断。
-check("终态错误只停单条频道", /TERMINAL_CODES\.has\(failure\.code\)\) return terminate\(entry, failure\)/.test(connection));
+// 终态错误若把整条连接拖去重连，同一作用域下其它正常频道会被一条无解的订阅反复打断。
+check("终态错误只停单条频道", /TERMINAL_CODES\.has\(failure\.code\)\) return terminate\(pool, entry, failure\)/.test(connection));
 check("服务端 unsubscribed 被当成频道终态", /frame\.type === "unsubscribed"/.test(connection));
+
+// 终态码不能靠人肉抄。订阅路径上的服务端错误码是从源码里数出来的：
+// 团队守卫发的是 TEAM_* 而不是通用 FORBIDDEN，任何一个漏进前端的重试集，
+// 对应的用户（被挂起、被移出、团队被停用、会话已删）就会带着一条永远订不上的频道无限重连。
+const terminalCodes = new Set((connection.match(/TERMINAL_CODES = new Set\(\[([\s\S]*?)\]\)/) || [])[1]?.match(/"([^"]+)"/g)?.map((code) => code.slice(1, -1)) || []);
+check("前端解析出终态码集合", terminalCodes.size > 0);
+const presenceCodes = new Set((connection.match(/PRESENCE_CODES = new Set\(\[([\s\S]*?)\]\)/) || [])[1]?.match(/"([^"]+)"/g)?.map((code) => code.slice(1, -1)) || []);
+const teamAccess = read(join(server, "services/team-access.ts"));
+const projectAccess = read(join(server, "services/project-access.ts"));
+const agentService = read(join(server, "services/agent.ts"));
+// 只数 4xx：5xx 与未标记错误是「服务端此刻出问题了」，重连有意义，本来就不该进终态集。
+const failCodes = (source) => [...source.matchAll(/fail\([^)]*?,\s*4\d\d,\s*"([A-Z_]+)"/g)].map((match) => match[1]);
+const namedFailCodes = (source) => [...source.matchAll(/fail\([^)]*?,\s*4\d\d,\s*(FORBIDDEN|NOT_FOUND)\b/g)].map((match) => match[1]);
+// presence 相关的码不进终态集：它们只说明这一次上报被拒，订阅本身还活着，由 PRESENCE_CODES 兜住。
+const RETRYABLE = new Set(["RATE_LIMITED"]);
+const reachable = [
+    ...new Set([
+        ...failCodes(channels),
+        ...namedFailCodes(channels),
+        ...failCodes(teamAccess),
+        ...failCodes(projectAccess),
+        ...namedFailCodes(projectAccess),
+        ...namedFailCodes(agentService),
+        ...[...hub.matchAll(/errorFrame\([^)]*?"([A-Z_]+)"/g)].map((match) => match[1]),
+    ]),
+].filter((code) => !RETRYABLE.has(code));
+check("枚举到服务端订阅期错误码", reachable.length >= 8, `实际 ${reachable.join(",")}`);
+for (const code of reachable) check(`终态码覆盖 ${code}`, terminalCodes.has(code) || presenceCodes.has(code));
+// presence 专属的两个码只能进 presence 集：进终态集会让一次拼错的上报直接判死整条画布订阅。
+for (const code of ["INVALID_ACTIVITY", "INVALID_NODE_IDS"]) {
+    check(`${code} 归 presence 而不是终态`, presenceCodes.has(code) && terminalCodes.has(code) === false);
+}
+// 会话不存在必须带稳定错误码：默认的 code=1 在前端只是「操作失败」，会被当成可重试。
+check("agent 会话不存在用 404 NOT_FOUND", /fail\("会话不存在", 404, NOT_FOUND\)/.test(agentService));
+// 团队页要把这些码翻成「不用再等了」的提示，只认 FORBIDDEN 会让被挂起的人一直看到「正在连接」。
+const teamMapped = new Set((teamRealtime.match(/TERMINAL_CODE_STATUS[^=]*= \{([\s\S]*?)\}/) || [])[1]?.match(/([A-Z_]+):/g)?.map((key) => key.slice(0, -1)) || []);
+for (const code of ["FORBIDDEN", "REVOKED", "TEAM_FORBIDDEN", "TEAM_MEMBER_SUSPENDED", "TEAM_DISABLED", "TEAM_NOT_FOUND"]) {
+    check(`团队终态提示覆盖 ${code}`, teamMapped.has(code));
+}
+// 会话不存在时换成 SSE 也是同一个 404，只会空转一轮再给出一句指错方向的「连接中断」。
+check("云端 Agent 对 NOT_FOUND 不再退回 SSE", /failure\.code === "NOT_FOUND"/.test(cloudAgent));
 
 console.log("频道名与服务端分派一致");
 for (const [name, pattern, source] of [
@@ -103,6 +145,38 @@ for (const [name, pattern, source] of [
     check(`${name} 频道名前端正确`, pattern.test(source));
     check(`${name} 频道服务端可分派`, new RegExp(`kind === "${name}"`).test(channels));
 }
+
+console.log("身份作用域隔离");
+// 账号与访客是两个物理身份。共用一条 socket 意味着一张票据同时承载两种权限判定，
+// 分享页里已登录的用户会拿账号票去订访客频道（反之亦然），这属于越权，必须按身份分池。
+check("连接按身份作用域分池", /scopeKey|pools\.get\(/.test(connection), "connection.ts 仍是单例全局状态");
+check("作用域区分 account 与 guest", /kind: "guest"/.test(connection) && /"account"/.test(connection));
+check("取票可显式使用 guest 令牌", /scope\.token\(\)/.test(connection) || /guestToken/.test(connection), "fetchTicket 只会读账号 token");
+check("guest 取票带分享标记头", /X-Share-Guest/.test(connection), "服务端按 Authorization 判 guest，但网关要能分流");
+check("每个作用域各自重连取票", /await fetchTicket\(pool\.scope\)|fetchTicket\(scope\)/.test(connection));
+// 池级状态一个都不能省成模块级：省下来的那个字段就是两种身份互相误判的地方。
+check("socket 与重连状态挂在池上", /pool\.socket/.test(connection) && /^let socket/m.test(connection) === false);
+check("失败计数挂在池上", /pool\.failures/.test(connection) && /^let failures/m.test(connection) === false);
+check("订阅表挂在池上", /pool\.entries/.test(connection) && /^const entries = new Map/m.test(connection) === false);
+check("分享订阅声明 guest 作用域", /scope: guestScope\(\)/.test(shareSync) && /kind: "guest"/.test(shareSync), "share-sync 没有显式传访客作用域");
+check("访客票据用 guest 令牌而不是账号令牌", /token: \(\) => useShareStore\.getState\(\)\.guestToken/.test(shareSync), "guest 作用域取票必须现取 guest 令牌");
+
+console.log("分享画布首选 WebSocket");
+check("分享订阅走共享连接", /subscribeRealtime</.test(shareSync));
+check("分享频道名为 project:<id>", /channel: `project:\$\{projectId\}`/.test(shareSync));
+check("分享订阅传的是 payload 函数", /payload: \(\) =>/.test(shareSync));
+check("分享 ready 同步角色", /ready\.role/.test(shareSync) || /role === "viewer" \|\| .*role === "editor"/.test(shareSync));
+check("分享 ready 过滤自己的 presence", /clientId !== shareClientId/.test(shareSync));
+check("分享按 revision 去重后再拉取", /revision > lastRevision|revision <= lastRevision/.test(shareSync));
+check("分享忽略自己写入的事件", /writerClientId === shareClientId/.test(shareSync));
+check("分享保留 SSE 降级", /shareProjectStream\(/.test(shareSync) && /watchShareProjectViaSse/.test(shareSync));
+check("分享连续失败才启用 SSE", /onDegrade: \(\) => \{[\s\S]{0,200}?startFallback\(\)/.test(shareSync));
+check("分享 ready 后停止 SSE 降级", /onRecover: stopFallback/.test(shareSync) && /onReady[\s\S]{0,400}?stopFallback\(\)/.test(shareSync));
+// 撤销是终态：服务端会主动断开这条频道，但降级成只读也走同一条路径，
+// 直接判失效会把「你现在只能看」误报成「链接没了」。重新鉴权一次才分得清。
+check("撤销后重新鉴权而不是直接判失效", /onTerminal: \(failure\) => \{[\s\S]*?startFallback\(\);\s*\n\s*\},/.test(shareSync), "撤销与降级走同一条断流路径，直接判失效会把「变只读」误报成「链接没了」");
+check("确证失效才进 gone 终态", /markGone\(/.test(shareSync) && /FORBIDDEN|PROJECT_NOT_FOUND/.test(shareSync));
+check("分享 presence 优先 WebSocket 且保留 HTTP", /subscription\.presence\(|presence\(\{/.test(shareSync) && /shareApi\.updatePresence\(/.test(shareSync));
 
 console.log("降级路径仍然存在");
 check("画布保留 SSE 降级", /serverProjectStream\(/.test(projectRealtime) && /watchProjectViaSse/.test(projectRealtime));

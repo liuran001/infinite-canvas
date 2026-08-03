@@ -168,9 +168,15 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
                     streamAbort?.abort();
                     streamAbort = null;
                 },
-                onTerminal: () => {
+                onTerminal: (failure) => {
                     if (token !== streamToken) return;
                     agentSocket = null;
+                    // 会话已被删除，或这个 id 根本不属于当前账号：换成 SSE 也是同一个 404，
+                    // 只会再空转一轮重试，然后把「连接中断，稍后重开会话」这种指错方向的提示留给用户。
+                    if (failure.code === "NOT_FOUND") {
+                        set({ error: "这个会话已经不存在了，可能已被删除；新建一个会话继续。" });
+                        return;
+                    }
                     void attachViaSse(sessionId, token);
                 },
             });

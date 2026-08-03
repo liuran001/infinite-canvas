@@ -153,7 +153,12 @@ globalThis.window = {
     clearInterval: (id) => clock.clearInterval(id),
 };
 // 取票是唯一的网络调用，直接给成功；票据本身的用例在 server/verify-realtime.ts 里。
-globalThis.fetch = async () => ({ ok: true, json: async () => ({ data: { ticket: `ticket-${Math.random()}` } }) });
+// 每次取票的凭据与标记头都记下来：账号票与访客票混用是这一层最贵的错误（越权或永远 FORBIDDEN）。
+const tickets = [];
+globalThis.fetch = async (url, init) => {
+    tickets.push({ url, headers: (init && init.headers) || {} });
+    return { ok: true, json: async () => ({ data: { ticket: `ticket-${Math.random()}` } }) };
+};
 
 const source = bundle.outputFiles[0].text;
 const { subscribeRealtime, resetRealtimeConnection } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
@@ -182,6 +187,7 @@ function reset() {
     resetRealtimeConnection();
     clock.reset();
     FakeWebSocket.instances.length = 0;
+    tickets.length = 0;
     globalThis.__stub = { baseUrl: "http://server.test", token: "t1" };
 }
 
@@ -324,6 +330,67 @@ console.log("服务端收回频道即终态");
     clock.advance(60_000);
     await settle();
     check("终态之后不再重订", socket.subscribes().length, 1);
+}
+
+console.log("账号与访客各走各的连接");
+{
+    reset();
+    let guestToken = "g1";
+    const guestScope = { kind: "guest", key: "share-abc", token: () => guestToken };
+    const account = await connectOnce({ channel: "jobs" });
+    const guest = await connectOnce({ channel: "project:p1", scope: guestScope, payload: () => ({ clientId: "c1" }) });
+    check("两个身份各建一条 socket", FakeWebSocket.instances.length, 2);
+    const accountSocket = FakeWebSocket.instances[0];
+    const guestSocket = FakeWebSocket.instances[1];
+    accountSocket.open();
+    guestSocket.open();
+    await settle();
+    check(
+        "账号 socket 上只有账号那条订阅",
+        accountSocket.subscribes().map((frame) => frame.channel),
+        ["jobs"],
+    );
+    check(
+        "访客 socket 上只有访客那条订阅",
+        guestSocket.subscribes().map((frame) => frame.channel),
+        ["project:p1"],
+    );
+    check("账号票用账号令牌", tickets[0].headers.Authorization, "Bearer t1");
+    check("账号票不带分享标记头", tickets[0].headers["X-Share-Guest"], undefined);
+    check("访客票用 guest 令牌", tickets[1].headers.Authorization, "Bearer g1");
+    check("访客票带分享标记头", tickets[1].headers["X-Share-Guest"], "1");
+
+    // 一个身份的连接塌了不该动另一个身份：两条池的失败计数、重连退避都必须各归各。
+    guestSocket.drop();
+    await settle();
+    check("访客断线不影响账号 socket", accountSocket.readyState, FakeWebSocket.OPEN);
+    accountSocket.deliver({ v: 1, type: "ready", id: accountSocket.subscribes()[0].id, payload: {} });
+    check("账号那条订阅照常 ready", account.calls.ready, 1);
+    // guest 令牌会续期：重连必须现取，缓存住旧的那份到点后取票只会一直 401。
+    guestToken = "g2";
+    clock.advance(40_000);
+    await settle();
+    check("访客重连只重建访客那条连接", FakeWebSocket.instances.length, 3);
+    check("访客重连取的是最新 guest 令牌", tickets[tickets.length - 1].headers.Authorization, "Bearer g2");
+
+    // 访客频道被判死，不该把账号那条也带走。
+    const reconnected = currentSocket();
+    reconnected.open();
+    reconnected.deliver({ v: 1, type: "error", id: reconnected.subscribes()[0].id, payload: { code: "FORBIDDEN", message: "没有权限" } });
+    check("访客频道终态", guest.calls.terminal, ["FORBIDDEN"]);
+    check("账号频道没有被牵连", account.calls.terminal, []);
+    check("账号 socket 仍然开着", accountSocket.readyState, FakeWebSocket.OPEN);
+}
+
+console.log("同一条分享链接复用连接，换链接换连接");
+{
+    reset();
+    const scopeOf = (key) => ({ kind: "guest", key, token: () => "g1" });
+    await connectOnce({ channel: "project:p1", scope: scopeOf("share-abc") });
+    await connectOnce({ channel: "project:p2", scope: scopeOf("share-abc") });
+    check("同一条链接共用一条 socket", FakeWebSocket.instances.length, 1);
+    await connectOnce({ channel: "project:p3", scope: scopeOf("share-xyz") });
+    check("换一条链接另起一条 socket", FakeWebSocket.instances.length, 2);
 }
 
 reset();
