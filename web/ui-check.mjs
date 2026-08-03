@@ -488,7 +488,10 @@ async function main() {
     check("系统设置里有可创建团队数上限", (await page.getByText("每个用户最多可创建的团队数").count()) > 0);
 
     await visit("/admin/invites");
-    await page.getByRole("button", { name: /批量生成/ }).first().click();
+    await page
+        .getByRole("button", { name: /批量生成/ })
+        .first()
+        .click();
     await page.waitForTimeout(600);
     const codeInput = page.getByLabel("指定邀请码");
     check("批量生成弹窗有指定邀请码输入框", await isVisible(codeInput.first()));
@@ -498,12 +501,21 @@ async function main() {
         await codeInput.first().fill("AUTUMN26");
         await page.waitForTimeout(500);
         const countInput = page.getByLabel("生成数量");
-        const countValue = await countInput.first().inputValue().catch(() => "");
+        const countValue = await countInput
+            .first()
+            .inputValue()
+            .catch(() => "");
         check("指定码值后数量被锁成 1", countValue.trim() === "1", `当前「${countValue}」`);
-        check("指定码值后数量输入被禁用", await countInput.first().isDisabled().catch(() => false));
+        check(
+            "指定码值后数量输入被禁用",
+            await countInput
+                .first()
+                .isDisabled()
+                .catch(() => false),
+        );
         // 形近字在前端就要拦下来，不能等服务端打回。
         await codeInput.first().fill("WELC0ME");
-        await page.getByRole("button", { name: /生\s*成/ }).click();
+        await page.getByRole("button", { name: /^生\s*成$/ }).click();
         await page.waitForTimeout(800);
         check("非法字符在前端就被拦住", (await page.getByText(/只能使用/).count()) > 0);
     } else {

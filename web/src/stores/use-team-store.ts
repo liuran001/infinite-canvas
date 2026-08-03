@@ -50,6 +50,13 @@ type TeamState = {
     clear: () => void;
 };
 
+/**
+ * 云空间的两个数字要兜底成 0。旧版本服务端的 teamView 里没有这两个字段，直接写进 store 会得到
+ * undefined，随后 used/quota 的百分比算出 NaN，进度条变成一段空白，界面上看不出任何异常——
+ * 比显示成 0 难查得多。
+ */
+const bytes = (value: number | undefined) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+
 const EMPTY = { currentTeamId: "", credits: 0, storageUsed: 0, storageQuota: 0, myRole: "" as TeamRole | "", realtimeStatus: "idle" as TeamRealtimeStatus, realtimeError: "" };
 
 export const useTeamStore = create<TeamState>((set) => ({
@@ -60,17 +67,16 @@ export const useTeamStore = create<TeamState>((set) => ({
     bindTeam: (teamId) => set((state) => (state.currentTeamId === teamId ? {} : { ...EMPTY, currentTeamId: teamId, realtimeStatus: "connecting" })),
     applyTeamSnapshot: (team) =>
         set((state) => {
-            if (state.currentTeamId !== team.id)
-                return { ...EMPTY, currentTeamId: team.id, credits: team.credits, storageUsed: team.storageUsed, storageQuota: team.storageQuota, myRole: team.myRole, realtimeStatus: "connecting" };
+            if (state.currentTeamId !== team.id) return { ...EMPTY, currentTeamId: team.id, credits: team.credits, storageUsed: bytes(team.storageUsed), storageQuota: bytes(team.storageQuota), myRole: team.myRole, realtimeStatus: "connecting" };
             // 改个团队名就会触发一次 refetch，而那份快照是实时推送之前拉的。
             // 盖回去等于余额自己往回跳一格，用户会以为刚才那笔消费没记上。云空间同理：
             // 队友刚传的文件会从用量里凭空消失，看着像是文件被谁删了。
             if (state.realtimeStatus === "ready") return {};
-            return { credits: team.credits, storageUsed: team.storageUsed, storageQuota: team.storageQuota, myRole: team.myRole };
+            return { credits: team.credits, storageUsed: bytes(team.storageUsed), storageQuota: bytes(team.storageQuota), myRole: team.myRole };
         }),
     // 迟到的事件带着别的团队 id 时直接丢掉：用户可能已经切走，写进去就是把 A 队的余额显示在 B 队页面上。
     setCredits: (teamId, credits) => set((state) => (state.currentTeamId === teamId ? { credits } : {})),
-    setStorage: (teamId, storageUsed, storageQuota) => set((state) => (state.currentTeamId === teamId ? { storageUsed, storageQuota } : {})),
+    setStorage: (teamId, used, quota) => set((state) => (state.currentTeamId === teamId ? { storageUsed: bytes(used), storageQuota: bytes(quota) } : {})),
     setMyRole: (teamId, role) => set((state) => (state.currentTeamId === teamId ? { myRole: role } : {})),
     setRealtimeStatus: (teamId, realtimeStatus, realtimeError = "") => set((state) => (state.currentTeamId === teamId ? { realtimeStatus, realtimeError } : {})),
     clear: () => set(EMPTY),

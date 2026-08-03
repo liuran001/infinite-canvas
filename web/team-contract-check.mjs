@@ -131,11 +131,7 @@ check("team.storage 事件写进 store", /"team\.storage"[\s\S]{0,200}?setStorag
 const pollSource = /const pollOnce[\s\S]*?const startPolling/.exec(realtimeSource)?.[0] || "";
 check("降级轮询也刷新云空间", /setStorage\(teamId, team\.storageUsed, team\.storageQuota\)/.test(pollSource), "轮询只刷了余额，降级后云空间用量会一直停在旧值");
 const storageCalls = realtimeSource.match(/setStorage\([^)]*/g) || [];
-check(
-    "每次写云空间都带上 teamId",
-    storageCalls.length >= 3 && storageCalls.every((call) => call.startsWith("setStorage(teamId,")),
-    `没带 teamId 的调用：${storageCalls.filter((call) => !call.startsWith("setStorage(teamId,")).join(" | ") || "无"}`,
-);
+check("每次写云空间都带上 teamId", storageCalls.length >= 3 && storageCalls.every((call) => call.startsWith("setStorage(teamId,")), `没带 teamId 的调用：${storageCalls.filter((call) => !call.startsWith("setStorage(teamId,")).join(" | ") || "无"}`);
 const teamStoreSource = read("stores/use-team-store.ts");
 check("store 按当前团队挡住迟到的云空间", /setStorage: \(teamId, [^\n]*state\.currentTeamId === teamId/.test(teamStoreSource), "setStorage 没有 currentTeamId 守卫，切队之后旧连接还能改新页面的用量");
 
@@ -177,6 +173,13 @@ check("创建按钮按上限禁用", /disabled=\{Boolean\(blockedReason\)\}/.tes
 check("上限原因在页面上直接可见", /data-testid="team-create-blocked"/.test(teamsPage), "原因只挂在 Tooltip 上，触屏用户永远看不到");
 // settings 还没拉回来就把入口锁死的话，慢一拍的网络会让所有人都建不了团队。
 check("配置未就绪时不拦创建", /maxTeamsPerUser === undefined \? "" :/.test(teamsPage), "配置还没拉回来就按上限拦，网络慢一拍所有人都建不了团队");
+// 旧版本服务端、以及新旧滚动升级期间，公开配置里根本没有 teams 这一节。
+// 少一个 ?. 就是当场抛 TypeError，整个团队列表页变成一张错误页——一个加提示的改动不该有这个能力。
+check("旧配置缺 teams 时不炸页", /settings\?\.teams\?\./.test(teamsPage), "settings?.teams.x 会在旧服务端上抛 TypeError，整页白屏");
+const settingsPage = read("pages/admin/settings/index.tsx");
+check("系统设置页对缺失的 teams 兜底", /draft\.public\.teams \|\|/.test(settingsPage), "直接解构 teams 会让系统设置页白屏，管理员连回去改配置的入口都没了");
+// 字段缺失时算出的百分比是 NaN，进度条变成一段空白，界面上看不出任何异常——比显示成 0 难查得多。
+check("云空间缺字段时兜底成 0", /const bytes = \(value/.test(teamStoreSource) && /storageUsed: bytes\(/.test(teamStoreSource), "storageUsed 可能是 undefined，百分比会算成 NaN");
 
 console.log("指定邀请码的校验");
 

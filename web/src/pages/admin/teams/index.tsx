@@ -170,7 +170,8 @@ export default function AdminTeamsPage() {
             <Modal open={Boolean(quotaTarget)} title={`调整团队云空间配额 · ${quotaTarget?.name || ""}`} okText="保存" cancelText="取消" onOk={submitQuota} onCancel={() => setQuotaTarget(null)}>
                 {/* 写明「只影响这个团队」：这里调的是团队那本账，成员的个人配额一动不动，不说清楚容易被当成给全队每个人加空间。 */}
                 <div className="mt-4 text-sm text-stone-500">单位 MB，只影响这一个团队。团队画布上传的图片与生成结果计入团队用量，成员的个人配额不受影响。当前已用 {formatBytes(quotaTarget?.storageUsed || 0) || "0 B"}。</div>
-                <InputNumber className="mt-3 w-full" min={0} precision={0} addonAfter="MB" value={quotaMb} onChange={(value) => setQuotaMb(value || 0)} />
+                {/* 用 suffix 而不是 addonAfter：后者在 antd 5 已弃用，会往控制台丢一条 error，让「页面无运行时报错」那条断言永远红着。 */}
+                <InputNumber className="mt-3 w-full" min={0} precision={0} suffix="MB" value={quotaMb} onChange={(value) => setQuotaMb(value || 0)} />
             </Modal>
         </div>
     );

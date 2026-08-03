@@ -68,7 +68,13 @@ export default function AdminSettingsPage() {
     const patchSearch = (value: Partial<AdminSettings["private"]["search"]>) => setDraft((current) => current && { ...current, private: { ...current.private, search: { ...current.private.search, ...value } } });
 
     const { channels, promptSync, search } = draft.private;
-    const { modelChannel, auth, storage, capabilities, agent, teams } = draft.public;
+    const { modelChannel, auth, storage, capabilities, agent } = draft.public;
+    /*
+     * teams 这一节要兜底。旧版本服务端、以及新旧滚动升级期间，公开配置里根本没有它，
+     * 直接解构会让整个系统设置页白屏——管理员连回去改配置的入口都没了。
+     * 这里的默认值与服务端 normalizePublic 保持一致：100MB、每人 5 个团队。
+     */
+    const teams = draft.public.teams || { defaultStorageQuota: 100 << 20, maxTeamsPerUser: 5 };
     const models = channelModels(channels);
     const optionsFor = (capability: ServerCapability) => models.filter((model) => model.capability === capability).map(toOption);
     const allOptions = models.map(toOption);
@@ -256,7 +262,14 @@ export default function AdminSettingsPage() {
                                     <Select className="w-28" value={service.provider} options={searchProviderOptions} onChange={(provider) => patchSearchService(index, { provider })} />
                                     <Input className="w-36" value={service.name} placeholder="备注名" onChange={(event) => patchSearchService(index, { name: event.target.value })} />
                                     <Input.Password className="min-w-[220px] flex-1" value={service.apiKey} placeholder="API Key，留空表示不修改" onChange={(event) => patchSearchService(index, { apiKey: event.target.value })} />
-                                    <InputNumber className="w-28" min={1} precision={0} prefix={<span className="text-xs text-stone-500">权重</span>} value={service.weight} onChange={(value) => patchSearchService(index, { weight: Math.max(1, Number(value) || 1) })} />
+                                    <InputNumber
+                                        className="w-28"
+                                        min={1}
+                                        precision={0}
+                                        prefix={<span className="text-xs text-stone-500">权重</span>}
+                                        value={service.weight}
+                                        onChange={(value) => patchSearchService(index, { weight: Math.max(1, Number(value) || 1) })}
+                                    />
                                     <Button danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => patchSearch({ services: search.services.filter((_, current) => current !== index) })} />
                                 </div>
                                 <Input className="mt-2" value={service.baseUrl} placeholder="接口地址，留空用服务商官方地址" onChange={(event) => patchSearchService(index, { baseUrl: event.target.value })} />
@@ -272,9 +285,7 @@ export default function AdminSettingsPage() {
                  * 它反映的是已保存的配置，所以文案统一说「当前」，避免和还没保存的草稿混淆。
                  */}
                 <p className={`mt-3 text-xs ${agent.searchEnabled ? "text-stone-500" : "text-amber-600 dark:text-amber-500"}`}>
-                    {agent.searchEnabled
-                        ? "当前联网搜索已生效，Agent 可以调用搜索与读取网页工具。"
-                        : "当前联网搜索不会生效：服务端只有在开关打开、且至少有一条启用并填了 API Key 的服务时，才会把联网工具下发给 Agent。填好后保存，这条提示会变为已生效。"}
+                    {agent.searchEnabled ? "当前联网搜索已生效，Agent 可以调用搜索与读取网页工具。" : "当前联网搜索不会生效：服务端只有在开关打开、且至少有一条启用并填了 API Key 的服务时，才会把联网工具下发给 Agent。填好后保存，这条提示会变为已生效。"}
                 </p>
             </section>
 
