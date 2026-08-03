@@ -255,6 +255,20 @@ async function main() {
     client.send({ type: "presence.update", id: "p", payload: { clientId: "ws-client-1", nodeIds: [], activity: "idle" } });
     const limited = await client.wait("p", "error");
     check("200ms 内重复 presence 被限流", (limited?.payload as { code: string } | undefined)?.code, "RATE_LIMITED");
+    // presence 错误必须带 scope：客户端要靠它把「这一次上报被拒」和「订阅失败」分开，
+    // 不然一次超频上报就会被当成订阅挂了，整条画布频道被打回未就绪并反复重订。
+    check("presence 错误带 presence scope", (limited?.payload as { scope?: string } | undefined)?.scope, "presence");
+
+    // 传输切换窗口：同一个 clientId 先由 HTTP 写入，再由这条 WebSocket 频道关闭时清理。
+    // 按来源判定的话，那次关闭不该动 HTTP 写进去的记录，否则用户在别人画布上凭空消失。
+    const { updateProjectPresence, removeProjectPresence, PRESENCE_SOURCE_HTTP } = await import("./src/services/project-realtime");
+    const actor = { id: "owner-1", displayName: "画布主", avatarUrl: "" };
+    updateProjectPresence("owner-1", "p1", actor, { clientId: "switch-client-1", nodeIds: [], activity: "idle", source: PRESENCE_SOURCE_HTTP });
+    check("另一来源的关闭不删这条 presence", removeProjectPresence("owner-1", "p1", "switch-client-1", "ws:999").some((member) => member.clientId === "switch-client-1"), true);
+    check("同来源的关闭才真的删掉", removeProjectPresence("owner-1", "p1", "switch-client-1", PRESENCE_SOURCE_HTTP).some((member) => member.clientId === "switch-client-1"), false);
+    updateProjectPresence("owner-1", "p1", actor, { clientId: "switch-client-2", nodeIds: [], activity: "idle", source: "ws:1" });
+    check("不带来源的显式退出无条件删掉", removeProjectPresence("owner-1", "p1", "switch-client-2").some((member) => member.clientId === "switch-client-2"), false);
+    check("成员列表不外泄内部来源字段", listProjectPresence("owner-1", "p1").every((member) => !("source" in member)), true);
 
     console.log("订阅错误与上限不影响物理连接");
     client.send({ type: "subscribe", id: "bad", channel: "team:team-not-mine", payload: {} });
@@ -337,6 +351,9 @@ async function main() {
     const replayAt = jobsClient.frames.findIndex((frame) => frame.id === "jr" && frame.type === "event");
     check("jobs 补齐带回运行中的任务", (jobsClient.frames[replayAt]?.payload as { job?: { id: string } } | undefined)?.job?.id, runningJobId);
     check("jobs ready 带上补齐后的最大 seq", jobsClient.frames[readyAt]?.payload?.seq, 3);
+    // ready 还要带上这一轮会推哪些任务：它排在补齐之前，客户端没有这份名单就只能把每个
+    // 等待中的任务都补查一次 HTTP，而它们下一毫秒就会由补齐推过来。
+    check("jobs ready 带上本轮补齐的任务名单", jobsClient.frames[readyAt]?.payload?.jobIds, [runningJobId]);
     // ready 必须排在补齐事件之前：反过来的话客户端会先收到一批比自己游标新的任务，
     // 再收到「你的游标是多少」，中途断开就会把一个还没生效的游标当成已经追平。
     check("jobs ready 排在补齐事件之前", [readyAt >= 0, replayAt > readyAt], [true, true]);

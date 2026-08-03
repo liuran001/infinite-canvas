@@ -46,6 +46,16 @@ function errorFrame(id: string | undefined, channel: string | undefined, code: s
     return serverFrame("error", id, channel, { code, message });
 }
 
+/**
+ * presence 上行失败的错误帧。带上 `scope: "presence"` 是刻意的：
+ * 客户端必须能把「这一次上报没被接受」和「这条订阅失败了」分开——
+ * 两者共用一种帧的话，一次超频上报就会被前端当成订阅挂了，进而把整条画布频道退到未就绪、
+ * 反复重订，而它其实一直好好的。错误码本身不足以区分（INTERNAL 两边都可能出现）。
+ */
+function presenceErrorFrame(id: string | undefined, channel: string | undefined, code: string, message: string) {
+    return serverFrame("error", id, channel, { code, message, scope: "presence" });
+}
+
 /** 未标记的错误不能把内部细节抖给客户端，但错误码要保留，前端得靠它区分「重试」和「别再连了」。 */
 function failureOf(error: unknown) {
     if (error instanceof SafeError) return { code: String(error.code), message: error.message };
@@ -126,17 +136,17 @@ class Connection {
 
     private presence(id: string, payload: unknown) {
         const channel = this.channels.get(id);
-        if (!channel?.presence) return this.send(errorFrame(id, channel?.channel, "INVALID_SUBSCRIPTION", "该订阅不支持 presence"));
+        if (!channel?.presence) return this.send(presenceErrorFrame(id, channel?.channel, "INVALID_SUBSCRIPTION", "该订阅不支持 presence"));
         const nowMs = Date.now();
         // 节流按连接而不是按频道：presence 是易失提示，攒着的那几十毫秒没有任何信息量，
         // 但一个循环里狂发的客户端能把所有订阅方的连接一起写爆。
-        if (nowMs - this.lastPresenceAt < PRESENCE_MIN_INTERVAL_MS) return this.send(errorFrame(id, channel.channel, "RATE_LIMITED", "presence 上报过于频繁"));
+        if (nowMs - this.lastPresenceAt < PRESENCE_MIN_INTERVAL_MS) return this.send(presenceErrorFrame(id, channel.channel, "RATE_LIMITED", "presence 上报过于频繁"));
         this.lastPresenceAt = nowMs;
         try {
             channel.presence(payload);
         } catch (error) {
             const failure = failureOf(error);
-            this.send(errorFrame(id, channel.channel, failure.code, failure.message));
+            this.send(presenceErrorFrame(id, channel.channel, failure.code, failure.message));
         }
     }
 

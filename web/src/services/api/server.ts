@@ -60,7 +60,13 @@ export type ServerAgentEvent = { type: "message"; message: ServerAgentMessage } 
  * `text` 是文本增量，offset 是这段内容在完整文本里的起点，按它覆盖写入，重连或重跑都不会错位；
  * `ready` 表示补齐结束，后面都是实时事件。
  */
-export type ServerJobEvent = { type: "job"; seq: number; job: ServerJob } | { type: "text"; id: string; offset: number; text: string } | { type: "ready"; seq: number };
+/**
+ * ready 的 jobIds 是 WebSocket 通道特有的：那条通道把 ready 排在补齐事件之前（客户端必须先拿到游标），
+ * 于是收到 ready 时补齐还没到，靠「这一轮有没有被推到」判断任务是否已结束会把每个等待中的任务
+ * 都误判成需要补查一次，白打一批 HTTP。带上本次补齐会推哪些任务，判断就不必再等。
+ * SSE 通道的 ready 排在补齐之后，不需要它，因此是可选字段。
+ */
+export type ServerJobEvent = { type: "job"; seq: number; job: ServerJob } | { type: "text"; id: string; offset: number; text: string } | { type: "ready"; seq: number; jobIds?: string[] };
 
 export type ServerProject = { id: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerProjectPresence = { clientId: string; principalId: string; displayName: string; avatarUrl: string; color: string; nodeIds: string[]; activity: "idle" | "selecting" | "editing"; updatedAt: string };

@@ -121,6 +121,10 @@ function onEvent(event: ServerJobEvent) {
     }
     // 流通了就不需要兜底轮询了。
     stopFallback();
+    // WebSocket 通道的 ready 排在补齐事件之前，所以此刻「还没被推到」并不代表任务已经结束——
+    // 直接按 seen 判会让每个等待中的任务都白补查一次 HTTP。ready 里带了这一轮会推哪些任务，
+    // 名单里的先按「即将到达」记上，剩下的才是真的需要补查。
+    if (event.jobIds) for (const waiter of waiters) if (event.jobIds.includes(waiter.jobId)) waiter.seen = true;
     // 补齐里一定带上了所有还没结束的任务，没被带到的说明它已经结束（或在断线期间就结束了）。
     // 这种任务补查一次就能收尾，不用为它一直轮询。
     for (const waiter of [...waiters]) if (!waiter.seen) void reconcile(waiter);
@@ -155,7 +159,11 @@ function startSocket() {
         onReady: (payload) => {
             stopFallback();
             for (const waiter of waiters) waiter.seen = false;
-            onEvent({ type: "ready", seq: Number((payload as { seq?: number } | null)?.seq) || lastSeq });
+            const ready = (payload || {}) as { seq?: number; jobIds?: unknown };
+            // jobIds 原样透传给 onEvent：这条通道的 ready 排在补齐之前，没有它就只能把每个
+            // 等待中的任务都补查一遍 HTTP，而它们下一毫秒就会由补齐推过来。
+            const jobIds = Array.isArray(ready.jobIds) ? ready.jobIds.filter((item): item is string => typeof item === "string") : [];
+            onEvent({ type: "ready", seq: Number(ready.seq) || lastSeq, jobIds });
         },
         onEvent,
         onDegrade: startFallback,

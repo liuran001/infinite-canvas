@@ -54,6 +54,15 @@ export type OpenChannelOptions = {
 
 const CLIENT_ID = /^[A-Za-z0-9_-]{8,128}$/;
 const ACTIVITIES: ProjectActivity[] = ["idle", "selecting", "editing"];
+/**
+ * 每条 WebSocket 画布频道的 presence 来源标记，全进程唯一。
+ *
+ * 用它是为了让「这条频道关闭」只删掉它自己写进去的那条 presence：切换到 SSE/HTTP 降级时，
+ * 同一个 clientId 会先由降级路径重新写入，而旧的 WebSocket 频道随后才关。
+ * 不区分来源的话，那次关闭会把刚写好的记录删掉，用户在别人的画布上凭空消失，
+ * 直到 15 秒后的下一次心跳才回来。
+ */
+let presenceSourceSeq = 0;
 
 function forbidden(message: string) {
     return fail(message, 403, FORBIDDEN);
@@ -129,13 +138,15 @@ async function openProject(options: OpenChannelOptions, projectId: string): Prom
     const ownerId = identity.guest?.ownerId || identity.userId;
 
     const stream = buffered((frame) => send(frame));
+    // 这条频道自己的 presence 来源标记：关闭时只删仍属于自己的那条记录。
+    const source = `ws:${(presenceSourceSeq += 1)}`;
     let released = false;
     const release = () => {
         if (released) return;
         released = true;
         stream.stop();
         unsubscribe();
-        removeProjectPresence(ownerId, projectId, clientId);
+        removeProjectPresence(ownerId, projectId, clientId, source);
         options.onClosed?.(id);
     };
     // 撤销分享时由 project-realtime 回调这里：只关掉这一条逻辑频道，物理连接上的其它订阅不受影响。
@@ -176,7 +187,7 @@ async function openProject(options: OpenChannelOptions, projectId: string): Prom
             if (!ACTIVITIES.includes(activity)) throw fail("无效的协作状态", 400, "INVALID_ACTIVITY");
             const nodeIds = body.nodeIds;
             if (!Array.isArray(nodeIds) || nodeIds.some((node: unknown) => typeof node !== "string" || !node || node.length > 128)) throw fail("无效的节点列表", 400, "INVALID_NODE_IDS");
-            updateProjectPresence(ownerId, projectId, access.actor, { clientId, nodeIds: nodeIds as string[], activity });
+            updateProjectPresence(ownerId, projectId, access.actor, { clientId, nodeIds: nodeIds as string[], activity, source });
         },
     };
 }
@@ -275,7 +286,7 @@ async function openJobs(options: OpenChannelOptions): Promise<RealtimeChannel> {
         release();
         throw error;
     }
-    stream.flush(serverFrame("ready", id, channel, { seq: maxSeq }));
+    stream.flush(serverFrame("ready", id, channel, { seq: maxSeq, jobIds: [...replayed.keys()] }));
     replaying = false;
     // 攒下的事件按任务逐个去重，只丢掉「快照已经比它新」的那些。
     // 不能用全局 maxSeq 一刀切：补齐读到的是各任务各自的快照，别的任务序号更大不代表这条已被覆盖。

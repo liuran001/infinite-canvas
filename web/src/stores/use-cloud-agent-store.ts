@@ -148,6 +148,8 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
     const attach = async (sessionId: string) => {
         detach();
         if (realtimeAvailable()) {
+            // 这一轮 attach 的代号。降级起 SSE 时不再自增，否则 WebSocket 回调里的比较全部失效，
+            // 恢复回调会被当成过期的一轮直接忽略，SSE 就永远关不掉了。
             const token = streamToken;
             agentSocket = subscribeRealtime<ServerAgentEvent>({
                 channel: `agent:${sessionId}`,
@@ -155,21 +157,21 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
                 onEvent: (event) => applyEvent(sessionId, event),
                 onDegrade: () => {
                     // WebSocket 连不上就交给 SSE：Agent 还在后台跑，界面不能停在半截消息上。
+                    // 但订阅要留着——它自己还在重连，接回来之后要靠 onRecover 把 SSE 收掉。
                     if (token !== streamToken) return;
-                    agentSocket?.close();
-                    agentSocket = null;
-                    void attachViaSse(sessionId);
+                    void attachViaSse(sessionId, token);
                 },
-                onTerminal: (failure) => {
+                onRecover: () => {
+                    // WebSocket 这条频道重新 ready 了，降级流必须停：两条流同时喂同一个会话，
+                    // 消息虽然按 seq 去重不会重复，但重连、重放的开销会一直翻倍地留着。
+                    if (token !== streamToken) return;
+                    streamAbort?.abort();
+                    streamAbort = null;
+                },
+                onTerminal: () => {
                     if (token !== streamToken) return;
                     agentSocket = null;
-                    // 会话已被删除，或这个 id 根本不属于当前账号：换成 SSE 也是同一个 404，
-                    // 只会再空转一轮重试，然后把「连接中断，稍后重开会话」这种指错方向的提示留给用户。
-                    if (failure.code === "NOT_FOUND") {
-                        set({ error: "这个会话已经不存在了，可能已被删除；新建一个会话继续。" });
-                        return;
-                    }
-                    void attachViaSse(sessionId);
+                    void attachViaSse(sessionId, token);
                 },
             });
             return;
@@ -177,9 +179,11 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         await attachViaSse(sessionId);
     };
 
-    /** 已上线的 SSE 实现，保留为降级路径。 */
-    const attachViaSse = async (sessionId: string) => {
-        const token = ++streamToken;
+    /** 已上线的 SSE 实现，保留为降级路径。token 由 WebSocket 降级时传入，用来共享同一轮的代号。 */
+    const attachViaSse = async (sessionId: string, sharedToken?: number) => {
+        // 已经有一条降级流在跑就别再起第二条：onDegrade 每次连接失败都可能再来一遍。
+        if (sharedToken !== undefined && streamAbort) return;
+        const token = sharedToken ?? ++streamToken;
         const abort = new AbortController();
         streamAbort = abort;
         for (let attempt = 0; attempt < RETRY_LIMIT; attempt += 1) {

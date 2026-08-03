@@ -6,7 +6,7 @@ import { createBufferedWriter, sseWriter } from "../lib/sse";
 import { accessContext, projectAuth, requireUser, userAuth } from "../middleware/auth";
 import { resolveProjectAccess } from "../services/project-access";
 import { getProjectTeam, setProjectTeam } from "../services/project-team";
-import { listProjectPresence, removeProjectPresence, subscribeProject, updateProjectPresence, type ProjectActivity } from "../services/project-realtime";
+import { listProjectPresence, PRESENCE_SOURCE_HTTP, removeProjectPresence, subscribeProject, updateProjectPresence, type ProjectActivity } from "../services/project-realtime";
 import { logShareAccess } from "../services/project-share";
 import { deleteProject, deleteUserAsset, deleteUserPlugin, listProjects, listUserAssets, listUserPlugins, saveProject, saveUserAsset, saveUserPlugin, toProjectView } from "../services/sync";
 
@@ -45,7 +45,9 @@ syncRouter.get(
             released = true;
             if (keepAlive) clearInterval(keepAlive);
             unsubscribe();
-            removeProjectPresence(ownerId, projectId, clientId);
+            // 只删仍然属于 HTTP/SSE 这条路径的记录：客户端可能已经切到 WebSocket 并重新上报过，
+            // 无条件删会把那条还活着的记录抹掉，用户在别人画布上消失到下一次心跳为止。
+            removeProjectPresence(ownerId, projectId, clientId, PRESENCE_SOURCE_HTTP);
         };
         const unsubscribe = subscribeProject(ownerId, projectId, (event) => stream.push(event), { shareId: context.guest?.shareId, clientId, close: () => res.end() });
         req.on("close", release);

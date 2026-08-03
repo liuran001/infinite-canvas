@@ -1,10 +1,17 @@
 import { serverApi, serverProjectStream, type ServerProjectEvent, type ServerProjectPresence } from "@/services/api/server";
 import { subscribeRealtime, type RealtimeSubscription } from "@/services/realtime/connection";
+import { PRESENCE_MIN_INTERVAL_MS } from "@/services/realtime/protocol";
 import { getProjectClientId, pullProject } from "@/services/remote-sync";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useProjectPresenceStore } from "@/stores/use-project-presence-store";
 
 const RETRIES = [1500, 3000, 6000, 12000, 24000, 30000];
+/**
+ * presence 去抖间隔。必须严格大于服务端的最小上报间隔：取成相等的话，
+ * 定时器与网络抖动会让相邻两帧的实际间隔落在阈值下方，服务端按 RATE_LIMITED 拒掉，
+ * 表现是「拖动停下来之后别人看到的位置还是旧的」，而且完全没有报错。
+ */
+const PRESENCE_DEBOUNCE_MS = PRESENCE_MIN_INTERVAL_MS + 60;
 const sleep = (ms: number, signal: AbortSignal) =>
     new Promise<void>((resolve, reject) => {
         const timer = setTimeout(resolve, ms);
@@ -33,11 +40,13 @@ export function watchProject(projectId: string, handlers: { onProject?: (revisio
         fallback?.abort();
         fallback = null;
     };
+    // 外层 signal 一停，降级流也要跟着停，否则换画布之后它还在往旧画布上写状态。
+    // 监听只挂这一次：挂在 startFallback 里的话，每降级一轮就往一个活到整页生命周期的 signal 上
+    // 再堆一个闭包，一晚上下来这些闭包连同它们捕获的 controller 全留在内存里。
+    signal.addEventListener("abort", () => stopFallback(), { once: true });
     const startFallback = () => {
         if (fallback || signal.aborted) return;
         fallback = new AbortController();
-        // 外层 signal 一停，降级流也要跟着停，否则换画布之后它还在往旧画布上写状态。
-        signal.addEventListener("abort", () => fallback?.abort(), { once: true });
         watchProjectViaSse(projectId, handlers, fallback.signal);
     };
 
@@ -148,10 +157,11 @@ export function createPresenceReporter(projectId: string) {
     let current: { nodeIds: string[]; activity: ServerProjectPresence["activity"] } = { nodeIds: [], activity: "idle" };
     let timer = 0;
     // presence 优先走 WebSocket 上行：它和事件走同一条连接，不会因为 HTTP 请求排队而比画布变更晚到。
-    // 没有可用订阅时仍打 HTTP 接口，这条路径在 WebSocket 不可用的环境下是唯一能让别人看到你的方式。
+    // 但「有订阅对象」不等于「这一帧真的发出去了」：订阅可能还没 ready、socket 可能正在重连或已经降级。
+    // 只有 presence() 明确回 true 才算发送成功，否则一律补一次 HTTP——
+    // 少了这一步，从 WebSocket 掉到降级路径的那段时间里，这个人在别人的画布上完全是隐身的。
     const send = () => {
-        const subscription = realtimePresence.get(projectId);
-        if (subscription) return subscription.presence({ clientId, ...current });
+        if (realtimePresence.get(projectId)?.presence({ clientId, ...current })) return;
         void serverApi.updateProjectPresence(projectId, { clientId, ...current }).catch(() => undefined);
     };
     const heartbeat = window.setInterval(send, 15_000);
@@ -159,7 +169,9 @@ export function createPresenceReporter(projectId: string) {
         update(nodeIds: string[], activity: ServerProjectPresence["activity"]) {
             current = { nodeIds: [...new Set(nodeIds)], activity };
             window.clearTimeout(timer);
-            timer = window.setTimeout(send, 200);
+            // 去抖必须比服务端的 PRESENCE_MIN_INTERVAL_MS(200ms) 长：正好取 200 时，
+            // 定时器抖动会让相邻两次上报间隔落在 199ms 上，服务端按限流拒掉，这次移动就白丢了。
+            timer = window.setTimeout(send, PRESENCE_DEBOUNCE_MS);
         },
         dispose() {
             window.clearTimeout(timer);

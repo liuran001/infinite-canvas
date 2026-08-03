@@ -225,6 +225,8 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
         sse?.abort();
         sse = null;
     };
+    // 下面统一注册的那个 abort 监听已经覆盖了降级流的收尾，startSse 里不能再挂第二个：
+    // signal 活到整个团队页的生命周期，每降级一轮就多一个再也不会被摘掉的闭包。
     const stopCorrector = () => {
         if (!corrector) return;
         window.clearInterval(corrector);
@@ -233,7 +235,6 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
     const startSse = () => {
         if (sse || signal.aborted) return;
         sse = new AbortController();
-        signal.addEventListener("abort", () => sse?.abort(), { once: true });
         watchTeamViaSse(teamId, sse.signal);
     };
     /** 纠偏轮询：只在 WebSocket 已经 ready 时跑，间隔取降级轮询的两倍，纯粹用来兜住跨实例丢事件。 */
