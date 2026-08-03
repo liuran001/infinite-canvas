@@ -5,11 +5,12 @@ import { Copy, History, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { useCopyText } from "@/hooks/use-copy-text";
+import { INVITE_CODE_ALPHABET, INVITE_CODE_MAX_LENGTH, INVITE_CODE_MIN_LENGTH, normalizeInviteCode, validateInviteCode } from "@/lib/invite-code";
 import { useAdminAction } from "@/pages/admin/use-admin-action";
 import { adminApi, type AdminInvite, type AdminInviteBatch, type AdminQuery } from "@/services/api/admin";
 
-/** 批量生成的默认值：一次 10 个、一码一用、不额外赠送算力点。 */
-const defaultBatch: AdminInviteBatch = { count: 10, maxUses: 1, credits: 0, note: "" };
+/** 批量生成的默认值：一次 10 个、一码一用、不额外赠送算力点、码值随机。 */
+const defaultBatch: AdminInviteBatch = { count: 10, maxUses: 1, credits: 0, note: "", code: "" };
 
 type InviteEdit = Pick<AdminInvite, "maxUses" | "credits" | "note">;
 
@@ -30,6 +31,9 @@ export default function AdminInvitesPage() {
     const [usesCode, setUsesCode] = useState("");
     const { data, isFetching, refetch } = useQuery({ queryKey: ["admin-invites", query], queryFn: () => adminApi.invites(query) });
     const uses = useQuery({ queryKey: ["admin-invite-uses", usesCode], queryFn: () => adminApi.inviteUses(usesCode), enabled: Boolean(usesCode) });
+    // 指定了码值就只能生成一个：一次插入两条同名主键必然冲突，让用户填了 10 个再被服务端整批打回没有任何意义。
+    const customCode = Form.useWatch("code", batchForm) || "";
+    const singleCode = Boolean(normalizeInviteCode(customCode));
 
     useEffect(() => {
         if (batching) batchForm.setFieldsValue(defaultBatch);
@@ -39,17 +43,30 @@ export default function AdminInvitesPage() {
         if (editing) editForm.setFieldsValue({ maxUses: editing.maxUses, credits: editing.credits, note: editing.note });
     }, [editing, editForm]);
 
+    // 填了指定码值就把数量强制成 1。只把输入框禁用是不够的：禁用不会改已经填进去的值，
+    // 提交上去仍然是 count=10，服务端只能整批拒掉，用户看到的是一句和自己操作对不上的错误。
+    useEffect(() => {
+        if (singleCode) batchForm.setFieldsValue({ count: 1 });
+    }, [singleCode, batchForm]);
+
     // 这里要拿到新生成的码本身，不能只知道成功与否，所以没走 runAction。
     const submitBatch = async () => {
-        const values = await batchForm.validateFields();
         setGenerating(true);
         try {
-            const items = await adminApi.createInvites(values);
+            // 校验失败会 reject，放在 try 外面就是一条没人接的 promise rejection：
+            // 指定码填错时按钮不动、控制台报错，管理员只当页面卡住了。
+            const values = await batchForm.validateFields();
+            // 码值只存大写，这里先归一再发：管理员随手打的小写如果原样发出去，
+            // 他照着自己填的小写把码发给别人，对方兑换时看到的却是大写，会以为发错了码。
+            const code = normalizeInviteCode(values.code || "");
+            const items = await adminApi.createInvites({ ...values, code, count: code ? 1 : values.count });
             setBatching(false);
             setGenerated(items);
             message.success(`已生成 ${items.length} 个邀请码`);
             await refetch();
         } catch (error) {
+            // 字段下面已经标红了，再弹一句「生成失败」会被当成服务端出错。
+            if (error && typeof error === "object" && "errorFields" in error) return;
             message.error(error instanceof Error ? error.message : "生成邀请码失败");
         } finally {
             setGenerating(false);
@@ -192,11 +209,30 @@ export default function AdminInvitesPage() {
             />
 
             <Modal open={batching} title="批量生成邀请码" okText="生成" cancelText="取消" confirmLoading={generating} onOk={submitBatch} onCancel={() => setBatching(false)}>
-                <div className="mt-4 text-sm text-stone-500">码值由服务端随机生成，这批码共用下面的次数、算力点与备注。</div>
+                <div className="mt-4 text-sm text-stone-500">码值默认由服务端随机生成，也可以自己指定一个；这批码共用下面的次数、算力点与备注。</div>
                 <Form form={batchForm} layout="vertical" className="mt-3" initialValues={defaultBatch}>
+                    {/*
+                     * 指定码值的三条约束（只能生成 1 个、只认特定字母表、不能与已有码重复）在服务端是硬校验。
+                     * 前面两条在这里就挡住，重复只有服务端知道，留给它报错。
+                     */}
+                    <Form.Item
+                        name="code"
+                        label="指定邀请码"
+                        extra={`留空则随机生成。指定时只能生成 1 个，长度 ${INVITE_CODE_MIN_LENGTH}-${INVITE_CODE_MAX_LENGTH} 位，且只能用 ${INVITE_CODE_ALPHABET} 这些字符（已去掉形近的 0 O 1 I L），与已有码重复会被拒绝。`}
+                        rules={[
+                            {
+                                validator: (_, value) => {
+                                    const reason = validateInviteCode(String(value || ""));
+                                    return reason ? Promise.reject(new Error(reason)) : Promise.resolve();
+                                },
+                            },
+                        ]}
+                    >
+                        <Input className="!font-mono" maxLength={INVITE_CODE_MAX_LENGTH} placeholder="可选，例如 AUTUMN26" />
+                    </Form.Item>
                     <div className="grid grid-cols-3 gap-4">
-                        <Form.Item name="count" label="生成数量" rules={[{ required: true, message: "请输入数量" }]}>
-                            <InputNumber className="w-full" min={1} max={200} precision={0} suffix="个" />
+                        <Form.Item name="count" label="生成数量" extra={singleCode ? "已指定码值，只能生成 1 个" : undefined} rules={[{ required: true, message: "请输入数量" }]}>
+                            <InputNumber className="w-full" min={1} max={200} precision={0} suffix="个" disabled={singleCode} />
                         </Form.Item>
                         <Form.Item name="maxUses" label="每码可用次数" extra="填 0 表示不限次数">
                             <InputNumber className="w-full" min={0} precision={0} suffix="次" />

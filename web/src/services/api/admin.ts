@@ -167,8 +167,11 @@ export type AdminInvite = {
 /** 一次兑换记录。usedAt 就是用掉的时刻；credits 是当时实际送出去的点数，码上的 credits 后来改过也不影响这份留档。 */
 export type AdminInviteUse = { code: string; userId: string; username: string; displayName: string; credits: number; usedAt: string };
 
-/** 批量生成的入参，count 是这次要生成几个码，其余字段所有新码共用。 */
-export type AdminInviteBatch = { count: number; maxUses: number; credits: number; note: string };
+/**
+ * 批量生成的入参，count 是这次要生成几个码，其余字段所有新码共用。
+ * code 是可选的「指定码值」：填了就只生成这一个码，服务端会校验字母表、长度并拒绝与已有码重复；留空维持随机生成。
+ */
+export type AdminInviteBatch = { count: number; maxUses: number; credits: number; note: string; code?: string };
 
 export type AdminProjectDetail = AdminProject & { data: { nodes?: CanvasNodeData[] } };
 
