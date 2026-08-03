@@ -158,7 +158,10 @@ WS_PROBE_STATUS=0
 node ws-probe.mjs "ws://127.0.0.1:$PORT/api/v1/realtime?ticket=$WS_TICKET" p1 smoke-ws-client 6000 >"$WORK/ws-probe.txt" 2>"$WORK/ws-probe.err" || WS_PROBE_STATUS=$?
 check "探针正常退出" "$WS_PROBE_STATUS" "0"
 check "WebSocket 订阅收到 ready" "$(jq -rs '[.[] | select(.type=="ready" and .channel=="project:p1")] | length' "$WORK/ws-probe.txt")" "1"
-check "ready 带上画布 revision" "$(jq -rs '[.[] | select(.type=="ready") | .payload.revision] | last // ""' "$WORK/ws-probe.txt")" "3"
+# 期望值取服务端当前的绝对 revision：上面的 CAS 与保存用例每加一条都会把它推高，
+# 写死数字只会让这条断言在别处改动时假失败。用 // "" 兜底，缺字段时会退化成空串而不是静默通过。
+WS_CURRENT_REV=$(curl -s "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.revision)
+check "ready 带上画布 revision" "$(jq -rs '[.[] | select(.type=="ready" and .channel=="project:p1") | .payload.revision] | last // ""' "$WORK/ws-probe.txt")" "$WS_CURRENT_REV"
 check "presence 上行广播回同一条频道" "$(jq -rs --arg id smoke-ws-client '[.[] | select(.payload.type=="presence.sync") | .payload.members[] | select(.clientId==$id) | .activity] | last // ""' "$WORK/ws-probe.txt")" "editing"
 check "无票据无法建立 WebSocket" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==' "$BASE/v1/realtime")" "401"
 curl -s -X DELETE "$BASE/v1/projects/p1" -H "Authorization: Bearer $USER_TOKEN" -H "X-Client-Id: smoke-client" >/dev/null
