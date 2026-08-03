@@ -43,7 +43,7 @@ console.log("团队 store 的时序契约");
 store().clear();
 store().bindTeam("team-1");
 store().setCredits("team-1", 777);
-store().setRealtimeStatus("ready");
+store().setRealtimeStatus("team-1", "ready");
 check("占位之后 ready 推来的余额能落库", store().credits === 777, `当前 ${store().credits}`);
 
 // 改个团队名会触发 refetch，那份快照是 SSE 之前的旧余额。盖回去等于余额自己往回跳。
@@ -60,7 +60,7 @@ check("未就绪时 REST 快照负责填充角色", store().myRole === "admin", 
 
 // 同一个团队重复 bind（React 严格模式、重渲染都会发生）不能把已经收到的实时值清掉。
 store().setCredits("team-1", 900);
-store().setRealtimeStatus("ready");
+store().setRealtimeStatus("team-1", "ready");
 store().bindTeam("team-1");
 check("重复绑定同一个团队不清空实时值", store().credits === 900 && store().realtimeStatus === "ready", `余额 ${store().credits}，状态 ${store().realtimeStatus}`);
 
@@ -71,8 +71,13 @@ check("切换团队清掉上一支队伍的角色", store().myRole === "", `当�
 store().setCredits("team-1", 555);
 check("迟到的旧团队事件不会写进新团队", store().credits === 0, `当前 ${store().credits}`);
 
+// 迟到的状态同样要按团队挡住。A 队那个还没停下来的轮询撞上 403/404 时，用户可能已经切到 B 队：
+// 不挡的话 B 队页面会挂出「你已不在这个团队里」，而他明明好好地待在 B 队，余额也还在实时更新。
+store().setRealtimeStatus("team-1", "failed", "你已不在这个团队里");
+check("迟到的旧团队状态不会污染新团队", store().realtimeStatus !== "failed" && store().realtimeError === "", `${store().realtimeStatus} / ${store().realtimeError}`);
+
 // 永久失败要留下原因：只把数字停住而不说为什么，用户会以为余额真的是那个数。
-store().setRealtimeStatus("failed", "你已不在这个团队里");
+store().setRealtimeStatus("team-2", "failed", "你已不在这个团队里");
 check("终止状态记下失败原因", store().realtimeStatus === "failed" && store().realtimeError === "你已不在这个团队里", `${store().realtimeStatus} / ${store().realtimeError}`);
 store().clear();
 check("clear 一并清掉失败原因", store().realtimeStatus === "idle" && store().realtimeError === "", `${store().realtimeStatus} / ${store().realtimeError}`);
@@ -113,15 +118,27 @@ const realtime = read("services/team-realtime.ts");
 check("识别永久失败的状态码", /TERMINAL_STATUS[^=]*=\s*\[401,\s*403,\s*404\]/.test(realtime), "没有把 401/403/404 单独列为永久失败");
 check("永久失败时停止重连", /if \(terminal[\s\S]{0,200}?break;/.test(realtime), "永久失败没有跳出重连循环");
 check("永久失败时停掉轮询", /if \(terminal[\s\S]{0,200}?clearPolling\(\)/.test(realtime), "永久失败后轮询还在跑");
-check("永久失败写进 store", /if \(terminal[\s\S]{0,200}?setRealtimeStatus\("failed"/.test(realtime), "永久失败没有写进 store，界面看不出来");
+check("永久失败写进 store", /if \(terminal[\s\S]{0,200}?setRealtimeStatus\(teamId, "failed"/.test(realtime), "永久失败没有写进 store，界面看不出来");
 const pollBlock = /const pollOnce[\s\S]*?const startPolling/.exec(realtime)?.[0] || "";
-check("轮询自己撞上永久失败也收手", /terminalStatusOf\(/.test(pollBlock) && /clearPolling\(\)/.test(pollBlock) && /setRealtimeStatus\("failed"/.test(pollBlock), "轮询是降级路径，撞上 403/404 却比主连接还执着");
+check("轮询自己撞上永久失败也收手", /terminalStatusOf\(/.test(pollBlock) && /clearPolling\(\)/.test(pollBlock) && /setRealtimeStatus\(teamId, "failed"/.test(pollBlock), "轮询是降级路径，撞上 403/404 却比主连接还执着");
 check("流失败携带 HTTP 状态码", /class TeamStreamError[\s\S]{0,200}?status/.test(realtime), "错误里没有状态码，调用方只能去匹配文案");
 // 降级到轮询之后，重连循环每转一圈都会重设状态。不看 poller 就会把 polling 改回 reconnecting，
 // 界面于是说「正在连接实时同步」，而用户实际在看一个每 30 秒才动一次的数字。
 const statusLine = /setRealtimeStatus\((?![\s\S]{0,10}"failed")[^\n]*(?:connecting|reconnecting)[^\n]*\)/.exec(realtime)?.[0] || "";
 check("已降级到轮询时状态保持 polling", /poller \? "polling"/.test(statusLine), `重连循环设置的状态没有考虑轮询是否在跑：${statusLine || "没找到那行"}`);
 check("分帧走共用实现", /decodeSseFrames\(/.test(realtime) && /parseSseJson[<(]/.test(realtime), "team-realtime 没有用共用的分帧实现");
+// 每一处状态写入都得报上自己是哪支队伍。漏一处，那处就成了跨团队污染的入口——
+// watchTeam 的闭包会在 abort 之后继续活一小会儿（飞行中的请求、已排队的定时器回调）。
+const statusCalls = realtime.match(/setRealtimeStatus\([^)]*/g) || [];
+check(
+    "每次写状态都带上 teamId",
+    statusCalls.length >= 5 && statusCalls.every((call) => call.startsWith("setRealtimeStatus(teamId,")),
+    `没带 teamId 的调用：${statusCalls.filter((call) => !call.startsWith("setRealtimeStatus(teamId,")).join(" | ") || "无"}`,
+);
+const storeSource = read("stores/use-team-store.ts");
+check("store 按当前团队挡住迟到的状态", /setRealtimeStatus: \(teamId, [^\n]*state\.currentTeamId === teamId/.test(storeSource), "setRealtimeStatus 没有 currentTeamId 守卫，切队之后旧连接还能改新页面的状态");
+// 轮询的请求是切走之前发出去的，它的失败只属于上一支队伍；卸载之后就不该再往 store 里写任何东西。
+check("卸载后轮询不再写 store", /if \(signal\.aborted\) return;/.test(pollBlock), "pollOnce 的 catch 没有检查 signal.aborted");
 // 服务端正常 EOF（多实例部署里另一个实例根本不会推事件、反代到点掐流）不计失败的话，
 // 一条秒断秒连的流会让 failure 永远停在 0，轮询兜底永远不启动，余额可以一整天不动。
 const loop = /let failure = 0;[\s\S]*?clearPolling\(\);\n    \}\)\(\);/.exec(realtime)?.[0] || "";

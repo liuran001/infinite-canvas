@@ -121,16 +121,18 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
             store().setCredits(teamId, team.credits);
             store().setMyRole(teamId, team.myRole);
         } catch (error) {
+            // 已经卸载/切走就什么都别写：这一轮请求是切走之前发出去的，它的失败只属于上一支队伍。
+            if (signal.aborted) return;
             // 轮询是降级路径，不该比主连接更执着：撞上同样的永久失败就一起收手。
             const terminal = terminalStatusOf(error);
             if (!terminal) return;
             clearPolling();
-            store().setRealtimeStatus("failed", terminalMessage(terminal));
+            store().setRealtimeStatus(teamId, "failed", terminalMessage(terminal));
         }
     };
     const startPolling = () => {
         if (poller || signal.aborted) return;
-        store().setRealtimeStatus("polling");
+        store().setRealtimeStatus(teamId, "polling");
         void pollOnce();
         poller = window.setInterval(() => void pollOnce(), POLL_INTERVAL);
     };
@@ -140,7 +142,7 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
         while (!signal.aborted) {
             // 已经降级到轮询时状态必须保持 polling：改回 reconnecting 的话，界面会说「正在连接实时同步」，
             // 用户以为马上就好，实际上他正看着一个每 30 秒才动一次的数字。轮询停下来之前这条降级提示不能消失。
-            store().setRealtimeStatus(poller ? "polling" : failure ? "reconnecting" : "connecting");
+            store().setRealtimeStatus(teamId, poller ? "polling" : failure ? "reconnecting" : "connecting");
             try {
                 await openStream(
                     teamId,
@@ -151,7 +153,7 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
                             clearPolling();
                             store().setCredits(teamId, event.credits);
                             store().setMyRole(teamId, event.role);
-                            store().setRealtimeStatus("ready");
+                            store().setRealtimeStatus(teamId, "ready");
                         } else if (event.type === "team.credits") {
                             store().setCredits(teamId, event.credits);
                         }
@@ -167,7 +169,7 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
                 const terminal = terminalStatusOf(error);
                 if (terminal) {
                     clearPolling();
-                    store().setRealtimeStatus("failed", terminalMessage(terminal));
+                    store().setRealtimeStatus(teamId, "failed", terminalMessage(terminal));
                     break;
                 }
                 failure += 1;

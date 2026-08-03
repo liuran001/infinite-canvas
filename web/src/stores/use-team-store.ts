@@ -29,7 +29,12 @@ type TeamState = {
     applyTeamSnapshot: (team: Team) => void;
     setCredits: (teamId: string, credits: number) => void;
     setMyRole: (teamId: string, role: TeamRole) => void;
-    setRealtimeStatus: (status: TeamRealtimeStatus, error?: string) => void;
+    /**
+     * 连接状态也要带 teamId。余额和角色早就按 teamId 挡了迟到事件，状态却没挡：
+     * 从 A 队切到 B 队时，A 队那个还没停下来的轮询一旦撞上 403/404，
+     * 就会把 B 队的页面写成「你已不在这个团队里」，而用户明明好好地待在 B 队。
+     */
+    setRealtimeStatus: (teamId: string, status: TeamRealtimeStatus, error?: string) => void;
     clear: () => void;
 };
 
@@ -52,7 +57,7 @@ export const useTeamStore = create<TeamState>((set) => ({
     // 迟到的事件带着别的团队 id 时直接丢掉：用户可能已经切走，写进去就是把 A 队的余额显示在 B 队页面上。
     setCredits: (teamId, credits) => set((state) => (state.currentTeamId === teamId ? { credits } : {})),
     setMyRole: (teamId, role) => set((state) => (state.currentTeamId === teamId ? { myRole: role } : {})),
-    setRealtimeStatus: (realtimeStatus, realtimeError = "") => set({ realtimeStatus, realtimeError }),
+    setRealtimeStatus: (teamId, realtimeStatus, realtimeError = "") => set((state) => (state.currentTeamId === teamId ? { realtimeStatus, realtimeError } : {})),
     clear: () => set(EMPTY),
 }));
 
