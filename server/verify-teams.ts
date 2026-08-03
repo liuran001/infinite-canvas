@@ -655,10 +655,33 @@ async function main() {
     await repo(TeamMember).insert({ teamId: relay.id, userId: "user-relay-b", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-relay-a", joinedAt: now(), updatedAt: now() });
     const relayEvents: Array<{ type: string; userId: string; role: string }> = [];
     const stopRelay = subscribeTeam(relay.id, "user-relay-a", (event) => relayEvents.push(event));
+    // 转让改的是双方的角色，而 SSE 建好之后不再鉴权：不断连的话，旧 owner 的界面会一直留着
+    // 「解散团队」这种他已经点不动的入口，新 owner 反而拿不到任何 owner 入口，两边都要等自己刷新。
+    let relayOldClosed = false;
+    let relayNewClosed = false;
+    subscribeTeam(
+        relay.id,
+        "user-relay-a",
+        () => undefined,
+        () => {
+            relayOldClosed = true;
+        },
+    );
+    subscribeTeam(
+        relay.id,
+        "user-relay-b",
+        () => undefined,
+        () => {
+            relayNewClosed = true;
+        },
+    );
     await transferOwner(relay.id, "user-relay-a", "user-relay-b");
     // 只广播新 owner 的话，其他人页面上会同时挂着两个 owner，旧 owner 那边还留着他已经点不动的入口。
     check("转让广播新 owner 的 roleChanged", relayEvents.filter((event) => event.type === "member.roleChanged" && event.userId === "user-relay-b" && event.role === "owner").length, 1);
     check("转让广播旧 owner 降为 admin", relayEvents.filter((event) => event.type === "member.roleChanged" && event.userId === "user-relay-a" && event.role === "admin").length, 1);
+    check("转让后断开旧 owner 的连接", relayOldClosed, true);
+    check("转让后断开新 owner 的连接", relayNewClosed, true);
+    check("转让后两边的 listener 都已退订", teamListenerCount(relay.id), 0);
     stopRelay();
 
     console.log("团队实时总线");

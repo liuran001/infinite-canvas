@@ -135,7 +135,9 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
     void (async () => {
         let failure = 0;
         while (!signal.aborted) {
-            store().setRealtimeStatus(failure ? "reconnecting" : "connecting");
+            // 已经降级到轮询时状态必须保持 polling：改回 reconnecting 的话，界面会说「正在连接实时同步」，
+            // 用户以为马上就好，实际上他正看着一个每 30 秒才动一次的数字。轮询停下来之前这条降级提示不能消失。
+            store().setRealtimeStatus(poller ? "polling" : failure ? "reconnecting" : "connecting");
             try {
                 await openStream(
                     teamId,

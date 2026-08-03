@@ -61,9 +61,16 @@ async function main() {
     // 一旦全局忽略 400，「某个页面把请求打坏了」和「这条断言故意造出来的失败」就共用一个出口，
     // 前者从此再也不会让脚本变红。申报的范围只到下一次导航为止。
     let expectedErrors = [];
-    const visit = async (path, waitFor, expected = []) => {
+    /**
+     * 清空上一段的错误并申报这一段预期内的。裸 goto 也必须走它：
+     * 漏一次的话，上一段申报的白名单会一直延续到脚本结束，替后面所有段落挡枪。
+     */
+    const resetErrors = (expected = []) => {
         errors.length = 0;
         expectedErrors = expected;
+    };
+    const visit = async (path, waitFor, expected = []) => {
+        resetErrors(expected);
         await page.goto(`${WEB}${path}`, { waitUntil: "networkidle", timeout: 45000 });
         if (waitFor) await page.waitForSelector(waitFor, { timeout: 15000 }).catch(() => {});
         await page.waitForTimeout(600);
@@ -190,7 +197,7 @@ async function main() {
     const projectUrl = page.url();
     await page.goto(projectUrl, { waitUntil: "networkidle", timeout: 45000 });
     await page.waitForTimeout(1200);
-    errors.length = 0;
+    resetErrors();
     const shareButton = page.getByRole("button", { name: "分享", exact: true });
     check("画布页有分享入口", (await shareButton.count()) > 0);
     if (await shareButton.count()) {
@@ -319,7 +326,7 @@ async function main() {
             [API, process.env.UI_ADMIN || "admin", process.env.UI_ADMIN_PASSWORD || "infinite-canvas"],
         );
         // 团队详情页挂着一条常驻 SSE，networkidle 永远不会到，这里只等 DOM。
-        errors.length = 0;
+        resetErrors();
         await page.goto(`${WEB}/teams/${uiTeamId}`, { waitUntil: "domcontentloaded", timeout: 45000 });
         await page.waitForTimeout(2500);
         const before = await page

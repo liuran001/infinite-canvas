@@ -7,6 +7,12 @@
  */
 
 /**
+ * 缓冲上限。一直收不到帧分隔说明对端在灌垃圾，或者反代把流截坏了；
+ * 继续攒下去只会把这个标签页的内存吃光，还不如断开让重连逻辑接手。
+ */
+const MAX_BUFFER = 1 << 20;
+
+/**
  * 从缓冲区里切出所有完整帧的 data 内容，并返回还没收完的余量。
  *
  * 换行按 SSE 规范同时接受 \n、\r\n、\r。只认 \n\n 的话，遇到会改写换行的反代
@@ -26,11 +32,14 @@ export function decodeSseFrames(buffer: string): { data: string[]; rest: string 
             .slice(0, index)
             .split("\n")
             .filter((line) => line.startsWith("data:"))
-            .map((line) => line.slice(5).trim())
-            .join("");
+            // 规范只允许去掉冒号后紧跟的那一个空格；trim 会把数据自己的首尾空白也吃掉。
+            .map((line) => (line.startsWith("data: ") ? line.slice(6) : line.slice(5)))
+            // 多行 data 按规范用换行连接。拼成空串的话，被拆成两行的内容会粘成一个词。
+            .join("\n");
         rest = rest.slice(index + 2);
         if (frame) data.push(frame);
     }
+    if (rest.length > MAX_BUFFER) throw new Error("团队实时连接返回的内容异常，已断开");
     return { data, rest: rest + pending };
 }
 

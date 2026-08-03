@@ -88,8 +88,19 @@ const first = decodeSseFrames('data: {"a":1}\r\n\r');
 const second = decodeSseFrames(`${first.rest}\ndata: next\r\n\r\n`);
 check("\\r\\n 被切在两个分片之间也能切帧", first.data.length === 0 && JSON.stringify(second.data) === JSON.stringify(['{"a":1}', "next"]), `第一片 ${JSON.stringify(first.data)}，第二片 ${JSON.stringify(second.data)}`);
 check("保活注释帧不产出数据", frames(": keep-alive\n\n").length === 0);
-check("多行 data 拼成一条", JSON.stringify(frames("data: ab\ndata: cd\n\n")) === JSON.stringify(["abcd"]));
+// 规范：多行 data 用换行连接，冒号后只去掉紧跟的那一个空格。
+check("多行 data 按规范用换行连接", JSON.stringify(frames("data: ab\ndata: cd\n\n")) === JSON.stringify(["ab\ncd"]));
+check("没有空格的 data 行照样解析", JSON.stringify(frames("data:ab\n\n")) === JSON.stringify(["ab"]));
+check("只吃掉冒号后的一个空格", JSON.stringify(frames("data:  ab \n\n")) === JSON.stringify([" ab "]));
 check("未收完的半帧留在余量里", decodeSseFrames('data: {"a":1}').rest === 'data: {"a":1}');
+// 一直收不到帧分隔的话，缓冲会一直涨；不设上限就是把这个标签页的内存交给对端处置。
+let overflowed = false;
+try {
+    decodeSseFrames("x".repeat((1 << 20) + 1));
+} catch {
+    overflowed = true;
+}
+check("缓冲超过上限时断开而不是一直攒", overflowed);
 // 一个坏帧不能掀翻整条连接：抛出去会让重连计数把一次「解析失败」当成「服务端挂了」。
 check("脏帧解析成 null 而不是抛错", parseSseJson("{ not json") === null);
 check("正常帧照常解析", parseSseJson('{"type":"ready"}')?.type === "ready");
@@ -106,6 +117,10 @@ check("永久失败写进 store", /if \(terminal[\s\S]{0,200}?setRealtimeStatus\
 const pollBlock = /const pollOnce[\s\S]*?const startPolling/.exec(realtime)?.[0] || "";
 check("轮询自己撞上永久失败也收手", /terminalStatusOf\(/.test(pollBlock) && /clearPolling\(\)/.test(pollBlock) && /setRealtimeStatus\("failed"/.test(pollBlock), "轮询是降级路径，撞上 403/404 却比主连接还执着");
 check("流失败携带 HTTP 状态码", /class TeamStreamError[\s\S]{0,200}?status/.test(realtime), "错误里没有状态码，调用方只能去匹配文案");
+// 降级到轮询之后，重连循环每转一圈都会重设状态。不看 poller 就会把 polling 改回 reconnecting，
+// 界面于是说「正在连接实时同步」，而用户实际在看一个每 30 秒才动一次的数字。
+const statusLine = /setRealtimeStatus\((?![\s\S]{0,10}"failed")[^\n]*(?:connecting|reconnecting)[^\n]*\)/.exec(realtime)?.[0] || "";
+check("已降级到轮询时状态保持 polling", /poller \? "polling"/.test(statusLine), `重连循环设置的状态没有考虑轮询是否在跑：${statusLine || "没找到那行"}`);
 check("分帧走共用实现", /decodeSseFrames\(/.test(realtime) && /parseSseJson[<(]/.test(realtime), "team-realtime 没有用共用的分帧实现");
 
 const layout = read("pages/teams/layout.tsx");
@@ -127,6 +142,9 @@ const uiCheck = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "ui-c
 check("不全局忽略 400", !/realErrors = \(\)[^\n]*400/.test(uiCheck), "realErrors 的噪音正则里全局放行了 400");
 check("预期错误按段申报", /const visit = async \([^)]*expected/.test(uiCheck), "visit 不接受按段申报的预期错误");
 check("每段的预期错误会被重置", /expectedErrors = /.test(uiCheck), "预期错误没有在每次导航时重置，会一直放行到脚本结束");
+// 裸 goto 漏掉重置的话，上一段申报的白名单会一直延续下去，替后面所有段落挡枪。
+const outsideReset = uiCheck.replace(/const resetErrors = [\s\S]*?\n    \};/, "");
+check("裸 goto 也重置预期错误", !/errors\.length = 0;/.test(outsideReset) && (uiCheck.match(/resetErrors\(/g) || []).length >= 3, "还有直接清 errors 而不重置白名单的地方");
 check("申报了却没出现要报出来", /申报/.test(uiCheck) || /预期内的错误没有出现/.test(uiCheck), "白名单没有反向校验，接口改好了也不会有人来删它");
 // 吞掉超时会让后面所有断言在一个错误的页面上继续跑，最后报一堆无关的失败。
 check("创建团队的跳转不吞超时", !/waitForURL\([^)]*\)\s*\.catch\(\(\) => \{\}\)/.test(uiCheck), "waitForURL 的超时被吞了");

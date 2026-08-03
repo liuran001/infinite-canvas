@@ -293,6 +293,13 @@ export async function transferOwner(teamId: string, actorId: string, targetId: s
     // 而旧 owner 自己的界面还留着「解散团队」这种他已经点不动的入口。
     publishTeamMember(teamId, { type: "member.roleChanged", userId: actorId, role: "admin" });
     publishTeamMember(teamId, { type: "member.roleChanged", userId: targetId, role: "owner" });
+    // 两边的长连接都得断，理由和 updateMember 的降级路径一样：SSE 建好之后不再鉴权，
+    // 连接建立那一刻 ready 里发下去的角色会被前端一直当成有效值。不断的话，旧 owner 页面上
+    // 还留着「解散团队」「转让团队」这些他已经点不动的入口，新 owner 反而一个 owner 的入口都没有，
+    // 两边都要等自己想起来刷新才对得上。断开是让他们立刻重连、重新拿一次角色，不是把人挡在外面。
+    // 广播之后再断：反过来的话，这两条 roleChanged 会写进一条已经 end 的连接，其他人也就收不到了。
+    closeTeamConnectionsOf(teamId, actorId);
+    closeTeamConnectionsOf(teamId, targetId);
 }
 
 /**
