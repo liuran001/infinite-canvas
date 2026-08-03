@@ -16,6 +16,7 @@ import { jobRouter } from "./routes/jobs";
 import { passkeyRouter } from "./routes/passkey";
 import { preferenceRouter } from "./routes/preferences";
 import { publicRouter } from "./routes/public";
+import { realtimeRouter } from "./routes/realtime";
 import { shareRouter } from "./routes/share";
 import { syncRouter } from "./routes/sync";
 import { teamRouter } from "./routes/teams";
@@ -55,6 +56,7 @@ export function createApp() {
     api.use(fileRouter);
     api.use(jobRouter);
     api.use(shareRouter);
+    api.use(realtimeRouter);
     api.use(syncRouter);
     api.use(aiRouter);
     api.use(agentRouter);
