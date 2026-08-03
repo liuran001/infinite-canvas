@@ -86,9 +86,22 @@ class Connection {
         if (this.channels.size + this.opening.size >= MAX_SUBSCRIPTIONS) return this.send(errorFrame(id, channel, "TOO_MANY_SUBSCRIPTIONS", `每条连接最多 ${MAX_SUBSCRIPTIONS} 个订阅`));
         this.opening.add(id);
         try {
-            const opened = await openRealtimeChannel({ identity: this.identity, id, channel, payload, send: this.send });
-            // 打开期间连接可能已经断了：这时把频道登记进表里就没人关得掉它了。
-            if (this.closed || !this.opening.delete(id)) return opened.close();
+            // 频道可能在 open 的 await 窗口里就被服务端收回（撤销分享、移出团队）。
+            // 那种情况下它已经自己清理干净了，登记进订阅表只会留下一条死记录，还会把这个 id 占住。
+            let selfClosed = false;
+            const opened = await openRealtimeChannel({
+                identity: this.identity,
+                id,
+                channel,
+                payload,
+                send: this.send,
+                onClosed: (closedId) => {
+                    if (closedId === id) selfClosed = true;
+                    // 只删表、不回调 close：hub 主动关闭那条路径已经先删过再关，这里删不到也就不会再绕回去。
+                    this.channels.delete(closedId);
+                },
+            });
+            if (this.closed || selfClosed || !this.opening.delete(id)) return opened.close();
             this.channels.set(id, opened);
         } catch (error) {
             this.opening.delete(id);

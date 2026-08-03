@@ -44,6 +44,12 @@ export type OpenChannelOptions = {
     channel: string;
     payload: unknown;
     send: ChannelSend;
+    /**
+     * 频道自己关掉时通知调用方。撤销分享、移出团队这类「服务端主动收回」不经过客户端的 unsubscribe，
+     * 不回调的话连接层的订阅表里会留下一条已经死掉的记录：它既收不到任何事件，又会把这个订阅 id 占住，
+     * 客户端拿同一个 id 重订会被判成重复订阅，于是这条频道在本次连接里再也起不来。
+     */
+    onClosed?: (id: string) => void;
 };
 
 const CLIENT_ID = /^[A-Za-z0-9_-]{8,128}$/;
@@ -130,6 +136,7 @@ async function openProject(options: OpenChannelOptions, projectId: string): Prom
         stream.stop();
         unsubscribe();
         removeProjectPresence(ownerId, projectId, clientId);
+        options.onClosed?.(id);
     };
     // 撤销分享时由 project-realtime 回调这里：只关掉这一条逻辑频道，物理连接上的其它订阅不受影响。
     const revoke = () => {
@@ -186,6 +193,7 @@ async function openTeam(options: OpenChannelOptions, teamId: string): Promise<Re
         released = true;
         stream.stop();
         unsubscribe();
+        options.onClosed?.(id);
     };
     const revoke = () => {
         if (released) return;
@@ -215,8 +223,12 @@ async function openJobs(options: OpenChannelOptions): Promise<RealtimeChannel> {
     const userId = requireAccount(identity);
     const sinceSeq = positiveInt(record(options.payload).sinceSeq);
 
+    const stream = buffered((frame) => send(frame));
     let released = false;
-    const emit = (event: unknown) => send(serverFrame("event", id, channel, event));
+    // 补齐读出来的快照同样先入队：ready 里带的是这次补齐的最大 seq，
+    // 先把补齐事件直发出去、ready 反而排在后面的话，客户端会先看到一批比自己游标新的任务，
+    // 然后才拿到「你的游标是多少」，中途断开就会把一个还没生效的游标当成已经追平。
+    const emit = (event: unknown) => stream.push(serverFrame("event", id, channel, event));
     // 这条频道已经推过的文本字符数，按任务分开记。事件带完整文本，这里只推没推过的尾巴；
     // 任务重跑导致文本变短时把游标归零整段重发。
     const sent = new Map<string, number>();
@@ -246,7 +258,9 @@ async function openJobs(options: OpenChannelOptions): Promise<RealtimeChannel> {
         if (released) return;
         released = true;
         queue.length = 0;
+        stream.stop();
         unsubscribe();
+        options.onClosed?.(id);
     };
 
     const replayed = new Map<string, number>();
@@ -261,7 +275,7 @@ async function openJobs(options: OpenChannelOptions): Promise<RealtimeChannel> {
         release();
         throw error;
     }
-    send(serverFrame("ready", id, channel, { seq: maxSeq }));
+    stream.flush(serverFrame("ready", id, channel, { seq: maxSeq }));
     replaying = false;
     // 攒下的事件按任务逐个去重，只丢掉「快照已经比它新」的那些。
     // 不能用全局 maxSeq 一刀切：补齐读到的是各任务各自的快照，别的任务序号更大不代表这条已被覆盖。
@@ -286,6 +300,7 @@ async function openAgent(options: OpenChannelOptions, sessionId: string): Promis
         released = true;
         stream.stop();
         unsubscribe();
+        options.onClosed?.(id);
     };
     const unsubscribe = subscribeAgentSession(userId, sessionId, (event: AgentEvent) => stream.push(serverFrame("event", id, channel, event)));
 

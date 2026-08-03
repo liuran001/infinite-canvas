@@ -217,7 +217,13 @@ async function main() {
             }
             return null;
         };
-        return { socket, frames, send, wait };
+        /** 等一个任意条件成立。撤销后重订这类用例要数「第几帧」，按 id+type 取第一帧是不够的。 */
+        const until = async (predicate: () => boolean, timeoutMs = 3000) => {
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline && !predicate()) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+            return predicate();
+        };
+        return { socket, frames, send, wait, until };
     }
 
     const client = await openClient(ownerIdentity);
@@ -284,6 +290,63 @@ async function main() {
     const guestCodes = await Promise.all(["gt", "gj", "ga"].map(async (id) => ((await guestClient.wait(id, "error"))?.payload as { code: string } | undefined)?.code));
     check("访客订不到 team/jobs/agent", guestCodes, ["FORBIDDEN", "FORBIDDEN", "FORBIDDEN"]);
     guestClient.socket.terminate();
+
+    console.log("jobs 补齐与 ready 的顺序");
+    const { Job } = await import("./src/db/entities");
+    const runningJobId = "job-rt-1";
+    await repo(Job).insert({
+        id: runningJobId,
+        userId: "owner-1",
+        clientJobId: "rt-1",
+        kind: "image",
+        status: "running",
+        model: "mock-image",
+        prompt: "",
+        params: "{}",
+        inputFileIds: [],
+        outputFileIds: [],
+        text: "",
+        context: {},
+        error: "",
+        credits: 0,
+        progress: 0,
+        seq: 3,
+        upstreamTaskId: "",
+        payerKind: "user",
+        payerTeamId: "",
+        payerLogId: "",
+        storageTeamId: "",
+        createdAt: now(),
+        updatedAt: now(),
+        finishedAt: "",
+    });
+    const jobsClient = await openClient(ownerIdentity);
+    jobsClient.send({ type: "subscribe", id: "jr", channel: "jobs", payload: { sinceSeq: 0 } });
+    await jobsClient.until(() => jobsClient.frames.some((frame) => frame.id === "jr" && frame.type === "event"));
+    const readyAt = jobsClient.frames.findIndex((frame) => frame.id === "jr" && frame.type === "ready");
+    const replayAt = jobsClient.frames.findIndex((frame) => frame.id === "jr" && frame.type === "event");
+    check("jobs 补齐带回运行中的任务", (jobsClient.frames[replayAt]?.payload as { job?: { id: string } } | undefined)?.job?.id, runningJobId);
+    check("jobs ready 带上补齐后的最大 seq", jobsClient.frames[readyAt]?.payload?.seq, 3);
+    // ready 必须排在补齐事件之前：反过来的话客户端会先收到一批比自己游标新的任务，
+    // 再收到「你的游标是多少」，中途断开就会把一个还没生效的游标当成已经追平。
+    check("jobs ready 排在补齐事件之前", [readyAt >= 0, replayAt > readyAt], [true, true]);
+    jobsClient.socket.terminate();
+
+    console.log("频道级撤销后同一订阅 id 可以重订");
+    const { disconnectShare } = await import("./src/services/project-realtime");
+    const revokedClient = await openClient(guestTicketIdentity as never);
+    revokedClient.send({ type: "subscribe", id: "rp", channel: "project:p1", payload: { clientId: "revoked-client-1" } });
+    await revokedClient.wait("rp", "ready");
+    check("撤销关掉了这条逻辑频道", disconnectShare("owner-1", "p1", share.id) >= 1, true);
+    const revokedFrame = await revokedClient.wait("rp", "unsubscribed");
+    check("撤销回发 REVOKED", (revokedFrame?.payload as { reason: string } | undefined)?.reason, "REVOKED");
+    // 撤销不关物理连接，但连接层的订阅表必须同步清掉：留着的话这个 id 会被一条死记录永久占住。
+    check("撤销后物理连接仍然开着", revokedClient.socket.readyState, WebSocket.OPEN);
+    revokedClient.send({ type: "subscribe", id: "rp", channel: "project:p1", payload: { clientId: "revoked-client-2" } });
+    const reSubscribed = await revokedClient.until(() => revokedClient.frames.filter((frame) => frame.id === "rp" && frame.type === "ready").length === 2);
+    check("撤销后同一个订阅 id 能重新订上", reSubscribed, true);
+    check("重订没有被判成重复订阅", revokedClient.frames.filter((frame) => frame.id === "rp" && frame.type === "error").length, 0);
+    revokedClient.socket.terminate();
 
     server.closeAllConnections();
     // 心跳定时器挂在 wss 上，server.close() 不会带上它；不显式关掉，脚本跑完会一直挂着不退出。
