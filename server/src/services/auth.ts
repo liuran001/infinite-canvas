@@ -53,6 +53,7 @@ function newUser(patch: Partial<User>): User {
         password: "",
         email: "",
         displayName: "",
+        displayNameCustomized: false,
         avatarUrl: "",
         role: "user",
         credits: 0,
@@ -204,6 +205,44 @@ export async function changePassword(userId: string, oldPassword: string, newPas
     user.password = await bcrypt.hash(newPassword, 10);
     user.updatedAt = now();
     await users.save(user);
+}
+
+/**
+ * 第三方登录时昵称该取哪个值。抽成函数而不是在 loginWithLinuxDo 里写一行：
+ * 这条规则要被验证脚本直接盯住，内联的话脚本只能照抄一份，抄出来的那份怎么改都不会红。
+ *
+ * 用户自己改过昵称就不再被第三方覆盖——登录一次就把人家改的名字打回去，而且不给任何提示，
+ * 用户只会以为「改昵称这个功能坏了」。没改过的账号仍然跟随 Linux.do，行为与改动前一致。
+ */
+export function syncedDisplayName(user: Pick<User, "displayName" | "displayNameCustomized">, incoming: string | undefined) {
+    if (user.displayNameCustomized) return user.displayName;
+    return firstNonEmpty(incoming, user.displayName);
+}
+
+/**
+ * 昵称的长度上限。列是 varchar(255)，超了在 MySQL/Postgres 上会直接报错或被截断，
+ * 而 64 已经远超任何正常昵称——真正的作用是挡住「把一整段文本粘进昵称框」。
+ */
+const DISPLAY_NAME_MAX = 64;
+
+/**
+ * 用户自助改昵称。只开放 displayName，username 仍然不可改：
+ * 它是登录凭据、是 Linux.do 撞名时拼后缀的基准，也散落在各处的历史记录里，改它是另一件事。
+ *
+ * 空昵称是允许的，等于「取消自定义、回落到用户名」——各处展示本来就是 displayName || username。
+ * 但即便清空也要把 displayNameCustomized 置上：用户清空之后再用 Linux.do 登录，
+ * 不置的话第三方昵称会立刻填回来，在他看来就是「清空没生效」。
+ */
+export async function updateDisplayName(userId: string, displayName: unknown) {
+    const users = repo(User);
+    const user = await users.findOneBy({ id: userId });
+    if (!user) throw fail("用户不存在");
+    const next = String(displayName ?? "").trim();
+    if (next.length > DISPLAY_NAME_MAX) throw fail(`昵称最多 ${DISPLAY_NAME_MAX} 个字符`);
+    user.displayName = next;
+    user.displayNameCustomized = true;
+    user.updatedAt = now();
+    return publicUser(await users.save(user));
 }
 
 /** 解绑第三方登录。没有密码时解绑会导致再也登不进来，必须先设密码。 */
@@ -393,7 +432,7 @@ export async function loginWithLinuxDo(req: Request, code: string, state: string
     } else if (user.status === "ban") {
         throw Object.assign(fail("账号已被禁用"), { redirect });
     }
-    user.displayName = firstNonEmpty(profile.name, user.displayName);
+    user.displayName = syncedDisplayName(user, profile.name);
     user.avatarUrl = firstNonEmpty(linuxDoAvatar(profile.avatar_template || ""), user.avatarUrl);
     user.lastLoginAt = now();
     user.updatedAt = now();

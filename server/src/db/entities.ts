@@ -47,6 +47,12 @@ export class User {
     @Column({ type: "varchar", length: 255, default: "" }) password!: string;
     @Column(short) email!: string;
     @Column(short) displayName!: string;
+    /**
+     * 昵称是否被用户自己改过。没有这一列的话，Linux.do 每次登录都会用第三方昵称覆盖本地昵称
+     * （见 loginWithLinuxDo），用户改完昵称、下次登录就被打回去，而且没有任何提示。
+     * 存量行默认 false，行为与改动前完全一致：没自定义过的账号仍然跟随第三方同步。
+     */
+    @Column({ type: "boolean", default: false }) displayNameCustomized!: boolean;
     @Column({ type: "text", nullable: true }) avatarUrl!: string;
     @Column({ type: "varchar", length: 32, default: "user" }) role!: UserRole;
     @Column({ type: "int", default: 0 }) credits!: number;

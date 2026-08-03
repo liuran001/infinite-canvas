@@ -3,8 +3,8 @@ import "reflect-metadata";
 import { createChecker, prepareEnv } from "./verify-common";
 
 /**
- * 账号相关专项验证。眼下覆盖管理员自定义邀请码：码值规则散在 lib 与 service 两处，
- * 而它决定了一张码能不能被人正确抄下来再输进去，端到端只能验到「能建出来」这一层。
+ * 账号相关专项验证：管理员自定义邀请码、用户自助改昵称与第三方昵称同步的冲突。
+ * 这两件事都改的是「用户身份」这条线，且都没有端到端以外的覆盖，所以在服务层直接验证。
  * 用法：cd server && npx tsx verify-account.ts
  */
 const env = prepareEnv("verify-account");
@@ -12,13 +12,15 @@ const env = prepareEnv("verify-account");
 async function main() {
     const { check, rejects, finish } = createChecker();
     const { initDatabase, repo } = await import("./src/db/data-source");
-    const { InviteCode } = await import("./src/db/entities");
+    const { InviteCode, User } = await import("./src/db/entities");
     const { createInviteCodes } = await import("./src/services/invites");
     const { normalizeCustomInviteCode } = await import("./src/lib/invite-code");
-    const { fail } = await import("./src/lib/errors");
+    const { syncedDisplayName, updateDisplayName } = await import("./src/services/auth");
+    const { fail, now } = await import("./src/lib/errors");
 
     await initDatabase();
     const codes = repo(InviteCode);
+    const users = repo(User);
 
     console.log("邀请码码值规则");
     const bad = (value: unknown) => normalizeCustomInviteCode(value, (reason) => fail(reason));
@@ -61,6 +63,51 @@ async function main() {
         const [row] = await createInviteCodes({ code: blank });
         check(`code=${JSON.stringify(blank)} 时仍然随机生成`, row.code.length, 10);
     }
+
+    console.log("用户自助改昵称");
+    await users.insert({
+        id: "user-name",
+        username: "name-user",
+        password: "",
+        email: "",
+        displayName: "第三方昵称",
+        displayNameCustomized: false,
+        avatarUrl: "",
+        role: "user",
+        credits: 0,
+        storageQuota: 1 << 20,
+        affCode: "name-user",
+        affCount: 0,
+        inviterId: "",
+        linuxDoId: "12345",
+        status: "active",
+        lastLoginAt: "",
+        preferences: "",
+        extra: "",
+        createdAt: now(),
+        updatedAt: now(),
+    });
+    check("改前没有被标记为自定义", (await users.findOneByOrFail({ id: "user-name" })).displayNameCustomized, false);
+    check("改昵称返回新值", (await updateDisplayName("user-name", "  我的昵称  ")).displayName, "我的昵称");
+    check("首尾空白被裁掉后落库", (await users.findOneByOrFail({ id: "user-name" })).displayName, "我的昵称");
+    check("改过之后被标记为自定义", (await users.findOneByOrFail({ id: "user-name" })).displayNameCustomized, true);
+    check("用户名不受影响", (await users.findOneByOrFail({ id: "user-name" })).username, "name-user");
+    await rejects("超长昵称被拒", () => updateDisplayName("user-name", "长".repeat(65)));
+    check("被拒后昵称没有被改", (await users.findOneByOrFail({ id: "user-name" })).displayName, "我的昵称");
+    await rejects("不存在的用户改不了", () => updateDisplayName("user-nobody", "x"));
+    // 空昵称是允许的：各处展示本来就是 displayName || username，清空等于回落到用户名。
+    check("允许清空昵称", (await updateDisplayName("user-name", "")).displayName, "");
+    check("清空之后仍然算自定义", (await users.findOneByOrFail({ id: "user-name" })).displayNameCustomized, true);
+
+    // 这是最容易漏的一点：Linux.do 每次登录都会同步第三方昵称，
+    // 用户自己改过之后再登录一次就被打回去，而且没有任何提示。
+    console.log("第三方昵称同步不覆盖用户自定义");
+    // 断言直接盯 loginWithLinuxDo 用的那个函数，不在这里照抄一份规则——抄出来的那份怎么改都不会红。
+    check("没自定义过的账号仍然跟随第三方", syncedDisplayName({ displayName: "旧名", displayNameCustomized: false }, "第三方新名"), "第三方新名");
+    check("自定义过的账号不被覆盖", syncedDisplayName({ displayName: "我改的", displayNameCustomized: true }, "第三方新名"), "我改的");
+    check("自定义成空之后也不被第三方填回来", syncedDisplayName({ displayName: "", displayNameCustomized: true }, "第三方新名"), "");
+    check("第三方昵称为空时保留本地值", syncedDisplayName({ displayName: "旧名", displayNameCustomized: false }, ""), "旧名");
+    check("第三方昵称是纯空白时同样保留本地值", syncedDisplayName({ displayName: "旧名", displayNameCustomized: false }, "   "), "旧名");
 
     finish(env.root);
 }

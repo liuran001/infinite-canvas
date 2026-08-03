@@ -21,6 +21,7 @@ import {
     saveCreditLog,
     saveUser,
     unbindLinuxDo,
+    updateDisplayName,
 } from "../services/auth";
 
 export const authRouter = Router();
@@ -72,6 +73,13 @@ authRouter.post(
         await changePassword(requireUser(req).id, String(req.body?.oldPassword || ""), String(req.body?.newPassword || ""));
         ok(res, true);
     }),
+);
+
+/** 用户自助改昵称。只收 displayName 一个字段，username 不在这条路径上，多传也不会被读。 */
+authRouter.post(
+    "/auth/profile",
+    userAuth,
+    handle(async (req, res) => ok(res, await updateDisplayName(requireUser(req).id, req.body?.displayName))),
 );
 
 /** OAuth 回调统一重定向回前端，令牌与错误都通过查询参数传递。 */

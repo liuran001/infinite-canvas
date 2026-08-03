@@ -610,6 +610,19 @@ check "改密码要校验原密码" "$(curl -s -X POST "$BASE/auth/password" -H 
 check "新密码长度不足被拒" "$(curl -s -X POST "$BASE/auth/password" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"oldPassword":"tester-pass","newPassword":"123"}' | jq -r .msg)" "新密码至少 6 位"
 check "改密码成功" "$(curl -s -X POST "$BASE/auth/password" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"oldPassword":"tester-pass","newPassword":"tester-pass-2"}' | jq -r .code)" "0"
 
+echo "用户自助改昵称"
+check "未登录改不了昵称" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/auth/profile" -H 'Content-Type: application/json' -d '{"displayName":"x"}')" "401"
+check "改昵称成功" "$(curl -s -X POST "$BASE/auth/profile" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"displayName":"  冒烟昵称  "}' | jq -r .data.displayName)" "冒烟昵称"
+check "改完立刻能从 /auth/me 读到" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.displayName)" "冒烟昵称"
+# username 是登录凭据、是第三方撞名时拼后缀的基准，这条路径一个字都不该碰它。
+check "改昵称不影响用户名" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.username)" "tester"
+check "夹带 username 也改不动它" "$(curl -s -X POST "$BASE/auth/profile" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"displayName":"冒烟昵称","username":"hacked"}' | jq -r .data.username)" "tester"
+check "超长昵称被拒" "$(curl -s -X POST "$BASE/auth/profile" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "{\"displayName\":\"$(printf '长%.0s' $(seq 1 65))\"}" | jq -r .code)" "1"
+check "被拒后昵称没变" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.displayName)" "冒烟昵称"
+# 昵称会出现在协作 presence、成员列表等处，读的必须是实时值而不是登录那一刻的快照。
+check "后台用户列表读到的是最新昵称" "$(curl -s --get "$BASE/admin/users" --data-urlencode 'keyword=tester' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[] | select(.username=="tester") | .displayName')" "冒烟昵称"
+# 空昵称是允许的：各处展示本来就是 displayName || username，清空等于回落到用户名。
+check "允许清空昵称" "$(curl -s -X POST "$BASE/auth/profile" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"displayName":""}' | jq -r '.data.displayName | length')" "0"
 check "旧密码已失效" "$(curl -s -X POST "$BASE/auth/login" -H 'Content-Type: application/json' -d '{"username":"tester","password":"tester-pass"}' | jq -r .msg)" "用户名或密码错误"
 check "新密码可登录" "$(curl -s -X POST "$BASE/auth/login" -H 'Content-Type: application/json' -d '{"username":"tester","password":"tester-pass-2"}' | jq -r .code)" "0"
 check "未绑定时解绑被拒" "$(curl -s -X POST "$BASE/auth/linux-do/unbind" -H "Authorization: Bearer $USER_TOKEN" | jq -r .msg)" "当前账号未绑定 Linux.do"
