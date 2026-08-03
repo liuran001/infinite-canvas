@@ -152,6 +152,11 @@ export const serverApi = {
      */
     completeLinuxDo: (pendingToken: string, inviteCode: string) => serverRequest<{ token: string; user: ServerUser }>("/auth/linux-do/complete", { method: "POST", ...jsonBody({ pendingToken, inviteCode }) }, "完成注册失败"),
     changePassword: (oldPassword: string, newPassword: string) => serverRequest<boolean>("/auth/password", { method: "POST", ...jsonBody({ oldPassword, newPassword }) }, "修改密码失败"),
+    /**
+     * 只改昵称，用户名不动：用户名是登录凭据、也是各处「@某人」的锚点，能自助改掉的话历史记录里的指向会全部对不上。
+     * 返回完整用户对象而不是布尔，调用方必须拿它写回 store——否则顶栏、成员列表、协作 presence 会一直显示改之前的名字。
+     */
+    updateProfile: (displayName: string) => serverRequest<ServerUser>("/auth/profile", { method: "POST", ...jsonBody({ displayName }) }, "修改昵称失败"),
     linuxDoBindUrl: (redirect: string) => serverRequest<{ url: string }>(`/auth/linux-do/bind?redirect=${encodeURIComponent(redirect)}`, {}, "获取授权地址失败"),
     unbindLinuxDo: () => serverRequest<ServerUser>("/auth/linux-do/unbind", { method: "POST" }, "解绑 Linux.do 失败"),
 

@@ -7,12 +7,18 @@ import { PasskeyManager } from "@/components/layout/passkey-manager";
 import { useServerStore } from "@/stores/use-server-store";
 
 type PasswordForm = { oldPassword?: string; newPassword: string };
+type ProfileForm = { displayName: string };
 
-/** 账号设置：修改密码与 Linux.do 绑定，绑定状态由服务端校验，前端只负责发起并提示结果。 */
+/** 与服务端 normalizeDisplayName 的截断长度保持一致：前端先挡住，用户就不会填了一长串再被服务端悄悄截短。 */
+const DISPLAY_NAME_MAX = 32;
+
+/** 账号设置：昵称、修改密码与 Linux.do 绑定，绑定状态由服务端校验，前端只负责发起并提示结果。 */
 export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
     const { message } = App.useApp();
     const [form] = Form.useForm<PasswordForm>();
+    const [profileForm] = Form.useForm<ProfileForm>();
     const [saving, setSaving] = useState(false);
+    const [savingProfile, setSavingProfile] = useState(false);
     const [linking, setLinking] = useState(false);
     const user = useServerStore((state) => state.user);
     const linuxDoEnabled = useServerStore((state) => state.settings?.auth.linuxDo.enabled);
@@ -26,6 +32,26 @@ export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose
             .then(setStorage)
             .catch(() => setStorage(null));
     }, [open]);
+
+    // 每次打开都用当前昵称重置：弹窗不销毁表单，上次改了一半又关掉的草稿会一直留着，
+    // 下次打开看到的就不是账号真正的昵称了。
+    useEffect(() => {
+        if (open) profileForm.setFieldsValue({ displayName: user?.displayName || "" });
+    }, [open, profileForm, user?.displayName]);
+
+    const submitProfile = async (values: ProfileForm) => {
+        setSavingProfile(true);
+        try {
+            // 服务端回的是完整用户对象，必须写回 store：顶栏、团队成员列表、协作 presence 都读它，
+            // 只提示一句「已保存」而不更新的话，界面会一直停在旧昵称上，用户以为没改成功又改一遍。
+            useServerStore.getState().setUser(await serverApi.updateProfile(values.displayName || ""));
+            message.success("昵称已更新");
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "修改昵称失败");
+        } finally {
+            setSavingProfile(false);
+        }
+    };
 
     const submitPassword = async (values: PasswordForm) => {
         setSaving(true);
@@ -68,7 +94,27 @@ export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose
 
     return (
         <Modal title="账号设置" open={open} onCancel={onClose} footer={null} width={480} destroyOnHidden>
-            <div className="mt-1 text-xs text-stone-500">当前账号：{user?.displayName || user?.username || "未登录"}</div>
+            <div className="mt-1 text-xs text-stone-500" data-testid="account-current-name">
+                当前账号：{user?.displayName || user?.username || "未登录"}
+            </div>
+
+            {user ? (
+                <>
+                    <div className="mt-5 text-sm font-semibold">昵称</div>
+                    <Form form={profileForm} layout="vertical" className="mt-3" requiredMark={false} disabled={savingProfile} onFinish={submitProfile}>
+                        {/*
+                         * 用户名不给改：它是登录凭据，也是流水、邀请记录里定位到人的锚点，改掉之后那些历史记录会指向一个不存在的名字。
+                         * 昵称允许留空——全站显示处都写成 displayName || username，空值会自然回落到用户名，不会出现无名氏。
+                         */}
+                        <Form.Item name="displayName" label="昵称" extra={`留空则显示用户名「${user.username}」。用户名不可修改。`} className="mb-3">
+                            <Input maxLength={DISPLAY_NAME_MAX} showCount placeholder="想让别人怎么称呼你" />
+                        </Form.Item>
+                        <Button type="primary" htmlType="submit" loading={savingProfile}>
+                            保存昵称
+                        </Button>
+                    </Form>
+                </>
+            ) : null}
 
             {storage ? (
                 <>
