@@ -618,3 +618,19 @@
     border-radius: 0.6rem;
     font-size: 0.75rem;
 }
+
+/*
+ * 画布上自带主题底色的按钮（见 components/canvas/canvas-surface-button.tsx）。
+ *
+ * 必须走样式表 + !important，不能像以前那样各自内联写 background：内联样式压得过 antd 自己的
+ * hover 规则，结果是 antd 的 hover 背景永远不生效，鼠标放上去毫无反馈，用户看不出这里能点。
+ * 颜色一律从 CSS 变量取，变量由组件按当前画布主题填，深浅两套主题共用这一条规则。
+ */
+.canvas-surface-button {
+    background: var(--canvas-surface-bg) !important;
+    color: var(--canvas-surface-text) !important;
+}
+
+.canvas-surface-button:hover:not(:disabled):not(.ant-btn-disabled) {
+    background: var(--canvas-surface-bg-hover) !important;
+}

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Bot, CloudOff, Download, Home, Images, Loader2, Menu, PanelLeftClose, PanelLeftOpen, Plus, Redo2, Share2, Trash2, Undo2, Upload } from "lucide-react";
-import { Button, Dropdown, Modal, Tooltip } from "antd";
+import { Dropdown, Modal, Tooltip } from "antd";
 
+import { CanvasSurfaceButton } from "@/components/canvas/canvas-surface-button";
 import { UserStatusActions } from "@/components/layout/user-status-actions";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { useCanvasSidePanelStore } from "@/stores/use-canvas-side-panel-store";
@@ -142,28 +143,16 @@ export function CanvasTopBar({
                 <div className="pointer-events-auto flex items-center gap-1.5">
                     {onOpenShare ? (
                         <Tooltip title="分享这张画布">
-                            <Button
-                                type="text"
-                                className="!h-10 !rounded-xl !px-3 !font-medium"
-                                style={{ background: theme.toolbar.panel, color: theme.node.text, boxShadow: "0 10px 30px rgba(28,25,23,.10)" }}
-                                icon={<Share2 className="size-4" />}
-                                onClick={onOpenShare}
-                            >
+                            <CanvasSurfaceButton theme={theme} className="!h-10 !rounded-xl !px-3 !font-medium" style={{ boxShadow: "0 10px 30px rgba(28,25,23,.10)" }} icon={<Share2 className="size-4" />} onClick={onOpenShare}>
                                 分享
-                            </Button>
+                            </CanvasSurfaceButton>
                         </Tooltip>
                     ) : null}
                     <UserStatusActions variant="canvas" onOpenShortcuts={() => setShortcutsOpen(true)} onOpenPlugins={onOpenPlugins} />
                     <span className="h-6 w-px" style={{ background: theme.toolbar.border }} />
-                    <Button
-                        type="text"
-                        className="!h-10 !rounded-xl !px-3 !font-medium"
-                        style={{ background: agentOpen ? theme.toolbar.activeBg : theme.toolbar.panel, color: theme.node.text, boxShadow: "0 10px 30px rgba(28,25,23,.10)" }}
-                        icon={<Bot className="size-4" />}
-                        onClick={onToggleAgent}
-                    >
+                    <CanvasSurfaceButton theme={theme} active={agentOpen} className="!h-10 !rounded-xl !px-3 !font-medium" style={{ boxShadow: "0 10px 30px rgba(28,25,23,.10)" }} icon={<Bot className="size-4" />} onClick={onToggleAgent}>
                         Agent
-                    </Button>
+                    </CanvasSurfaceButton>
                 </div>
             </div>
             <Modal title="快捷键" open={shortcutsOpen} onCancel={() => setShortcutsOpen(false)} footer={null} centered>

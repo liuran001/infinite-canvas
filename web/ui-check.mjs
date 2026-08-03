@@ -157,8 +157,97 @@ async function main() {
         .catch(() => false);
     await page.waitForTimeout(2500);
     check("能新建画布并进入", created && page.url().includes("/canvas/"), `当前地址 ${page.url()}`);
+    // 上面那条按「点一下就该进去」判定，是它该有的样子，失败了就得留在账上。
+    // 但后面还有一整段断言要在画布里跑，不能因为这一步没成就全部作废：
+    // 画布这时其实已经建出来了（只是没跳转），从列表里点进去是用户同样会走的路径。
+    if (!page.url().includes("/canvas/")) {
+        await page
+            .getByText(/^无限画布 \d+$/)
+            .first()
+            .click()
+            .catch(() => {});
+        await page.waitForTimeout(3000);
+    }
+    const inCanvas = page.url().includes("/canvas/");
     check("画布页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
     await page.screenshot({ path: "ui-check-canvas.png" }).catch(() => {});
+
+    console.log("深色模式下的按钮 hover");
+    // 画布上的按钮底色要跟着画布主题走，只能内联写；而内联样式压得过 antd 自己的 hover 规则，
+    // 结果曾经是 hover 背景完全不生效，鼠标放上去毫无反馈。这里按「hover 前后背景必须不同」判，
+    // 不是看某个具体色值——色值以后还会调，而「hover 得有反馈」是不该退化的那条线。
+    if (inCanvas) {
+        // 计算对比度要拿真实 sRGB：Tailwind v4 用 oklch(...)，直接正则当成 rgb 解析会算出完全错误的值。
+        const contrastProbe = (element) =>
+            element.evaluate((node) => {
+                const toRgb = (css) => {
+                    const canvas = document.createElement("canvas");
+                    canvas.width = canvas.height = 1;
+                    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+                    ctx.fillStyle = "#000";
+                    ctx.fillStyle = css;
+                    ctx.fillRect(0, 0, 1, 1);
+                    return [...ctx.getImageData(0, 0, 1, 1).data];
+                };
+                const luminance = (css) => {
+                    const [r, g, b] = toRgb(css);
+                    const channel = (value) => (value / 255 <= 0.03928 ? value / 255 / 12.92 : Math.pow((value / 255 + 0.055) / 1.055, 2.4));
+                    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+                };
+                const style = getComputedStyle(node);
+                // 背景可能是半透明的，往上找到第一个足够不透明的祖先才是用户真正看到的底。
+                let ancestor = node;
+                let background = style.backgroundColor;
+                while (ancestor && toRgb(background)[3] <= 140) {
+                    ancestor = ancestor.parentElement;
+                    if (!ancestor) break;
+                    background = getComputedStyle(ancestor).backgroundColor;
+                }
+                const first = luminance(style.color);
+                const second = luminance(background);
+                return { background: style.backgroundColor, color: style.color, ratio: (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05) };
+            });
+
+        for (const mode of ["dark", "light"]) {
+            const toggle = page.getByRole("button", { name: /切换到(浅色|深色)主题/ }).first();
+            const isDark = await page.evaluate(() => document.documentElement.classList.contains("dark"));
+            if ((mode === "dark") !== isDark) {
+                await toggle.click().catch(() => {});
+                await page.waitForTimeout(2000);
+            }
+            const nowDark = await page.evaluate(() => document.documentElement.classList.contains("dark"));
+            check(`能切到${mode === "dark" ? "深色" : "浅色"}模式`, nowDark === (mode === "dark"), `document.documentElement 上的 dark 类为 ${nowDark}`);
+            const shareButton = page.getByRole("button", { name: /^分享$/ }).first();
+            if (!(await shareButton.count())) {
+                skip([`${mode} 模式下分享按钮 hover 有背景变化`, `${mode} 模式下分享按钮 hover 文字仍然看得清`], "画布页上没有分享按钮");
+                continue;
+            }
+            await page.mouse.move(2, 2);
+            await page.waitForTimeout(400);
+            const rest = await contrastProbe(shareButton);
+            await shareButton.hover();
+            await page.waitForTimeout(600);
+            const hovered = await contrastProbe(shareButton);
+            check(`${mode} 模式下分享按钮 hover 有背景变化`, rest.background !== hovered.background, `hover 前后都是 ${hovered.background}，说明 hover 根本没生效`);
+            // 4.5 是 WCAG AA 对正文的要求；这里的按钮文字就是正文字号。
+            check(`${mode} 模式下分享按钮 hover 文字仍然看得清`, hovered.ratio >= 4.5, `hover 时文字 ${hovered.color} 配底色 ${hovered.background}，对比度只有 ${hovered.ratio.toFixed(2)}`);
+        }
+        // 收尾切回深色之外的默认态，后面的段落不依赖主题，但留一个确定的起点更好排查。
+        const backDark = await page.evaluate(() => document.documentElement.classList.contains("dark"));
+        if (backDark) {
+            await page
+                .getByRole("button", { name: /切换到浅色主题/ })
+                .first()
+                .click()
+                .catch(() => {});
+            await page.waitForTimeout(1500);
+        }
+    } else {
+        skip(
+            ["能切到深色模式", "dark 模式下分享按钮 hover 有背景变化", "dark 模式下分享按钮 hover 文字仍然看得清", "能切到浅色模式", "light 模式下分享按钮 hover 有背景变化", "light 模式下分享按钮 hover 文字仍然看得清"],
+            "没有进入画布页，hover 断言无法执行",
+        );
+    }
 
     console.log("画布 Agent 面板");
     await page.getByRole("button", { name: "Agent", exact: true }).last().click();
@@ -195,8 +284,10 @@ async function main() {
 
     console.log("画布分享");
     const projectUrl = page.url();
-    await page.goto(projectUrl, { waitUntil: "networkidle", timeout: 45000 });
-    await page.waitForTimeout(1200);
+    // 画布页挂着一条常驻的协作 SSE，networkidle 永远不会到，这里只等 DOM——
+    // 和团队详情页那一段用的是同一个理由。
+    await page.goto(projectUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForTimeout(2500);
     resetErrors();
     const shareButton = page.getByRole("button", { name: "分享", exact: true });
     check("画布页有分享入口", (await shareButton.count()) > 0);
@@ -214,8 +305,11 @@ async function main() {
     }
 
     // 分享页在登录守卫之外：无效 token 也应当渲染失效提示，而不是被踢回首页。
-    await visit("/s/invalid-token-for-ui-check");
+    // 这一段故意用一个不存在的 token，服务端必然回 404；只在这一次导航里放行它，
+    // 并在下面用 missingExpected() 反向校验——哪天这条 404 不再出现，说明白名单过期了，得有人来删。
+    await visit("/s/invalid-token-for-ui-check", null, [/status of 404/]);
     check("无效分享链接渲染失效提示", (await page.getByText("链接不存在或已失效").count()) > 0, `当前地址 ${page.url()}`);
+    check("无效分享链接确实被服务端拒绝", missingExpected().length === 0, "预期内的 404 没有出现，这条白名单已经过期");
     check("分享页不会被登录守卫踢回首页", new URL(page.url()).pathname.startsWith("/s/"), `当前地址 ${page.url()}`);
     const robotsMeta = await page
         .locator('head meta[name="robots"]')
@@ -258,6 +352,12 @@ async function main() {
         check("创建后进入团队详情", await isVisible(page.getByText("UI 验证团队").first()));
         check("详情页展示团队积分", await isVisible(page.getByText(/团队积分/).first()));
         // 团队云空间和个人云空间是两本账，详情页必须把团队那本单独摆出来。
+        // 刚创建完就跳进来时用量还在路上，先等元素出现再断言，否则测的是「加载够不够快」而不是「有没有这块内容」。
+        await page
+            .getByTestId("team-storage")
+            .first()
+            .waitFor({ state: "visible", timeout: 8000 })
+            .catch(() => {});
         check("详情页展示团队云空间", await isVisible(page.getByTestId("team-storage").first()));
         const teamStorageText = await page
             .getByTestId("team-storage")

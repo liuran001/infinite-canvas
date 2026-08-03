@@ -10,7 +10,7 @@
 //      而 ui-check 自己的白名单本来就是一条源码属性），用最紧的正则钉住。
 //
 // 用法：node web/team-contract-check.mjs
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,6 +34,16 @@ function check(name, ok, detail = "") {
 }
 
 const read = (relative) => readFileSync(join(root, relative), "utf8");
+/** 递归列出 src 下所有 ts/tsx，给「全仓扫描某个反模式」这类断言用。 */
+function sourceFiles(dir) {
+    const out = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) out.push(...sourceFiles(full));
+        else if (/\.tsx?$/.test(entry.name)) out.push(full);
+    }
+    return out;
+}
 const store = () => useTeamStore.getState();
 const team = (id, credits, myRole = "owner", storageUsed = 0, storageQuota = 0) => ({
     id,
@@ -213,6 +223,53 @@ check("昵称有长度上限", /maxLength=\{DISPLAY_NAME_MAX\}/.test(accountModa
 // 弹窗不销毁表单，上次改了一半又关掉的草稿会留着，下次打开看到的就不是账号真正的昵称。
 check("每次打开用当前昵称重置表单", /if \(open\) profileForm\.setFieldsValue/.test(accountModal), "上次没保存的草稿会留在输入框里，看着像是账号的真实昵称");
 check("昵称允许留空并回落到用户名", /displayName \|\| user\?\.username/.test(accountModal), "空昵称没有回落，界面上会出现无名氏");
+
+console.log("画布按钮的 hover 契约");
+
+// 这几条是「以后不会再犯」的机械保证，不是对某几个按钮的抽查。
+//
+// 背景：画布上的按钮底色要跟着画布主题走，只能内联写；而内联样式压得过 antd 自己的 hover 规则，
+// 于是 antd 的 hover 背景永远不生效——鼠标放上去毫无反馈，用户看不出这里能点。
+// 以前每个按钮各写一份 style={{ background }}，也就各自漏掉了一次 hover，全站漏了七处。
+const surfaceButton = read("components/canvas/canvas-surface-button.tsx");
+const globalCss = read("styles/globals.css");
+const themeSource = read("lib/canvas-theme.ts");
+
+// 只要还有人用「type="text" + 内联背景色」这个写法，这条就红：那正是漏掉 hover 的那一步。
+const inlineBackgroundTextButtons = [];
+for (const relative of sourceFiles(join(root))) {
+    const source = readFileSync(relative, "utf8");
+    for (const match of source.matchAll(/type="text"/g)) {
+        const start = source.lastIndexOf("<", match.index);
+        let index = match.index + match[0].length;
+        let depth = 0;
+        let end = source.length;
+        while (index < source.length) {
+            const char = source[index];
+            if (char === "{") depth += 1;
+            else if (char === "}") depth -= 1;
+            else if (char === ">" && depth === 0) {
+                end = index + 1;
+                break;
+            }
+            index += 1;
+        }
+        const fragment = source.slice(start, end);
+        if (/(background|backgroundColor)\s*:/.test(fragment)) inlineBackgroundTextButtons.push(`${relative.slice(root.length + 1)}:${source.slice(0, start).split("\n").length}`);
+    }
+}
+check("没有按钮再自己内联写背景色", inlineBackgroundTextButtons.length === 0, `这些地方绕开了 CanvasSurfaceButton，它们的 hover 一定是死的：${inlineBackgroundTextButtons.join(", ")}`);
+
+// 着色必须落在样式表里：只有走样式表才能带 !important 压过 antd，也只有走 :hover 选择器才有 hover 态。
+check("hover 规则落在样式表里", /\.canvas-surface-button:hover[^{]*\{[^}]*background:[^;]*!important/.test(globalCss), "globals.css 里没有 .canvas-surface-button 的 hover 规则，hover 依旧不会生效");
+check("静态色也带 !important", /\.canvas-surface-button\s*\{[^}]*background:[^;]*!important/.test(globalCss), "静态背景没有 !important，会被 antd 的默认底色盖掉");
+// 颜色从主题取，不在组件里写死：写死就等于又开了一处「深浅两套主题各调一遍」的口子。
+check("hover 色由主题提供", /panelHover/.test(themeSource) && /fillHover/.test(themeSource) && /activeBgHover/.test(themeSource), "canvas-theme 里缺 hover 色，组件只能自己编一个");
+check("组件只从主题取色", /theme\.toolbar\.panelHover/.test(surfaceButton) && /theme\.node\.fillHover/.test(surfaceButton), "CanvasSurfaceButton 没有用主题里的 hover 色");
+// 选中态（比如 Agent 面板已打开）再 hover 也要有反馈，否则会被当成点不动了。
+check("选中态也有 hover 反馈", /activeBgHover/.test(surfaceButton), "选中的按钮 hover 没有任何变化，看着像坏了");
+// 调用方不能再自己写 type：写成别的 type 就又回到 antd 默认那套亮色 hover 上去了。
+check("组件锁死 type=text", /\.\.\.rest\}\s*\n\s*type="text"/.test(surfaceButton) || /type="text"[\s\S]{0,80}\.\.\.rest/.test(surfaceButton), "type 没有被组件锁死，调用方可以覆盖掉");
 
 console.log("SSE 分帧");
 
