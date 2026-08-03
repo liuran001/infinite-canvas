@@ -85,6 +85,7 @@ export function AgentChatComposer({
                     onKeyDown={(event) => {
                         if (!isPlainEnterKey(event)) return;
                         event.preventDefault();
+                        if (!canSubmit) return;
                         void onSubmit();
                     }}
                     className="thin-scrollbar max-h-32 min-h-20 w-full resize-none border-0 bg-transparent px-1 py-1 text-sm leading-5 outline-none placeholder:opacity-45"
@@ -100,7 +101,7 @@ export function AgentChatComposer({
                                     event.target.value = "";
                                 }} />
                                 <Tooltip title="上传图片">
-                                    <Button type="text" shape="circle" className="!h-9 !w-9 !min-w-9" disabled={sending} style={{ color: theme.node.muted }} icon={<ImagePlus className="size-4" />} onClick={() => fileInputRef.current?.click()} />
+                                    <Button type="text" shape="circle" className="!h-9 !w-9 !min-w-9" disabled={disabled || sending} style={{ color: theme.node.muted }} icon={<ImagePlus className="size-4" />} onClick={() => fileInputRef.current?.click()} />
                                 </Tooltip>
                             </>
                         ) : null}

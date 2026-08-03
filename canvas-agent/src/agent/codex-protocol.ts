@@ -6,6 +6,7 @@ export type CodexTurnError = JsonRecord & { message: string };
 export type CodexItem = JsonRecord & { id: string; type: string; text?: string };
 export type CodexPlanStep = { step: string; status: "pending" | "inProgress" | "completed" };
 export type CodexPlanUpdate = { threadId: string; turnId: string; explanation?: string | null; plan: CodexPlanStep[]; turnStatus?: string };
+export type CodexMcpStartupStatus = { threadId: string | null; name: string; status: "starting" | "ready" | "failed" | "cancelled"; error: string | null; failureReason: "reauthenticationRequired" | null };
 export type CodexReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type CodexModel = JsonRecord & {
     id: string;
@@ -99,6 +100,7 @@ type CodexNotificationSpec = {
     "item/reasoning/summaryTextDelta": { threadId: string; turnId: string; itemId: string; delta: string; summaryIndex: number };
     "item/commandExecution/outputDelta": { threadId: string; turnId: string; itemId: string; delta: string };
     "thread/tokenUsage/updated": { threadId: string; turnId: string; tokenUsage: { last: TokenUsageBreakdown } };
+    "mcpServer/startupStatus/updated": CodexMcpStartupStatus;
     error: { threadId: string; turnId: string; error: CodexTurnError; willRetry: boolean };
 };
 

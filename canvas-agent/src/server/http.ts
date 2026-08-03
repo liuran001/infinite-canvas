@@ -43,6 +43,24 @@ export function startHttpServer() {
         session.emitThread("workspace_changed", activeThreadId, { ...payload, activeThreadId });
         return workspace;
     };
+    let draftThreadStart: ReturnType<typeof startCodexThread> | null = null;
+    const prepareDraftThread = (clientId: string, permission: AgentPermissionMode) => {
+        if (draftThreadStart) return draftThreadStart;
+        const workspace = ensureSiteWorkspace(config);
+        emit("agent_bootstrap", { type: "codex.preparing", sourceClientId: clientId });
+        const start = startCodexThread(emit, workspace.workspacePath, permission);
+        draftThreadStart = start;
+        void start.then((thread) => {
+            if (draftThreadStart !== start) return;
+            draftThreadStart = null;
+            const threadId = String((thread as Record<string, unknown>).id || "");
+            if (threadId && !ensureSiteWorkspace(config).activeThreadId) setActiveThread(threadId, { emptyThread: true, draftThread: true, sourceClientId: clientId });
+        }).catch((error) => {
+            if (draftThreadStart === start) draftThreadStart = null;
+            emit("agent_bootstrap", { type: "codex.prepare_failed", sourceClientId: clientId, error: error instanceof Error ? error.message : String(error) });
+        });
+        return start;
+    };
     const app = express();
     app.disable("x-powered-by");
     app.use(express.json({ limit: "30mb" }));
@@ -124,7 +142,10 @@ export function startHttpServer() {
         res.json({ ok: true, workspace: nextWorkspace, thread: summarizeCodexThread(thread), messages: [] });
     }));
     app.post("/agent/codex/threads/reset", codexMutation((req, res) => {
-        res.json({ ok: true, workspace: setActiveThread("", { emptyThread: true, draftThread: true, sourceClientId: String(req.body?.clientId || "") }) });
+        const clientId = String(req.body?.clientId || "");
+        const workspace = setActiveThread("", { emptyThread: true, draftThread: true, sourceClientId: clientId });
+        void prepareDraftThread(clientId, permissionMode(req.body?.permissionMode));
+        res.json({ ok: true, workspace });
     }));
     app.get("/agent/codex/threads/:threadId", route(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
@@ -172,7 +193,7 @@ export function startHttpServer() {
         try {
             let turnId = "";
             if (!threadId) {
-                const thread = await startCodexThread(emit, workspace.workspacePath, permissionMode(req.body?.permissionMode));
+                const thread = await prepareDraftThread(clientId, permissionMode(req.body?.permissionMode));
                 threadId = String((thread as Record<string, unknown>).id || "");
                 setActiveThread(threadId, { emptyThread: true, sourceClientId: clientId });
             }

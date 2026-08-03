@@ -258,6 +258,18 @@ export class CodexAppClient {
             }
             return;
         }
+        if (method === "mcpServer/startupStatus/updated") {
+            const value = params as unknown as CodexNotificationParams<"mcpServer/startupStatus/updated">;
+            this.emit("agent_bootstrap", {
+                type: "mcp.startup",
+                threadId: value.threadId || this.currentThreadId,
+                name: value.name,
+                status: value.status,
+                error: value.error,
+                failureReason: value.failureReason,
+            });
+            return;
+        }
         const turnEvent = method.startsWith("turn/") || method.startsWith("item/") || method === "thread/tokenUsage/updated" || method === "error";
         if (turnEvent) {
             const threadId = String(field(params, "threadId") || this.currentThreadId);

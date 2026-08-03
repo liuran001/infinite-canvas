@@ -381,7 +381,7 @@ function AgentPlanCard({ title, plan, theme }: { title: string; plan: PlanDetail
     );
 }
 
-export function AgentWorkingMessage({ text, activityKey, theme }: { text: string; activityKey: string; theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {
+export function AgentWorkingMessage({ text, detail, status = "running", mcpStatuses = [], activityKey, theme }: { text: string; detail?: string; status?: "running" | "ready" | "error"; mcpStatuses?: Array<{ name: string; status: "running" | "ready" | "error"; detail: string }>; activityKey: string; theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {
     const [elapsed, setElapsed] = useState(0);
     useEffect(() => {
         const startedAt = Date.now();
@@ -392,11 +392,25 @@ export function AgentWorkingMessage({ text, activityKey, theme }: { text: string
     return (
         <div className="min-w-0 py-1" aria-live="polite">
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm" style={{ color: theme.node.muted }}>
-                <LoaderCircle className="size-3.5 shrink-0 animate-spin" />
+                {status === "running" ? <LoaderCircle className="size-3.5 shrink-0 animate-spin" /> : status === "ready" ? <CheckCircle2 className="size-3.5 shrink-0 text-emerald-600" /> : <XCircle className="size-3.5 shrink-0 text-red-600" />}
                 <span className="min-w-0">{text}</span>
-                {elapsed >= 5 ? <span className="shrink-0 text-[11px] tabular-nums opacity-60">{waitingTime(elapsed)}</span> : null}
+                {status === "running" && elapsed >= 5 ? <span className="shrink-0 text-[11px] tabular-nums opacity-60">{waitingTime(elapsed)}</span> : null}
             </div>
-            {elapsed >= 30 ? <div className="mt-1 text-xs leading-5 opacity-65" style={{ color: theme.node.muted }}>响应时间较长，但任务仍在运行。可以继续等待，或点击输入框右侧的停止按钮结束本轮。</div> : null}
+            {detail ? <div className="ml-5.5 mt-1 text-xs leading-5 opacity-65" style={{ color: theme.node.muted }}>{detail}</div> : null}
+            {mcpStatuses.length ? (
+                <div className="ml-5.5 mt-3 space-y-2">
+                    {mcpStatuses.map((item) => (
+                        <div key={item.name} className="flex min-w-0 items-start gap-2 text-xs leading-5" style={{ color: theme.node.muted }}>
+                            {item.status === "running" ? <LoaderCircle className="mt-0.5 size-3.5 shrink-0 animate-spin" /> : item.status === "ready" ? <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-emerald-600" /> : <XCircle className="mt-0.5 size-3.5 shrink-0 text-red-600" />}
+                            <div className="min-w-0">
+                                <div className="font-medium" style={{ color: theme.node.text }}>{item.name}</div>
+                                <div className="opacity-65">{item.detail}</div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            ) : null}
+            {status === "running" && elapsed >= 30 ? <div className="mt-1 text-xs leading-5 opacity-65" style={{ color: theme.node.muted }}>响应时间较长，但任务仍在运行。可以继续等待，或点击输入框右侧的停止按钮结束本轮。</div> : null}
         </div>
     );
 }

@@ -80,6 +80,7 @@ type AgentCodexState = { busy?: boolean; threadId?: string; turnId?: string };
 type AgentHelloEvent = { ok?: boolean; protocolVersion?: number; clientId?: string; workspace?: { activeThreadId?: string }; codex?: AgentCodexState; pendingApprovals?: AgentPendingApproval[] };
 type AgentWorkspaceEvent = { activeThreadId?: string; threadId?: string; sourceClientId?: string; emptyThread?: boolean; draftThread?: boolean };
 type AgentChatEvent = { threadId?: string; turnId?: string; sourceClientId?: string; replayed?: boolean; message?: AgentChatItem };
+type AgentBootstrapEvent = { type?: "codex.preparing" | "codex.prepare_failed" | "mcp.startup"; threadId?: string; name?: string; status?: "starting" | "ready" | "failed" | "cancelled"; error?: string | null; failureReason?: string | null };
 type AgentClientGlobal = typeof globalThis & { __infiniteCanvasAgentClientIdPromise?: Promise<string> };
 
 function authoritativeHistoryTurnKeys(threadId: string, settledTurnIds: string[]) {
@@ -125,6 +126,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         })),
     );
     const setAgentState = useAgentStore((state) => state.setAgentState);
+    const agentInitializing = useAgentStore((state) => state.bootstrapStatus?.status === "running");
     const closePanel = useAgentStore((state) => state.closePanel);
     const pushMessage = useAgentStore((state) => state.addMessage);
     const pushEventLog = useAgentStore((state) => state.addEventLog);
@@ -338,6 +340,13 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             if (!headless) message.success("本地 Agent 已连接");
             void postState(endpoint, token, clientId, canvasContextRef.current?.snapshot || null);
             if (document.visibilityState === "visible" && document.hasFocus()) void activateAgentClient(endpoint, token, clientId);
+            if (!busy && !nextThreadId) {
+                setAgentState({ bootstrapStatus: { key: "codex:preparing", text: "正在初始化 Codex 对话", detail: "正在创建会话并启动画布工具服务", status: "running" }, mcpStartupStatuses: {} });
+                void fetchAgentJson(endpoint, token, "/agent/codex/threads/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId, permissionMode }) }).catch((error) => {
+                    setAgentState({ bootstrapStatus: { key: "codex:prepare_failed", text: "Codex 对话初始化失败", detail: error instanceof Error ? error.message : "无法创建 Codex 会话", status: "error" } });
+                    addEventLog("Codex 对话初始化失败", error);
+                });
+            }
         });
         source.addEventListener("codex_state", (event) => {
             const data = parseEventData<AgentCodexState>(event);
@@ -392,6 +401,42 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 if (data.type !== "usage.updated" && !shouldProcess) return;
                 return handleAgentEvent(data);
             });
+        });
+        source.addEventListener("agent_bootstrap", (event) => {
+            const data = parseEventData<AgentBootstrapEvent>(event);
+            if (!data?.type) return;
+            if (data.type === "codex.preparing") {
+                setAgentState({ bootstrapStatus: { key: "codex:preparing", text: "正在初始化 Codex 对话", detail: "正在创建会话并启动画布工具服务", status: "running" }, mcpStartupStatuses: {} });
+                addEventLog("正在初始化 Codex 对话", "正在创建会话并启动画布工具服务", data);
+                return;
+            }
+            if (data.type === "codex.prepare_failed") {
+                setAgentState({ bootstrapStatus: { key: "codex:prepare_failed", text: "Codex 对话初始化失败", detail: data.error || "无法创建 Codex 会话", status: "error" } });
+                addEventLog("Codex 对话初始化失败", data.error, data);
+                return;
+            }
+            if (!data.name || !data.status) return;
+            const label = data.name;
+            const status = data.status === "starting"
+                ? { text: `正在启动 MCP：${label}`, detail: "正在建立工具连接并读取可用工具列表", status: "running" as const }
+                : data.status === "ready"
+                    ? { text: `MCP 已就绪：${label}`, detail: "工具列表加载完成，可以开始对话", status: "ready" as const }
+                    : data.status === "failed"
+                        ? { text: `MCP 启动失败：${label}`, detail: data.error || "工具服务未能完成初始化", status: "error" as const }
+                        : { text: `MCP 启动已取消：${label}`, detail: "工具服务初始化已取消", status: "error" as const };
+            const mcpStartupStatuses = { ...useAgentStore.getState().mcpStartupStatuses, [label]: { key: `mcp:${label}:${data.status}`, ...status } };
+            const services = Object.values(mcpStartupStatuses);
+            const failed = services.some((item) => item.status === "error");
+            const ready = services.length > 0 && services.every((item) => item.status === "ready");
+            setAgentState({
+                mcpStartupStatuses,
+                bootstrapStatus: failed
+                    ? { key: "mcp:failed", text: "部分 MCP 服务初始化失败", detail: "可以查看下方服务状态和诊断日志", status: "error" }
+                    : ready
+                        ? { key: "mcp:ready", text: `${services.length} 个 MCP 服务已就绪`, detail: "工具列表加载完成，可以开始对话", status: "ready" }
+                        : { key: "mcp:starting", text: "正在启动 MCP 服务", detail: `正在初始化 ${services.length} 个工具服务`, status: "running" },
+            });
+            addEventLog(status.text, status.detail, data);
         });
         source.addEventListener("workspace_changed", (event) => {
             const data = parseEventData<AgentWorkspaceEvent>(event);
@@ -838,6 +883,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             sending: false,
             pendingTool: null,
             pendingApprovals: [],
+            bootstrapStatus: null,
+            mcpStartupStatuses: {},
             ...patch,
         });
         pendingToolRef.current = null;
@@ -860,14 +907,16 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         const current = useAgentStore.getState();
         if (!current.connected || current.sending || current.waiting || current.loadingThreads) return;
         const operation = beginThreadOperation();
-        setAgentState({ activeTab: "chat", activity: "正在新建对话" });
+        applyWorkspaceChange({ activeThreadId: "", emptyThread: true, draftThread: true, sourceClientId: clientIdRef.current });
+        setAgentState({ activeTab: "chat", activity: "正在新建对话", bootstrapStatus: { key: "codex:preparing", text: "正在初始化 Codex 对话", detail: "正在创建会话并启动画布工具服务", status: "running" }, mcpStartupStatuses: {} });
         try {
-            const result = await fetchAgentJson<AgentWorkspaceResponse>(endpoint, token, "/agent/codex/threads/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId: clientIdRef.current }) });
+            const result = await fetchAgentJson<AgentWorkspaceResponse>(endpoint, token, "/agent/codex/threads/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId: clientIdRef.current, permissionMode }) });
             if (threadOperationRef.current !== operation) return;
             const latest = useAgentStore.getState();
             if (latest.activeThreadId || latest.messages.length) applyWorkspaceChange({ activeThreadId: result.workspace?.activeThreadId || "", emptyThread: true, draftThread: true, sourceClientId: clientIdRef.current });
             setAgentState({ activeTab: "chat", activity: "新对话" });
         } catch (error) {
+            setAgentState({ bootstrapStatus: { key: "codex:prepare_failed", text: "Codex 对话初始化失败", detail: error instanceof Error ? error.message : "无法创建 Codex 会话", status: "error" } });
             addEventLog("新建对话失败", error);
             message.error(error instanceof Error ? error.message : "新建对话失败");
             await loadThreads();
@@ -1051,7 +1100,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             const current = useAgentStore.getState();
             if (!scope.threadId || !scope.turnId) return;
             liveTurnKeysRef.current.add(`${scope.threadId}\0${scope.turnId}`);
-            setAgentState({ activeTurnId: scope.turnId, messages: bindPendingTurnMessages(current.messages, scope.threadId, scope.turnId) });
+            setAgentState({ activeTurnId: scope.turnId, bootstrapStatus: null, mcpStartupStatuses: {}, messages: bindPendingTurnMessages(current.messages, scope.threadId, scope.turnId) });
         }
         if (event.type === "item.updated" && event.item?.type === "agent_message" && event.item.id) {
             const delta = stringText(event.item.delta);
@@ -1223,9 +1272,9 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                     <AgentChatComposer
                         prompt={prompt}
                         attachments={attachments.map(agentAttachmentToChatAttachment)}
-                        disabled={!connected}
+                        disabled={!connected || agentInitializing}
                         sending={sending || waiting}
-                        placeholder="询问 Codex，或让它操作网站/画布"
+                        placeholder={agentInitializing ? "MCP 初始化中，完成后即可发送" : "询问 Codex，或让它操作网站/画布"}
                         theme={theme}
                         onPromptChange={(prompt) => setAgentState({ prompt })}
                         onSubmit={sendPrompt}

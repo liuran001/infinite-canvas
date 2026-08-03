@@ -290,13 +290,19 @@ function expandLog(item: AgentEventLog): DisplayLog[] {
             displayText,
             level,
             signature: `${level}\n${title}\n${logSignature(displayText)}`,
-            success: level === "info" && /完成|成功|已连接|收到回复/.test(`${title}\n${displayText}`),
+            success: level === "info" && /完成|成功|已连接|已就绪|收到回复/.test(`${title}\n${displayText}`),
         };
     });
 }
 
 function logLevel(item: AgentEventLog, entry?: unknown): DisplayLog["level"] {
     const entries = entry === undefined ? parseJsonEntries(item.raw ?? item.text) : [entry];
+    const structured = entries.find((value) => value && typeof value === "object" && !Array.isArray(value)) as Record<string, unknown> | undefined;
+    if (structured?.type === "mcp.startup") {
+        if (structured.status === "failed") return "error";
+        if (structured.status === "cancelled") return "warning";
+        return "info";
+    }
     const declared = entries.map(declaredLogLevel).filter(Boolean);
     if (declared.includes("error")) return "error";
     if (declared.includes("warning")) return "warning";
