@@ -8,9 +8,12 @@
 
 /** 与服务端 CODE_ALPHABET 一字不差。去掉 0/O/1/I/L 这些形近字：码是要人手抄手输的，留着只会让人反复输错。 */
 export const INVITE_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-/** 长度区间同样对齐服务端。随机码固定 10 位，指定码放宽一些，但不能短到能被人猜中。 */
+/**
+ * 长度区间对齐服务端 invite-code.ts 的 CUSTOM_CODE_MIN / CUSTOM_CODE_MAX。
+ * 随机码固定 10 位；指定码下界 4（再短就能被人猜中），上界 64 对齐 code 列的 varchar(64)。
+ */
 export const INVITE_CODE_MIN_LENGTH = 4;
-export const INVITE_CODE_MAX_LENGTH = 16;
+export const INVITE_CODE_MAX_LENGTH = 64;
 
 /** 码值只存大写，输入随手打的小写要先归一，否则用户照着自己填的小写去发码，兑换时对不上。 */
 export function normalizeInviteCode(code: string) {

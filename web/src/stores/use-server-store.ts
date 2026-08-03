@@ -41,11 +41,12 @@ export type ServerSettings = {
     /** defaultQuota 是新账号的云空间上限（字节）。 */
     storage: { remoteEnabled: boolean; defaultQuota: number };
     /**
-     * 团队相关的平台级上限。defaultStorageQuota 是新建团队的云空间上限（字节），
-     * maxTeamsPerUser 是一个用户最多能创建几个团队——放在公开配置里是因为前端要在用户点「创建团队」之前
-     * 就把上限讲清楚，而不是等他填完表单再收到一句服务端的拒绝。
+     * 团队相关的平台级默认值，语义与隔壁的 storage.defaultQuota 一一对应，所以字段名也不加前缀。
+     * defaultQuota 是新建团队的云空间上限（字节），只作用于之后新建的团队；
+     * maxPerUser 是一个用户最多能创建几个团队（0 表示不限），与他被邀请加入了多少个无关——
+     * 放在公开配置里是因为前端要在用户点「创建团队」之前就把上限讲清楚，而不是等他填完表单再被服务端拒绝。
      */
-    teams: { defaultStorageQuota: number; maxTeamsPerUser: number };
+    team: { defaultQuota: number; maxPerUser: number };
     /** 管理员统一控制的功能入口开关，关掉后所有用户都看不到对应入口。 */
     capabilities: Record<ServerCapability, boolean>;
 };

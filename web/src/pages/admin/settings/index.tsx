@@ -63,7 +63,7 @@ export default function AdminSettingsPage() {
     const patchStorage = (remoteEnabled: boolean, defaultQuota?: number) => setDraft((current) => current && { ...current, public: { ...current.public, storage: { remoteEnabled, defaultQuota: defaultQuota ?? current.public.storage.defaultQuota } } });
     const patchCapabilities = (key: ServerCapability, enabled: boolean) => setDraft((current) => current && { ...current, public: { ...current.public, capabilities: { ...current.public.capabilities, [key]: enabled } } });
     const patchAgent = (value: Partial<ServerSettings["agent"]>) => setDraft((current) => current && { ...current, public: { ...current.public, agent: { ...current.public.agent, ...value } } });
-    const patchTeams = (value: Partial<ServerSettings["teams"]>) => setDraft((current) => current && { ...current, public: { ...current.public, teams: { ...current.public.teams, ...value } } });
+    const patchTeam = (value: Partial<ServerSettings["team"]>) => setDraft((current) => current && { ...current, public: { ...current.public, team: { ...current.public.team, ...value } } });
     const patchPrivate = (value: Partial<AdminSettings["private"]>) => setDraft((current) => current && { ...current, private: { ...current.private, ...value } });
     const patchSearch = (value: Partial<AdminSettings["private"]["search"]>) => setDraft((current) => current && { ...current, private: { ...current.private, search: { ...current.private.search, ...value } } });
 
@@ -74,7 +74,7 @@ export default function AdminSettingsPage() {
      * 直接解构会让整个系统设置页白屏——管理员连回去改配置的入口都没了。
      * 这里的默认值与服务端 normalizePublic 保持一致：100MB、每人 5 个团队。
      */
-    const teams = draft.public.teams || { defaultStorageQuota: 100 << 20, maxTeamsPerUser: 5 };
+    const team = draft.public.team || { defaultQuota: 100 << 20, maxPerUser: 5 };
     const models = channelModels(channels);
     const optionsFor = (capability: ServerCapability) => models.filter((model) => model.capability === capability).map(toOption);
     const allOptions = models.map(toOption);
@@ -388,21 +388,14 @@ export default function AdminSettingsPage() {
                     <label className="block">
                         <span className="mb-1 block text-sm font-medium">团队默认云空间</span>
                         {/* 与「新账号默认云空间」同一套单位换算：界面按 MB 填，配置里存字节。 */}
-                        <InputNumber
-                            className="w-full"
-                            min={1}
-                            precision={0}
-                            suffix="MB"
-                            value={Math.round(teams.defaultStorageQuota / 1024 / 1024)}
-                            onChange={(value) => patchTeams({ defaultStorageQuota: Math.max(1, Number(value) || 1) * 1024 * 1024 })}
-                        />
+                        <InputNumber className="w-full" min={1} precision={0} suffix="MB" value={Math.round(team.defaultQuota / 1024 / 1024)} onChange={(value) => patchTeam({ defaultQuota: Math.max(1, Number(value) || 1) * 1024 * 1024 })} />
                         <span className="mt-1 block text-xs text-stone-500">只影响之后新建的团队，默认 100MB；已有团队请到团队管理里单独调整。</span>
                     </label>
                     <label className="block">
                         <span className="mb-1 block text-sm font-medium">每个用户最多可创建的团队数</span>
-                        <InputNumber className="w-full" min={0} precision={0} suffix="个" value={teams.maxTeamsPerUser} onChange={(value) => patchTeams({ maxTeamsPerUser: Math.max(0, Number(value) || 0) })} />
-                        {/* 0 是「不许建」而不是「不限」：这里要能真正关掉创建入口，把 0 解释成不限的话就没有任何办法关它了。 */}
-                        <span className="mt-1 block text-xs text-stone-500">默认 5；只限制自己创建的团队，被别人邀请加入的不计入。填 0 表示不允许普通用户创建团队。</span>
+                        <InputNumber className="w-full" min={0} precision={0} suffix="个" value={team.maxPerUser} onChange={(value) => patchTeam({ maxPerUser: Math.max(0, Number(value) || 0) })} />
+                        {/* 0 的语义跟着服务端走（teams.ts 里 limit > 0 才判），这里的提示必须和它一致，否则管理员填 0 会得到与预期相反的结果。 */}
+                        <span className="mt-1 block text-xs text-stone-500">默认 5；只限制自己创建的团队，被别人邀请加入的不计入。填 0 表示不限。</span>
                     </label>
                 </div>
             </section>

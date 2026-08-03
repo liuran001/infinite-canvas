@@ -9,8 +9,8 @@ import { useServerStore } from "@/stores/use-server-store";
 type PasswordForm = { oldPassword?: string; newPassword: string };
 type ProfileForm = { displayName: string };
 
-/** 与服务端 normalizeDisplayName 的截断长度保持一致：前端先挡住，用户就不会填了一长串再被服务端悄悄截短。 */
-const DISPLAY_NAME_MAX = 32;
+/** 与服务端 auth.ts 的 DISPLAY_NAME_MAX 保持一致：前端先挡住，用户就不会填了一长串再被服务端整条打回。 */
+const DISPLAY_NAME_MAX = 64;
 
 /** 账号设置：昵称、修改密码与 Linux.do 绑定，绑定状态由服务端校验，前端只负责发起并提示结果。 */
 export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose: () => void }) {

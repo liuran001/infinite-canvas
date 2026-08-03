@@ -22,12 +22,12 @@ export default function TeamsPage() {
     const setTeams = useTeamStore((state) => state.setTeams);
     const userId = useServerStore((state) => state.user?.id) || "";
     /*
-     * teams 整个字段都要走可选链，不能只对 settings 做。旧版本服务端、以及新旧滚动升级期间，
-     * /api/settings 回的公开配置里根本没有 teams 这一节，`settings?.teams.maxTeamsPerUser`
+     * team 整个字段都要走可选链，不能只对 settings 做。旧版本服务端、以及新旧滚动升级期间，
+     * /api/settings 回的公开配置里根本没有 team 这一节，`settings?.team.maxPerUser`
      * 会当场抛 TypeError，把整个团队列表页变成一张错误页——一个「加了个上限提示」的改动
      * 不该有能力让整页打不开。
      */
-    const maxTeamsPerUser = useServerStore((state) => state.settings?.teams?.maxTeamsPerUser);
+    const maxTeamsPerUser = useServerStore((state) => state.settings?.team?.maxPerUser);
     const { data, isPending, isFetching, error, refetch } = useQuery({ queryKey: ["teams"], queryFn: () => teamApi.teams() });
 
     // 列表进 store，顶部导航等地方不必各自再拉一次。

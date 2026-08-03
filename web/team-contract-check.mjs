@@ -172,8 +172,10 @@ check("没登录时不算任何名额", ownedTeamCount(owned(3), "") === 0);
 check("没到上限时不拦", teamCreateBlockedReason(owned(2), "me", 5) === "");
 check("到达上限时给出原因", teamCreateBlockedReason(owned(5), "me", 5).includes("最多创建 5 个"), `当前「${teamCreateBlockedReason(owned(5), "me", 5)}」`);
 check("超过上限同样拦住", teamCreateBlockedReason(owned(7), "me", 5) !== "");
-// 0 是「管理员把创建关掉了」，再删团队也不会解锁，文案必须和「你建满了」区分开，否则用户白删一通。
-check("上限为 0 时说明是平台关闭而非建满", teamCreateBlockedReason([], "me", 0).includes("不允许自行创建"), `当前「${teamCreateBlockedReason([], "me", 0)}」`);
+// 0 表示不限，语义跟着服务端走（teams.ts 里写的是 `limit > 0 && ...`，0 根本不参与判定）。
+// 理解反了的后果很隐蔽：管理员填 0 想放开限制，前端却把所有人的创建入口锁死，
+// 而服务端那边其实是放行的——用户连报错都看不到，只看到按钮是灰的。
+check("上限为 0 时按不限放行", teamCreateBlockedReason(owned(99), "me", 0) === "", `当前「${teamCreateBlockedReason(owned(99), "me", 0)}」`);
 // 坏配置不能把所有人的创建入口锁死。
 check("配置异常时按不限处理", teamCreateBlockedReason(owned(99), "me", -1) === "" && teamCreateBlockedReason(owned(99), "me", Number.NaN) === "");
 
@@ -183,11 +185,14 @@ check("创建按钮按上限禁用", /disabled=\{Boolean\(blockedReason\)\}/.tes
 check("上限原因在页面上直接可见", /data-testid="team-create-blocked"/.test(teamsPage), "原因只挂在 Tooltip 上，触屏用户永远看不到");
 // settings 还没拉回来就把入口锁死的话，慢一拍的网络会让所有人都建不了团队。
 check("配置未就绪时不拦创建", /maxTeamsPerUser === undefined \? "" :/.test(teamsPage), "配置还没拉回来就按上限拦，网络慢一拍所有人都建不了团队");
+// 界面上的说明和实际判定必须是同一套。说成「填 0 表示不允许创建」而代码按不限放行，
+// 管理员会照着提示把创建功能「关掉」，结果谁都没被关住。
+check("设置页把 0 说成不限", /填 0 表示不限/.test(read("pages/admin/settings/index.tsx")), "系统设置里 0 的说明和 teamCreateBlockedReason 的判定对不上");
 // 旧版本服务端、以及新旧滚动升级期间，公开配置里根本没有 teams 这一节。
 // 少一个 ?. 就是当场抛 TypeError，整个团队列表页变成一张错误页——一个加提示的改动不该有这个能力。
-check("旧配置缺 teams 时不炸页", /settings\?\.teams\?\./.test(teamsPage), "settings?.teams.x 会在旧服务端上抛 TypeError，整页白屏");
+check("旧配置缺 team 时不炸页", /settings\?\.team\?\./.test(teamsPage), "settings?.team.x 会在旧服务端上抛 TypeError，整页白屏");
 const settingsPage = read("pages/admin/settings/index.tsx");
-check("系统设置页对缺失的 teams 兜底", /draft\.public\.teams \|\|/.test(settingsPage), "直接解构 teams 会让系统设置页白屏，管理员连回去改配置的入口都没了");
+check("系统设置页对缺失的 team 兜底", /draft\.public\.team \|\|/.test(settingsPage), "直接解构 team 会让系统设置页白屏，管理员连回去改配置的入口都没了");
 // 字段缺失时算出的百分比是 NaN，进度条变成一段空白，界面上看不出任何异常——比显示成 0 难查得多。
 check("云空间缺字段时兜底成 0", /const bytes = \(value/.test(teamStoreSource) && /storageUsed: bytes\(/.test(teamStoreSource), "storageUsed 可能是 undefined，百分比会算成 NaN");
 
