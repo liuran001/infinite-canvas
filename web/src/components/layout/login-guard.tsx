@@ -4,7 +4,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { useIsServerEnabled, useIsServerMode, useServerStore } from "@/stores/use-server-store";
 
 /** 这些页面的数据全部来自服务端，未登录进去只会看到空白。 */
-const REQUIRE_LOGIN = ["/canvas", "/image", "/video", "/assets", "/prompts", "/config"];
+const REQUIRE_LOGIN = ["/canvas", "/image", "/video", "/assets", "/prompts", "/config", "/teams"];
 
 /**
  * 未登录时挡下需要数据的二级页面，退回首页并唤起登录。
