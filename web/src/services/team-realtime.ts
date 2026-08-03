@@ -196,6 +196,21 @@ function watchTeamViaSse(teamId: string, signal: AbortSignal) {
 }
 
 /**
+ * WebSocket 订阅的终态码到 HTTP 状态的映射。服务端团队守卫发的是 TEAM_* 系列而不是通用 FORBIDDEN，
+ * 只认 FORBIDDEN 的话，被挂起、被移出团队、团队被停用这三种人都会看到「正在重连」，
+ * 然后被推去起一条同样连不上的 SSE，界面上永远停在连接中。
+ */
+const TERMINAL_CODE_STATUS: Record<string, number> = {
+    FORBIDDEN: 403,
+    REVOKED: 403,
+    TEAM_FORBIDDEN: 403,
+    TEAM_MEMBER_SUSPENDED: 403,
+    TEAM_DISABLED: 403,
+    TEAM_NOT_FOUND: 404,
+    NOT_FOUND: 404,
+};
+
+/**
  * 订阅团队余额与成员变更。优先走共享 WebSocket；它连不上（旧服务端、反代不放行 Upgrade）
  * 才退回原来的 SSE 循环，SSE 又连续失败才起 30 秒轮询。
  *
@@ -263,9 +278,10 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
         onTerminal: (failure) => {
             stopCorrector();
             // 权限类终态与 SSE 那边判定一致：换传输也是同一个结果，直接落到失败提示，不再重连。
-            if (failure.code === "FORBIDDEN" || failure.code === "REVOKED") {
+            const status = TERMINAL_CODE_STATUS[failure.code];
+            if (status) {
                 stopSse();
-                store().setRealtimeStatus(teamId, "failed", terminalMessage(403));
+                store().setRealtimeStatus(teamId, "failed", terminalMessage(status));
                 return;
             }
             startSse();

@@ -86,6 +86,42 @@ check("ready 之后通知恢复", /markRecovered\(\)/.test(connection));
 check("终态错误只停单条频道", /TERMINAL_CODES\.has\(failure\.code\)\) return terminate\(entry, failure\)/.test(connection));
 check("服务端 unsubscribed 被当成频道终态", /frame\.type === "unsubscribed"/.test(connection));
 
+// 终态码不能靠人肉抄。订阅路径上的服务端错误码是从源码里数出来的：
+// 团队守卫发的是 TEAM_* 而不是通用 FORBIDDEN，任何一个漏进前端的重试集，
+// 对应的用户（被挂起、被移出、团队被停用、会话已删）就会带着一条永远订不上的频道无限重连。
+const terminalCodes = new Set((connection.match(/TERMINAL_CODES = new Set\(\[([\s\S]*?)\]\)/) || [])[1]?.match(/"([^"]+)"/g)?.map((code) => code.slice(1, -1)) || []);
+check("前端解析出终态码集合", terminalCodes.size > 0);
+const teamAccess = read(join(server, "services/team-access.ts"));
+const projectAccess = read(join(server, "services/project-access.ts"));
+const agentService = read(join(server, "services/agent.ts"));
+// 只数 4xx：5xx 与未标记错误是「服务端此刻出问题了」，重连有意义，本来就不该进终态集。
+const failCodes = (source) => [...source.matchAll(/fail\([^)]*?,\s*4\d\d,\s*"([A-Z_]+)"/g)].map((match) => match[1]);
+const namedFailCodes = (source) => [...source.matchAll(/fail\([^)]*?,\s*4\d\d,\s*(FORBIDDEN|NOT_FOUND)\b/g)].map((match) => match[1]);
+// presence 限流按连接节流，等一会儿就能过，是唯一一个「重试确实有用」的订阅期错误码。
+const RETRYABLE = new Set(["RATE_LIMITED"]);
+const reachable = [
+    ...new Set([
+        ...failCodes(channels),
+        ...namedFailCodes(channels),
+        ...failCodes(teamAccess),
+        ...failCodes(projectAccess),
+        ...namedFailCodes(projectAccess),
+        ...namedFailCodes(agentService),
+        ...[...hub.matchAll(/errorFrame\([^)]*?"([A-Z_]+)"/g)].map((match) => match[1]),
+    ]),
+].filter((code) => !RETRYABLE.has(code));
+check("枚举到服务端订阅期错误码", reachable.length >= 8, `实际 ${reachable.join(",")}`);
+for (const code of reachable) check(`终态码覆盖 ${code}`, terminalCodes.has(code));
+// 会话不存在必须带稳定错误码：默认的 code=1 在前端只是「操作失败」，会被当成可重试。
+check("agent 会话不存在用 404 NOT_FOUND", /fail\("会话不存在", 404, NOT_FOUND\)/.test(agentService));
+// 团队页要把这些码翻成「不用再等了」的提示，只认 FORBIDDEN 会让被挂起的人一直看到「正在连接」。
+const teamMapped = new Set((teamRealtime.match(/TERMINAL_CODE_STATUS[^=]*= \{([\s\S]*?)\}/) || [])[1]?.match(/([A-Z_]+):/g)?.map((key) => key.slice(0, -1)) || []);
+for (const code of ["FORBIDDEN", "REVOKED", "TEAM_FORBIDDEN", "TEAM_MEMBER_SUSPENDED", "TEAM_DISABLED", "TEAM_NOT_FOUND"]) {
+    check(`团队终态提示覆盖 ${code}`, teamMapped.has(code));
+}
+// 会话不存在时换成 SSE 也是同一个 404，只会空转一轮再给出一句指错方向的「连接中断」。
+check("云端 Agent 对 NOT_FOUND 不再退回 SSE", /failure\.code === "NOT_FOUND"/.test(cloudAgent));
+
 console.log("频道名与服务端分派一致");
 for (const [name, pattern, source] of [
     ["project", /channel: `project:\$\{projectId\}`/, projectRealtime],

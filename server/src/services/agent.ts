@@ -3,7 +3,7 @@ import { MoreThan, Not } from "typeorm";
 
 import { repo } from "../db/data-source";
 import { AgentMessage, AgentSession, type AgentMessageRole, type AgentPendingAction, type AgentSessionStatus } from "../db/entities";
-import { fail, newId, now, SafeError } from "../lib/errors";
+import { fail, newId, NOT_FOUND, now, SafeError } from "../lib/errors";
 import { upstreamJson } from "../lib/upstream";
 import { fileIdOfStorageKey, listAgentTools, runAgentTool, storageKeyOf, type AgentTool, type AgentToolAccess, type ToolState } from "./agent-tools";
 import { charge, payerOfProject, payerOfSession, refund, type ChargeReceipt } from "./billing";
@@ -106,7 +106,9 @@ export function subscribeAgentSession(userId: string, sessionId: string, listene
 
 async function loadSession(userId: string, sessionId: string) {
     const row = await sessions().findOneBy({ userId, sessionId });
-    if (!row || row.deleted) throw fail("会话不存在");
+    // 必须带上 404/NOT_FOUND：默认的 code=1 到了前端只是「操作失败」，实时频道会把它当成可重试的错误，
+    // 于是一个已删除或本来就不属于这个人的会话会被无限重订，每次都换一张票再拿一次同样的拒绝。
+    if (!row || row.deleted) throw fail("会话不存在", 404, NOT_FOUND);
     return row;
 }
 

@@ -261,6 +261,16 @@ async function main() {
     const denied = await client.wait("bad", "error");
     check("订不到别人的团队", (denied?.payload as { code: string } | undefined)?.code, "TEAM_NOT_FOUND");
     check("订阅失败不关物理连接", client.socket.readyState, WebSocket.OPEN);
+    // 会话不存在必须是一个稳定错误码而不是默认的 1：前端要靠它把这条频道判成终态，
+    // 否则删掉的会话（或别人的会话）会被无限重订，每次都换一张票、再拿一次同样的拒绝。
+    client.send({ type: "subscribe", id: "bad-agent", channel: "agent:session-not-mine", payload: {} });
+    const missingAgent = await client.wait("bad-agent", "error");
+    check("订不到不存在的会话且带 NOT_FOUND", (missingAgent?.payload as { code: string } | undefined)?.code, "NOT_FOUND");
+    // 重复订阅同一个 id 也是终态：服务端不会因为客户端多等一会儿就改口。
+    client.send({ type: "subscribe", id: "dup", channel: "jobs", payload: {} });
+    client.send({ type: "subscribe", id: "dup", channel: "jobs", payload: {} });
+    const duplicate = await client.wait("dup", "error");
+    check("重复订阅回 DUPLICATE_SUBSCRIPTION", (duplicate?.payload as { code: string } | undefined)?.code, "DUPLICATE_SUBSCRIPTION");
 
     for (let index = 0; index < maxSubs; index += 1) client.send({ type: "subscribe", id: `extra-${index}`, channel: "jobs", payload: {} });
     const overflow = await client.wait(`extra-${maxSubs - 1}`, "error");

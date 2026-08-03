@@ -27,9 +27,32 @@ const FAILURES_BEFORE_DEGRADE = 3;
 
 /**
  * 订阅失败后不该重试的错误码。这些码代表「换多少次连接结果都一样」：
- * 没权限、频道名非法、资源不存在。继续重订只是每隔几秒打一次必然失败的请求。
+ * 没权限、频道名非法、资源不存在，以及连接层自己判定的订阅冲突与超限。
+ * 继续重订只是每隔几秒打一次必然失败的请求。
+ *
+ * 团队那四个码要单独列：服务端的团队守卫不发通用的 FORBIDDEN，而是发
+ * TEAM_FORBIDDEN / TEAM_MEMBER_SUSPENDED / TEAM_DISABLED / TEAM_NOT_FOUND，
+ * 漏掉任何一个，被移出团队或被挂起的人都会带着一条永远订不上的频道无限重连。
+ * DUPLICATE_SUBSCRIPTION 与 TOO_MANY_SUBSCRIPTIONS 同理：这两条是本次连接的确定结论，
+ * 原样再发一遍只会拿到同一帧 error。
  */
-const TERMINAL_CODES = new Set(["FORBIDDEN", "INVALID_SUBSCRIPTION", "INVALID_CLIENT_ID", "INVALID_ACTIVITY", "INVALID_NODE_IDS", "PROJECT_NOT_FOUND", "TEAM_NOT_FOUND", "NOT_FOUND", "UNSUPPORTED_VERSION", "UNKNOWN_TYPE"]);
+const TERMINAL_CODES = new Set([
+    "FORBIDDEN",
+    "INVALID_SUBSCRIPTION",
+    "INVALID_CLIENT_ID",
+    "INVALID_ACTIVITY",
+    "INVALID_NODE_IDS",
+    "PROJECT_NOT_FOUND",
+    "TEAM_NOT_FOUND",
+    "TEAM_FORBIDDEN",
+    "TEAM_MEMBER_SUSPENDED",
+    "TEAM_DISABLED",
+    "NOT_FOUND",
+    "UNSUPPORTED_VERSION",
+    "UNKNOWN_TYPE",
+    "DUPLICATE_SUBSCRIPTION",
+    "TOO_MANY_SUBSCRIPTIONS",
+]);
 
 export type RealtimeFailure = { code: string; message: string };
 
