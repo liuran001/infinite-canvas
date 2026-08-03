@@ -37,6 +37,7 @@ const hub = read(join(server, "services/realtime-hub.ts"));
 const channels = read(join(server, "services/realtime-channels.ts"));
 const ticketsRoute = read(join(server, "routes/realtime.ts"));
 const projectRealtime = read(join(web, "services/project-realtime.ts"));
+const shareSync = read(join(web, "services/share-sync.ts"));
 const teamRealtime = read(join(web, "services/team-realtime.ts"));
 const jobStream = read(join(web, "services/api/job-stream.ts"));
 const cloudAgent = read(join(web, "stores/use-cloud-agent-store.ts"));
@@ -67,7 +68,7 @@ check("取票端点与服务端路由一致", /serverApiUrl\("\/v1\/realtime\/ti
 
 console.log("重连与订阅");
 // 票据一次性且 30 秒过期：复用旧票在重连时必然 401，而且是「网好了却连不上」这种最难查的形态。
-check("每次重连都重新取票", /connect\(\)[\s\S]{0,600}?await fetchTicket\(\)/.test(connection));
+check("每次重连都重新取票", /async function connect\(pool[\s\S]{0,600}?await fetchTicket\(pool\.scope\)/.test(connection));
 // 重订阅必须取调用方此刻的游标，取首次订阅时的快照会把断线期间处理过的事件再放一遍。
 check("订阅参数是每次求值的函数", /payload\?: \(\) => unknown/.test(clientProtocol) === false && /payload\?\.\(\)/.test(connection));
 for (const [name, source] of [
@@ -81,9 +82,9 @@ const backoff = (connection.match(/RETRIES = \[([^\]]+)\]/) || [])[1]?.replace(/
 check("退避序列为 1500..30000", backoff === "1500,3000,6000,12000,24000,30000", `实际 ${backoff}`);
 check("退避带 0.8~1.2 抖动", /0\.8 \+ Math\.random\(\) \* 0\.4/.test(connection));
 check("连续 3 次失败通知降级", /FAILURES_BEFORE_DEGRADE = 3/.test(connection));
-check("ready 之后通知恢复", /markRecovered\(\)/.test(connection));
+check("ready 之后通知恢复", /markRecovered\(pool\)/.test(connection));
 // 终态错误若把整条连接拖去重连，另外三条正常频道会被一条无解的订阅反复打断。
-check("终态错误只停单条频道", /TERMINAL_CODES\.has\(failure\.code\)\) return terminate\(entry, failure\)/.test(connection));
+check("终态错误只停单条频道", /TERMINAL_CODES\.has\(failure\.code\)\) return terminate\(pool, entry, failure\)/.test(connection));
 check("服务端 unsubscribed 被当成频道终态", /frame\.type === "unsubscribed"/.test(connection));
 
 // 终态码不能靠人肉抄。订阅路径上的服务端错误码是从源码里数出来的：
@@ -132,6 +133,34 @@ for (const [name, pattern, source] of [
     check(`${name} 频道名前端正确`, pattern.test(source));
     check(`${name} 频道服务端可分派`, new RegExp(`kind === "${name}"`).test(channels));
 }
+
+console.log("身份作用域隔离");
+// 账号与访客是两个物理身份。共用一条 socket 意味着一张票据同时承载两种权限判定，
+// 分享页里已登录的用户会拿账号票去订访客频道（反之亦然），这属于越权，必须按身份分池。
+check("连接按身份作用域分池", /scopeKey|scopes\.get\(/.test(connection), "connection.ts 仍是单例全局状态");
+check("作用域区分 account 与 guest", /kind: "guest"/.test(connection) && /"account"/.test(connection));
+check("取票可显式使用 guest 令牌", /scope\.token\(\)/.test(connection) || /guestToken/.test(connection), "fetchTicket 只会读账号 token");
+check("guest 取票带分享标记头", /X-Share-Guest/.test(connection), "服务端按 Authorization 判 guest，但网关要能分流");
+check("每个作用域各自重连取票", /await fetchTicket\(pool\.scope\)|fetchTicket\(scope\)/.test(connection));
+check("分享订阅声明 guest 作用域", /scope: guestScope\(\)/.test(shareSync) && /kind: "guest"/.test(shareSync), "share-sync 没有显式传访客作用域");
+check("访客票据用 guest 令牌而不是账号令牌", /token: \(\) => useShareStore\.getState\(\)\.guestToken/.test(shareSync), "guest 作用域取票必须现取 guest 令牌");
+
+console.log("分享画布首选 WebSocket");
+check("分享订阅走共享连接", /subscribeRealtime</.test(shareSync));
+check("分享频道名为 project:<id>", /channel: `project:\$\{projectId\}`/.test(shareSync));
+check("分享订阅传的是 payload 函数", /payload: \(\) =>/.test(shareSync));
+check("分享 ready 同步角色", /ready\.role/.test(shareSync) || /role === "viewer" \|\| .*role === "editor"/.test(shareSync));
+check("分享 ready 过滤自己的 presence", /clientId !== shareClientId/.test(shareSync));
+check("分享按 revision 去重后再拉取", /revision > lastRevision|revision <= lastRevision/.test(shareSync));
+check("分享忽略自己写入的事件", /writerClientId === shareClientId/.test(shareSync));
+check("分享保留 SSE 降级", /shareProjectStream\(/.test(shareSync) && /watchShareProjectViaSse/.test(shareSync));
+check("分享连续失败才启用 SSE", /onDegrade: \(\) => \{[\s\S]{0,200}?startFallback\(\)/.test(shareSync));
+check("分享 ready 后停止 SSE 降级", /onRecover: stopFallback/.test(shareSync) && /onReady[\s\S]{0,400}?stopFallback\(\)/.test(shareSync));
+// 撤销是终态：服务端会主动断开这条频道，但降级成只读也走同一条路径，
+// 直接判失效会把「你现在只能看」误报成「链接没了」。重新鉴权一次才分得清。
+check("撤销后重新鉴权而不是直接判失效", /onTerminal: \(failure\) => \{[\s\S]*?startFallback\(\);\s*\n\s*\},/.test(shareSync), "撤销与降级走同一条断流路径，直接判失效会把「变只读」误报成「链接没了」");
+check("确证失效才进 gone 终态", /markGone\(/.test(shareSync) && /FORBIDDEN|PROJECT_NOT_FOUND/.test(shareSync));
+check("分享 presence 优先 WebSocket 且保留 HTTP", /subscription\.presence\(|presence\(\{/.test(shareSync) && /shareApi\.updatePresence\(/.test(shareSync));
 
 console.log("降级路径仍然存在");
 check("画布保留 SSE 降级", /serverProjectStream\(/.test(projectRealtime) && /watchProjectViaSse/.test(projectRealtime));

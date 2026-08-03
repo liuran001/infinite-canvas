@@ -1,6 +1,7 @@
 import { isShareConflict, isShareGone, isShareReadOnly, shareApi, shareProjectStream, type ShareApiError } from "@/services/api/share";
 import type { ServerProject, ServerProjectEvent, ServerProjectPresence } from "@/services/api/server";
 import { mergeProjectSnapshots } from "@/services/project-merge";
+import { subscribeRealtime, type RealtimeScope, type RealtimeSubscription } from "@/services/realtime/connection";
 import { useShareStore } from "@/stores/use-share-store";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
 
@@ -141,10 +142,105 @@ const sleep = (ms: number, signal: AbortSignal) =>
     });
 
 /**
- * 订阅分享画布的实时事件。撤销后服务端会主动断开连接，重连拿到 404 即判定链接失效并停止重试
- * ——这正是设计文档要求的「撤销立即断流」在客户端的落点。
+ * 访客的实时身份作用域。key 用 URL 上的明文分享 token：一条链接一条连接，换链接就换连接。
+ * 令牌每次现取——guest 令牌会周期性续期，缓存住的那份到点之后取票只会一直 401。
+ */
+function guestScope(): RealtimeScope {
+    return { kind: "guest", key: useShareStore.getState().token || "share", token: () => useShareStore.getState().guestToken };
+}
+
+/** ready 与 presence.sync 的成员列表都要滤掉自己，否则页面上会多出一个「自己在看自己」。 */
+function applyMembers(members: ServerProjectPresence[] | undefined) {
+    useShareStore.getState().setMembers((members || []).filter((item) => item.clientId !== shareClientId));
+}
+
+/** 服务端在 ready 里带的是这条链接此刻的角色；owner 直连时是 owner，不属于分享角色，跳过。 */
+function applyRole(role: unknown) {
+    if ((role === "viewer" || role === "editor") && role !== useShareStore.getState().role) useShareStore.getState().setRole(role);
+}
+
+/**
+ * 订阅分享画布的实时事件。首选与账号画布同一条共享 WebSocket（走访客票据），
+ * 连不上（旧服务端、反代不放 Upgrade）才退回原来的 SSE 循环——SSE 是这条链路唯一被验证过的兜底。
+ *
+ * 撤销的处理是这里最容易写错的一处：服务端撤销、降级成只读、关掉匿名，走的都是同一个
+ * 「断开这条频道」的动作，客户端收到的都是 unsubscribed。直接判成「链接已失效」会把
+ * 「你现在只能看」误报成「链接没了」，画布当场白掉。所以撤销后一律交给 SSE 重新鉴权一次：
+ * 真失效会拿到 404 并进 gone 终态，只是降级则会在新的 ready 里带回 viewer 角色。
  */
 export function watchShareProject(projectId: string, handlers: { onProject?: (project: CanvasProject) => void; onDeleted?: () => void }, signal: AbortSignal) {
+    let lastRevision = useShareStore.getState().revision || 0;
+    let fallback: AbortController | null = null;
+    const stopFallback = () => {
+        fallback?.abort();
+        fallback = null;
+    };
+    const startFallback = () => {
+        if (fallback || signal.aborted) return;
+        fallback = new AbortController();
+        // 外层 signal 一停，降级流也要跟着停，否则离开分享页之后它还在往 store 里写状态。
+        signal.addEventListener("abort", () => fallback?.abort(), { once: true });
+        watchShareProjectViaSse(projectId, handlers, fallback.signal);
+    };
+
+    const subscription = subscribeRealtime<ServerProjectEvent>({
+        channel: `project:${projectId}`,
+        scope: guestScope(),
+        payload: () => ({ clientId: shareClientId, sinceRevision: lastRevision }),
+        onReady: (payload) => {
+            const ready = (payload || {}) as { revision?: number; role?: unknown; members?: ServerProjectPresence[] };
+            lastRevision = Math.max(lastRevision, Number(ready.revision) || 0);
+            applyRole(ready.role);
+            applyMembers(ready.members);
+            useShareStore.getState().setStreamStatus("ready");
+            stopFallback();
+        },
+        onEvent: (event) => {
+            if (event.type === "presence.sync") return applyMembers(event.members);
+            if (event.type === "project.deleted") return handlers.onDeleted?.();
+            if (event.type === "ready") return;
+            if (event.revision <= lastRevision) return;
+            lastRevision = event.revision;
+            if (event.writerClientId === shareClientId) return;
+            void pullShareProject()
+                .then((project) => project && handlers.onProject?.(project))
+                .catch(() => undefined);
+        },
+        onDegrade: () => {
+            useShareStore.getState().setStreamStatus("reconnecting");
+            startFallback();
+        },
+        onRecover: stopFallback,
+        onTerminal: (failure) => {
+            // 服务端确证这条链接不存在了：没有任何重试能改变结果，直接进终态，别再拉一条注定 404 的流。
+            if (failure.code === "PROJECT_NOT_FOUND" || failure.code === "NOT_FOUND") {
+                useShareStore.getState().markGone("链接已失效");
+                return;
+            }
+            // 其余终态（撤销、降级、权限被收）都分不清是「没了」还是「变只读了」：让 SSE 重新鉴权一次去分。
+            useShareStore.getState().setStreamStatus("reconnecting");
+            startFallback();
+        },
+    });
+    useShareStore.getState().setStreamStatus("connecting");
+    signal.addEventListener(
+        "abort",
+        () => {
+            subscription.close();
+            stopFallback();
+            // 留下一条已关闭的订阅，presence 就会一直往死连接上发，HTTP 回落永远走不到，
+            // 别人从此看不到这个访客在画布上的位置。
+            if (sharePresence.get(projectId) === subscription) sharePresence.delete(projectId);
+        },
+        { once: true },
+    );
+    sharePresence.set(projectId, subscription);
+
+    return shareClientId;
+}
+
+/** 已上线的 SSE 实现，保留为降级路径。撤销后重连拿到 404 即判定失效并停止重试。 */
+function watchShareProjectViaSse(projectId: string, handlers: { onProject?: (project: CanvasProject) => void; onDeleted?: () => void }, signal: AbortSignal) {
     void (async () => {
         let failure = 0;
         while (!signal.aborted) {
@@ -196,11 +292,18 @@ export function watchShareProject(projectId: string, handlers: { onProject?: (pr
     return shareClientId;
 }
 
+/** 画布 id → 当前那条访客 WebSocket 订阅，presence 上行要用它；没有连接时回落到 HTTP 接口。 */
+const sharePresence = new Map<string, RealtimeSubscription>();
+
 /** Presence 上报。只读访客同样上报，让所有者看到「有人在看」。 */
 export function createSharePresenceReporter(projectId: string) {
     let current: { nodeIds: string[]; activity: ServerProjectPresence["activity"] } = { nodeIds: [], activity: "idle" };
     let timer = 0;
+    // 与账号侧同构：presence 优先走 WebSocket 上行，和事件同一条连接，不会因为 HTTP 排队而比画布变更晚到。
+    // 没有可用订阅时仍打 HTTP 接口——在 WebSocket 起不来的环境里这是唯一能让别人看到你的方式。
     const send = () => {
+        const subscription = sharePresence.get(projectId);
+        if (subscription) return subscription.presence({ clientId: shareClientId, ...current });
         const { guestToken } = useShareStore.getState();
         if (!guestToken) return;
         void shareApi.updatePresence(projectId, guestToken, { clientId: shareClientId, ...current }).catch(() => undefined);
@@ -215,6 +318,7 @@ export function createSharePresenceReporter(projectId: string) {
         dispose() {
             window.clearTimeout(timer);
             window.clearInterval(heartbeat);
+            sharePresence.delete(projectId);
             const { guestToken } = useShareStore.getState();
             if (guestToken) void shareApi.removePresence(projectId, guestToken, shareClientId).catch(() => undefined);
         },
