@@ -6,7 +6,7 @@ import { requireUser, userAuth } from "../middleware/auth";
 import { requireTeamRole } from "../services/team-access";
 import { acceptTeamInvite, createTeamInvite, deleteTeamInvite, listTeamInvites, previewTeamInvite, updateTeamInvite } from "../services/team-invites";
 import { subscribeTeam, type TeamRealtimeEvent } from "../services/team-realtime";
-import { createTeam, disbandTeam, getTeam, leaveTeam, listMemberViews, listMyTeamCreditLogs, listMyTeams, listTeamCreditLogs, removeMember, transferOwner, updateMember, updateTeam } from "../services/teams";
+import { createTeam, disbandTeam, getTeam, leaveTeam, listMemberViews, listMyTeamCreditLogs, listMyTeams, listTeamCreditLogs, removeMember, teamStorage, transferOwner, updateMember, updateTeam } from "../services/teams";
 
 /**
  * 团队前台。整个 router 走 userAuth（账号身份，分享访客一律拒绝），
@@ -50,6 +50,9 @@ teamRouter.post(
         ok(res, true);
     }),
 );
+
+/** 团队云空间用量。放在成员之前无所谓，但必须在 :id 之后，否则会被当成团队 id。 */
+teamRouter.get("/v1/teams/:id/storage", handle(async (req, res) => ok(res, await teamStorage(requireUser(req).id, String(req.params.id)))));
 
 teamRouter.get("/v1/teams/:id/members", handle(async (req, res) => ok(res, await listMemberViews(requireUser(req).id, String(req.params.id)))));
 

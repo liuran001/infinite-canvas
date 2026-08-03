@@ -37,6 +37,8 @@ export type AgentPendingAction = { type: "continue"; roundsUsed: number; credits
 export const DEFAULT_STORAGE_QUOTA = 100 << 20;
 /** 团队云空间的默认配额。与个人同一起点，但两者是各自独立的账，改其中一个不影响另一个。 */
 export const DEFAULT_TEAM_STORAGE_QUOTA = 100 << 20;
+/** 一个用户默认最多能创建几个团队。限制的是「创建」，加入别人的团队不受它约束。 */
+export const DEFAULT_TEAM_LIMIT_PER_USER = 5;
 
 @Entity("users")
 export class User {

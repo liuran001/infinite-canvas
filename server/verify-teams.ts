@@ -823,6 +823,8 @@ async function main() {
     await backstage({ check, rejects });
     await readySequencing({ check });
     await numericInput({ check, rejects });
+    await teamLimits({ check, rejects });
+    await teamStorageQuota({ check, rejects });
 
     finish(env.root);
 }
@@ -1053,6 +1055,135 @@ async function projectOwnership({ check, rejects }: { check: (name: string, actu
 
     await setProjectTeam("user-canvas-owner", "pt-1", "");
     check("解绑回个人不需要团队权限", (await getProjectTeam("user-canvas-owner", "pt-1")).teamId, "");
+}
+
+/**
+ * 团队数量上限。限制的是「创建」，不是「加入」——把两者混在一起的话，
+ * 一个被邀请进了 5 个团队的人从此再也建不了自己的团队，而他一个都没有创建过。
+ * 已解散的团队同样不占名额：它没有成员也没有入口，占着名额等于给用户设了一道永远解不开的锁。
+ */
+async function teamLimits({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { repo } = await import("./src/db/data-source");
+    const { Team, TeamMember } = await import("./src/db/entities");
+    const { createTeam, disbandTeam } = await import("./src/services/teams");
+    const { saveSettings } = await import("./src/services/settings");
+    const { now } = await import("./src/lib/errors");
+
+    console.log("团队数量上限");
+    await saveSettings({ public: { team: { maxPerUser: 2 } } } as never);
+    const first = await createTeam("user-limit", { name: "上限一" });
+    await createTeam("user-limit", { name: "上限二" });
+    await rejects("超过上限时拒绝创建", () => createTeam("user-limit", { name: "上限三" }));
+    check("被拒的团队没有留在库里", await repo(Team).countBy({ ownerId: "user-limit" }), 2);
+    // 事务回滚必须把 owner 成员行一起撤掉，否则库里会留下一条指向不存在团队的成员记录。
+    check("被拒时没有留下孤儿成员行", await repo(TeamMember).countBy({ userId: "user-limit" }), 2);
+
+    // 加入别人的团队不占自己的创建名额：把上限放宽一个，他仍应能建出第 3 个，
+    // 哪怕此时他已经是 4 个团队的成员。数「我加入了几个」的话，这一步会被误拒。
+    const host = await createTeam("user-limit-host", { name: "别人的团队" });
+    await repo(TeamMember).insert({ teamId: host.id, userId: "user-limit", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-limit-host", joinedAt: now(), updatedAt: now() });
+    await saveSettings({ public: { team: { maxPerUser: 3 } } } as never);
+    const third = await createTeam("user-limit", { name: "上限三" });
+    check("加入他人团队不占创建名额", third.ownerId, "user-limit");
+    await rejects("放宽后的上限仍然拦得住", () => createTeam("user-limit", { name: "上限四" }));
+
+    await disbandTeam(first.id, "user-limit");
+    const revived = await createTeam("user-limit", { name: "解散后腾出的名额" });
+    check("解散的团队不占名额", revived.ownerId, "user-limit");
+
+    // 0 表示不限，而它必须能被保存住：`Number(x) || 默认` 会把 0 吞成 5，管理员每存一次「不限」都会被改回去。
+    await saveSettings({ public: { team: { maxPerUser: 0 } } } as never);
+    const { publicSettings } = await import("./src/services/settings");
+    check("不限（0）能被保存住", (await publicSettings()).team.maxPerUser, 0);
+    await createTeam("user-limit", { name: "不限之后" });
+    check("不限时可以继续创建", await repo(Team).countBy({ ownerId: "user-limit", status: "active" }), 4);
+    check("解散的那个仍在库里，只是不占名额", await repo(Team).countBy({ ownerId: "user-limit", status: "disbanded" }), 1);
+    // 恢复默认，免得影响后面的用例。
+    await saveSettings({ public: { team: { maxPerUser: 5 } } } as never);
+}
+
+/**
+ * 团队云空间。核心是三件事：团队画布的上传记团队的账、个人用量不被团队文件污染、
+ * 平台管理员能单独调团队的额度且改动会广播出去。
+ */
+async function teamStorageQuota({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { repo } = await import("./src/db/data-source");
+    const { Project, StoredFile, Team, User } = await import("./src/db/entities");
+    const { adminUpdateTeam } = await import("./src/services/admin-teams");
+    const { createTeam, disbandTeam, teamStorage } = await import("./src/services/teams");
+    const { saveFile } = await import("./src/services/files");
+    const { storageOf, usedBytes, usedBytesOfTeam } = await import("./src/services/quota");
+    const { publicSettings, saveSettings } = await import("./src/services/settings");
+    const { subscribeTeam } = await import("./src/services/team-realtime");
+    const { now } = await import("./src/lib/errors");
+
+    console.log("团队云空间");
+    const users = repo(User);
+    const makeUser = async (id: string, quota: number) =>
+        users.insert({ id, username: id, password: "", email: "", displayName: id, displayNameCustomized: false, avatarUrl: "", role: "user", credits: 0, storageQuota: quota, affCode: id, affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
+    await makeUser("user-fs-owner", 1 << 20);
+    await makeUser("user-fs-mate", 1 << 20);
+
+    const team = await createTeam("user-fs-owner", { name: "空间团队" });
+    check("新团队拿到系统默认配额", Number((await repo(Team).findOneByOrFail({ id: team.id })).storageQuota), (await publicSettings()).team.defaultQuota);
+
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+    const personal = await saveFile("user-fs-owner", png, "image/png");
+    check("个人上传记个人用量", await usedBytes("user-fs-owner"), png.length);
+    check("个人上传不记团队用量", await usedBytesOfTeam(team.id), 0);
+
+    // 同一份内容再传一次，这次落在团队画布上：物理对象仍然只有一个，但两本账各记一次。
+    const shared = await saveFile("user-fs-owner", png, "image/png", {}, team.id);
+    check("团队上传拿到独立的 fileId", shared.id !== personal.id, true);
+    check("团队上传记团队用量", await usedBytesOfTeam(team.id), png.length);
+    check("团队上传不吃个人用量", await usedBytes("user-fs-owner"), png.length);
+    const { PhysicalBlob } = await import("./src/db/entities");
+    check("两条逻辑记录共用一个物理对象", await repo(PhysicalBlob).countBy({ checksum: shared.checksum }), 1);
+    check("refCount 按逻辑记录数记", (await repo(PhysicalBlob).findOneByOrFail({ checksum: shared.checksum })).refCount, 2);
+
+    // 团队内重复上传命中去重，不再记第二次账。
+    const again = await saveFile("user-fs-owner", png, "image/png", {}, team.id);
+    check("团队内重复上传返回原 fileId", again.id, shared.id);
+    check("团队内重复上传不增加用量", await usedBytesOfTeam(team.id), png.length);
+
+    // 上限用尽后团队上传被拒，但同一个人的个人空间还富余，个人上传照样能过——两本账互不担保。
+    const otherPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
+    await repo(Team).update({ id: team.id }, { storageQuota: png.length });
+    await rejects("团队空间不足时拒绝上传", () => saveFile("user-fs-owner", otherPng, "image/png", {}, team.id));
+    check("被拒的团队上传没有留下记录", await repo(StoredFile).countBy({ teamId: team.id, checksum: "" }), 0);
+    check("团队空间不足不影响个人上传", (await saveFile("user-fs-owner", otherPng, "image/png")).teamId, "");
+    await repo(Team).update({ id: team.id }, { storageQuota: 1 << 20 });
+
+    check("成员能读团队用量", await teamStorage("user-fs-owner", team.id), { used: png.length, quota: 1 << 20 });
+    await rejects("非成员读不到团队用量", () => teamStorage("user-fs-stranger", team.id));
+
+    // 后台单独调配额：数值走 nonNegativeInteger，畸形值不能被折成 0（0 在这里就是「一个字节都不能传」）。
+    for (const bogus of ["abc", -1, 2.5, "", [], Number.POSITIVE_INFINITY, 1_000_000_000_001]) await rejects(`团队配额 ${String(bogus)} 被拒`, () => adminUpdateTeam(team.id, { storageQuota: bogus }));
+    check("被拒后团队配额没有被清零", Number((await repo(Team).findOneByOrFail({ id: team.id })).storageQuota), 1 << 20);
+    check("合法配额能改", (await adminUpdateTeam(team.id, { storageQuota: 5 << 20 })).storageQuota, 5 << 20);
+    check("不传配额时保持原值", (await adminUpdateTeam(team.id, { name: "空间团队" })).storageQuota, 5 << 20);
+
+    // 配额变化要推给成员，否则界面上的「已用 / 总量」会一直照着旧上限算。
+    const events: unknown[] = [];
+    const unsubscribe = subscribeTeam(team.id, "user-fs-owner", (event) => events.push(event));
+    await adminUpdateTeam(team.id, { storageQuota: 6 << 20 });
+    await adminUpdateTeam(team.id, { storageQuota: 6 << 20 });
+    unsubscribe();
+    check("配额变化会广播", events, [{ type: "team.storage", teamId: team.id, quota: 6 << 20 }]);
+
+    // 改系统默认值只影响之后新建的团队，已有团队一个字节都不动。
+    await saveSettings({ public: { team: { defaultQuota: 7 << 20 } } } as never);
+    check("改默认值不影响已有团队", Number((await repo(Team).findOneByOrFail({ id: team.id })).storageQuota), 6 << 20);
+    const fresh = await createTeam("user-fs-mate", { name: "新默认值团队" });
+    check("新建团队用新的默认值", Number((await repo(Team).findOneByOrFail({ id: fresh.id })).storageQuota), 7 << 20);
+
+    // 解散时文件必须跟着画布回到个人名下，否则它们既不算任何人的用量、也没有任何入口能清理。
+    await repo(Project).insert({ userId: "user-fs-owner", projectId: "pfs-1", title: "团队画布", data: "{}", revision: 1, deleted: false, teamId: team.id, createdAt: now(), updatedAt: now() });
+    const before = await usedBytes("user-fs-owner");
+    await disbandTeam(team.id, "user-fs-owner");
+    check("解散后团队用量归零", await usedBytesOfTeam(team.id), 0);
+    check("解散后文件回到个人名下", (await repo(StoredFile).findOneByOrFail({ id: shared.id })).teamId, "");
+    check("解散后个人用量涨了这些文件", (await storageOf("user-fs-owner")).used, before + png.length);
 }
 
 void main();

@@ -609,6 +609,7 @@ echo "账号自助管理"
 check "改密码要校验原密码" "$(curl -s -X POST "$BASE/auth/password" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"oldPassword":"wrong","newPassword":"new-pass-123"}' | jq -r .msg)" "原密码不正确"
 check "新密码长度不足被拒" "$(curl -s -X POST "$BASE/auth/password" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"oldPassword":"tester-pass","newPassword":"123"}' | jq -r .msg)" "新密码至少 6 位"
 check "改密码成功" "$(curl -s -X POST "$BASE/auth/password" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"oldPassword":"tester-pass","newPassword":"tester-pass-2"}' | jq -r .code)" "0"
+
 check "旧密码已失效" "$(curl -s -X POST "$BASE/auth/login" -H 'Content-Type: application/json' -d '{"username":"tester","password":"tester-pass"}' | jq -r .msg)" "用户名或密码错误"
 check "新密码可登录" "$(curl -s -X POST "$BASE/auth/login" -H 'Content-Type: application/json' -d '{"username":"tester","password":"tester-pass-2"}' | jq -r .code)" "0"
 check "未绑定时解绑被拒" "$(curl -s -X POST "$BASE/auth/linux-do/unbind" -H "Authorization: Bearer $USER_TOKEN" | jq -r .msg)" "当前账号未绑定 Linux.do"
@@ -1463,6 +1464,7 @@ check "码值只含约定字母表" "$(echo "$BATCH" | jq -r '[.data[].code | te
 check "码值没有公共前缀（不可预测）" "$(echo "$BATCH" | jq -r '[.data[].code[0:4]] | unique | length > 1')" "true"
 check "生成时写入了配置" "$(echo "$BATCH" | jq -r '.data[0] | "\(.maxUses)/\(.credits)/\(.note)/\(.enabled)/\(.usedCount)"')" "2/7/冒烟批量/true/0"
 check "批量生成的码都能在列表里查到" "$(curl -s --get "$BASE/admin/invites" --data-urlencode 'keyword=冒烟批量' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "8"
+
 # 指定码值：留空随机、填了就用管理员给的那一个。
 CUSTOM=$(new_invites '{"code":"smkevp99","maxUses":2,"credits":3,"note":"指定码"}')
 check "指定的码按大写落库" "$(echo "$CUSTOM" | jq -r '.data[0].code')" "SMKEVP99"
@@ -1483,7 +1485,6 @@ check "code 传空串仍然随机生成" "$(new_invites '{"code":"","count":2}' 
 curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"requireInvite":true}}}' >/dev/null
 check "指定的码能真的注册进来" "$(register_invited smoke-custom-invited SMKEVP99 | jq -r .data.user.username)" "smoke-custom-invited"
 curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"requireInvite":false}}}' >/dev/null
-
 check "列表带出使用情况" "$(invite_row "$(echo "$BATCH" | jq -r '.data[0].code')" | jq -r '"\(.usedCount)/\(.maxUses)"')" "0/2"
 
 GIFT_CODE=$(echo "$BATCH" | jq -r '.data[0].code')
@@ -1663,6 +1664,50 @@ check "管理员可停用团队" "$(curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID
 check "停用后成员仍可只读" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams/$TEAM_ID" -H "Authorization: Bearer $USER_TOKEN")" "200"
 check "停用后禁止写入" "$(curl -s -o /dev/null -w '%{http_code}' -X PATCH "$BASE/v1/teams/$TEAM_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"name":"改名"}')" "403"
 curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"status":"active"}' >/dev/null
+
+echo "团队云空间"
+check "团队默认配额为 100MB" "$(curl -s "$BASE/v1/teams/$TEAM_ID/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.quota)" "104857600"
+check "新团队用量为 0" "$(curl -s "$BASE/v1/teams/$TEAM_ID/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)" "0"
+check "非成员读不到团队用量" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/teams/$TEAM_ID/storage" -H "Authorization: Bearer $OUTSIDER_TOKEN")" "404"
+
+# 把一张画布挂到团队上，往它里面传的图就该记团队的账，而不是画布主人的个人空间。
+curl -s -X PUT "$BASE/v1/projects/team-p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"团队画布","revision":0,"clientId":"smoke-team","data":{"nodes":[]}}' >/dev/null
+curl -s -X PUT "$BASE/v1/projects/team-p1/team" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "{\"teamId\":\"$TEAM_ID\"}" >/dev/null
+PERSONAL_USED_BEFORE=$(curl -s "$BASE/v1/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)
+printf 'team-storage-smoke-payload' >"$WORK/team.png"
+TEAM_FILE=$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $USER_TOKEN" -F "file=@$WORK/team.png;type=image/png" -F "projectId=team-p1" | jq -r .data.id)
+check "团队画布的上传记团队用量" "$(curl -s "$BASE/v1/teams/$TEAM_ID/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)" "$(stat -c %s "$WORK/team.png")"
+check "团队画布的上传不吃个人用量" "$(curl -s "$BASE/v1/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)" "$PERSONAL_USED_BEFORE"
+check "上传的文件本人仍然读得到" "$(curl -s "$BASE/v1/files/$TEAM_FILE" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.id)" "$TEAM_FILE"
+# 同一份内容传到个人画布上是另一本账：物理对象复用，但用量各记各的。
+PERSONAL_COPY=$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $USER_TOKEN" -F "file=@$WORK/team.png;type=image/png" | jq -r .data.id)
+check "同内容传个人名下拿到另一个 fileId" "$([ "$PERSONAL_COPY" != "$TEAM_FILE" ] && echo yes || echo no)" "yes"
+check "个人那份记个人用量" "$(curl -s "$BASE/v1/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)" "$((PERSONAL_USED_BEFORE + $(stat -c %s "$WORK/team.png")))"
+check "个人那份不影响团队用量" "$(curl -s "$BASE/v1/teams/$TEAM_ID/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)" "$(stat -c %s "$WORK/team.png")"
+
+# 平台后台单独调团队配额。畸形值必须是一次失败而不是被折成 0——0 在这里就是「一个字节都不能再传」。
+check "非法团队配额被拒" "$(curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"storageQuota":"abc"}' | jq -r .code)" "TEAM_STORAGE_QUOTA_INVALID"
+check "负数团队配额被拒" "$(curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"storageQuota":-1}' | jq -r .code)" "TEAM_STORAGE_QUOTA_INVALID"
+check "被拒后团队配额没被清零" "$(curl -s "$BASE/v1/teams/$TEAM_ID/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.quota)" "104857600"
+TEAM_USED=$(curl -s "$BASE/v1/teams/$TEAM_ID/storage" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.used)
+check "管理员能单独调团队配额" "$(curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d "{\"storageQuota\":$TEAM_USED}" | jq -r .data.storageQuota)" "$TEAM_USED"
+printf 'team-storage-smoke-overflow' >"$WORK/team2.png"
+check "团队空间不足时拒绝上传" "$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $USER_TOKEN" -F "file=@$WORK/team2.png;type=image/png" -F "projectId=team-p1" | jq -r .msg | grep -c '团队云空间不足')" "1"
+check "团队空间不足不影响个人上传" "$(curl -s -X POST "$BASE/v1/files" -H "Authorization: Bearer $USER_TOKEN" -F "file=@$WORK/team2.png;type=image/png" | jq -r .code)" "0"
+curl -s -X PATCH "$BASE/admin/teams/$TEAM_ID" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"storageQuota":104857600}' >/dev/null
+check "后台团队列表带出用量与上限" "$(curl -s "$BASE/admin/teams" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r --arg id "$TEAM_ID" '.data.items[] | select(.id==$id) | "\(.storageUsed)/\(.storageQuota)"')" "$TEAM_USED/104857600"
+
+echo "团队数量上限"
+check "默认最多创建 5 个团队" "$(curl -s "$BASE/settings" | jq -r .data.team.maxPerUser)" "5"
+check "系统设置里能读到团队默认配额" "$(curl -s "$BASE/settings" | jq -r .data.team.defaultQuota)" "104857600"
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"team":{"maxPerUser":1}}}' >/dev/null
+check "改上限后超额创建被拒" "$(curl -s -X POST "$BASE/v1/teams" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"name":"第二个团队"}' | jq -r .code)" "TEAM_LIMIT_EXCEEDED"
+check "被拒的团队没有进列表" "$(curl -s "$BASE/v1/teams" -H "Authorization: Bearer $USER_TOKEN" | jq '[.data[] | select(.name=="第二个团队")] | length')" "0"
+# 限制的是创建，加入别人的团队不受影响，否则被邀请进几个团队的人就再也建不了自己的。
+check "上限不影响加入他人团队" "$(curl -s -X POST "$BASE/v1/team-invites/$INVITE_TOKEN/accept" -H "Authorization: Bearer $OUTSIDER_TOKEN" | jq -r .data.role)" "member"
+curl -s -X POST "$BASE/v1/teams/$TEAM_ID/leave" -H "Authorization: Bearer $OUTSIDER_TOKEN" >/dev/null
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"team":{"maxPerUser":5}}}' >/dev/null
+check "改回上限后又能创建" "$(curl -s -X POST "$BASE/v1/teams" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"name":"第二个团队"}' | jq -r .data.name)" "第二个团队"
 
 echo "团队实时同步"
 STREAM_LOG="$WORK/team-stream.log"

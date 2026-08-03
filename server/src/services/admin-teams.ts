@@ -6,12 +6,16 @@ import { fail, now } from "../lib/errors";
 import type { Query } from "../lib/response";
 import { nonNegativeInteger } from "../lib/validate";
 import { setTeamCredits } from "./billing";
+import { usedBytesOfTeam, usedBytesOfTeams } from "./quota";
+import { publishTeamStorage } from "./team-realtime";
 import { normalizeTeamName } from "./teams";
 
 /** 成员上限的合理天花板。与 DB 的 int 列对齐并留出余量，超过它只可能是拼错了字段而不是真需求。 */
 const MEMBER_LIMIT_MAX = 100_000;
 /** 团队池余额的天花板。个人余额同样是 int 列，两边保持同一个量级。 */
 export const TEAM_CREDITS_MAX = 1_000_000_000;
+/** 团队云空间上限的天花板，1e12 字节约合 1TB。列是 bigint，这个量级远在安全整数内，不会被静默截断。 */
+export const TEAM_STORAGE_QUOTA_MAX = 1_000_000_000_000;
 
 /**
  * 平台管理员视角的团队数据。刻意不引用 team-access 里的任何函数：
@@ -31,7 +35,9 @@ export async function adminListTeams(query: Query) {
         .groupBy("member.teamId")
         .getRawMany<{ teamId: string; count: string | number }>();
     const byTeam = new Map(counts.map((row) => [row.teamId, Number(row.count)]));
-    return { items: items.map((team) => ({ ...team, memberCount: byTeam.get(team.id) || 0 })), total };
+    // 用量与个人用户列表同一套口径：按文件对象实时聚合，不存冗余计数列。
+    const used = await usedBytesOfTeams(items.map((team) => team.id));
+    return { items: items.map((team) => ({ ...team, memberCount: byTeam.get(team.id) || 0, storageQuota: Number(team.storageQuota), storageUsed: used.get(team.id) || 0 })), total };
 }
 
 async function teamOrFail(teamId: string) {
@@ -42,7 +48,8 @@ async function teamOrFail(teamId: string) {
 }
 
 export async function adminGetTeam(teamId: string) {
-    return teamOrFail(teamId);
+    const team = await teamOrFail(teamId);
+    return { ...team, storageQuota: Number(team.storageQuota), storageUsed: await usedBytesOfTeam(team.id) };
 }
 
 /**
@@ -53,7 +60,7 @@ export async function adminGetTeam(teamId: string) {
  * 这里只改一列状态的话，画布的 teamId 会留在一个再也进不去的团队上，付费方解析永远卡在「团队不可用」，
  * 画布的主人既不能在上面花钱、也没有任何入口解绑，等于被永久锁死。真要解散只能走团队 owner 的 disbandTeam。
  */
-export async function adminUpdateTeam(teamId: string, patch: { status?: unknown; memberLimit?: unknown; name?: unknown }) {
+export async function adminUpdateTeam(teamId: string, patch: { status?: unknown; memberLimit?: unknown; name?: unknown; storageQuota?: unknown }) {
     const team = await teamOrFail(teamId);
     const status = patch.status === undefined ? team.status : (String(patch.status) as TeamStatus);
     if (!["active", "disabled"].includes(status)) throw fail("平台后台只能启用或停用团队", 400, "TEAM_STATUS_INVALID");
@@ -63,10 +70,14 @@ export async function adminUpdateTeam(teamId: string, patch: { status?: unknown;
         // 与前台 updateTeam 用同一套 normalize：后台绕过截断的话，超长团队名会在这里被数据库静默切断。
         name: patch.name === undefined ? team.name : normalizeTeamName(patch.name, team.name),
         memberLimit: nonNegativeInteger(patch.memberLimit, team.memberLimit, MEMBER_LIMIT_MAX, "成员上限必须是不超过十万的非负整数", "TEAM_MEMBER_LIMIT_INVALID"),
+        // bigint 读出来可能是字符串，先 Number 再当兜底值，否则「这次不改」会把 "104857600" 原样写回去。
+        storageQuota: nonNegativeInteger(patch.storageQuota, Number(team.storageQuota), TEAM_STORAGE_QUOTA_MAX, "云空间上限必须是不超过 1TB 的非负整数字节数", "TEAM_STORAGE_QUOTA_INVALID"),
         status,
         updatedAt: now(),
     };
     await repo(Team).update({ id: teamId }, next);
+    // 上限变了才广播：没变也发的话，每次改个团队名都会让所有成员的界面闪一下配额。
+    if (next.storageQuota !== Number(team.storageQuota)) publishTeamStorage(teamId, next.storageQuota);
     return { ...team, ...next };
 }
 

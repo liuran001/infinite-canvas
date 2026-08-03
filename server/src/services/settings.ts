@@ -1,6 +1,6 @@
 import { config } from "../config";
 import { repo } from "../db/data-source";
-import { DEFAULT_STORAGE_QUOTA, Setting } from "../db/entities";
+import { DEFAULT_STORAGE_QUOTA, DEFAULT_TEAM_LIMIT_PER_USER, DEFAULT_TEAM_STORAGE_QUOTA, Setting } from "../db/entities";
 import { fail, now } from "../lib/errors";
 
 export type ApiFormat = "openai" | "gemini" | "ark";
@@ -73,6 +73,13 @@ export type PublicSetting = {
     auth: { allowRegister: boolean; requireInvite: boolean; linuxDo: { enabled: boolean } };
     /** defaultQuota 是新账号的云空间上限（字节），已有账号不受影响。 */
     storage: { remoteEnabled: boolean; defaultQuota: number };
+    /**
+     * 团队相关的默认值。语义与 storage.defaultQuota 完全一致：defaultQuota 只作用于「之后新建的团队」，
+     * 已有团队的额度是落在 Team.storageQuota 上的一个具体数字，改这里动不了它们——
+     * 否则平台管理员改一次默认值，全平台团队的可用空间会集体变动，而没有任何一条记录说明这件事发生过。
+     * maxPerUser 限制的是「一个用户能创建几个团队」，与他被邀请加入了多少个无关，0 表示不限。
+     */
+    team: { defaultQuota: number; maxPerUser: number };
     /** 各类功能入口的总开关。配了模型也可以先不对外开放，关掉后所有用户都看不到对应入口。 */
     capabilities: Record<ModelCapability, boolean>;
     /**
@@ -212,6 +219,12 @@ function normalizePublic(setting: Partial<PublicSetting> | undefined, privateSet
         storage: {
             remoteEnabled: setting?.storage?.remoteEnabled !== false,
             defaultQuota: Math.max(0, Number(setting?.storage?.defaultQuota) || DEFAULT_STORAGE_QUOTA),
+        },
+        team: {
+            defaultQuota: Math.max(0, Number(setting?.team?.defaultQuota) || DEFAULT_TEAM_STORAGE_QUOTA),
+            // 0 是「不限」，是个有意义的取值，所以判定用 typeof + isSafeInteger 而不是 `|| 默认`：后者会把 0 一起吞掉，
+            // 于是管理员每保存一次「不限」，下次读出来的都是 5。
+            maxPerUser: typeof setting?.team?.maxPerUser === "number" && Number.isSafeInteger(setting.team.maxPerUser) && setting.team.maxPerUser >= 0 ? setting.team.maxPerUser : DEFAULT_TEAM_LIMIT_PER_USER,
         },
         capabilities: {
             image: setting?.capabilities?.image !== false,

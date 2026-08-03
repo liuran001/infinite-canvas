@@ -1,11 +1,13 @@
 import { In, type EntityManager } from "typeorm";
 
 import { repo, serialTransaction } from "../db/data-source";
-import { Project, Team, TeamCreditLog, TeamInvite, TeamMember, User, type TeamLimitWindow, type TeamMemberStatus, type TeamRole } from "../db/entities";
+import { Project, StoredFile, Team, TeamCreditLog, TeamInvite, TeamMember, User, type TeamLimitWindow, type TeamMemberStatus, type TeamRole } from "../db/entities";
 import { fail, newId, now } from "../lib/errors";
 import type { Query } from "../lib/response";
 import { nonNegativeInteger } from "../lib/validate";
 import { usedCreditsOfTeam } from "./billing";
+import { storageOfTeam } from "./quota";
+import { publicSettings } from "./settings";
 import { assertCanManageMember, canTeamAction, requireTeamRole } from "./team-access";
 import { closeTeamConnectionsOf, publishTeamMember } from "./team-realtime";
 
@@ -41,6 +43,8 @@ export function teamView(team: Team, role: TeamRole) {
         avatarUrl: team.avatarUrl || "",
         ownerId: team.ownerId,
         credits: team.credits,
+        // bigint 在部分方言下读出来是字符串，统一转数字，否则前端会拿到 "104857600" 做加减。
+        storageQuota: Number(team.storageQuota),
         memberLimit: team.memberLimit,
         status: team.status,
         myRole: role,
@@ -49,12 +53,22 @@ export function teamView(team: Team, role: TeamRole) {
     };
 }
 
+/** 已解散的团队不占名额：它没有成员、没有入口，占着名额只会让用户永远建不出新团队。 */
+async function ownedTeamCount(manager: EntityManager, userId: string) {
+    return manager.getRepository(Team).count({ where: [{ ownerId: userId, status: "active" }, { ownerId: userId, status: "disabled" }] });
+}
+
 /**
  * 建团队。团队与 owner 成员必须同事务写入：
  * 分两步写的话中间失败就会留下一个没有 owner 的团队，谁都改不动也解散不了，只能进库里手工修。
+ *
+ * 数量上限在同一个事务里「先插入再数」而不是「先数再插入」：后者两次调用会各自数到同一个旧值、
+ * 双双认为还差一个名额，于是上限被静默突破一个。插完再数的话，超限的那一条自己也在计数里，
+ * 抛错回滚就把它连同成员行一起撤掉，留在库里的永远不超过上限。
  */
 export async function createTeam(userId: string, input: TeamInput) {
     const name = normalizeName(input.name);
+    const settings = await publicSettings();
     const team = repo(Team).create({
         id: newId("team"),
         name,
@@ -62,6 +76,8 @@ export async function createTeam(userId: string, input: TeamInput) {
         avatarUrl: String(input.avatarUrl || "").trim(),
         ownerId: userId,
         credits: 0,
+        // 建团队时把当时的系统默认值固化下来，之后改默认值不影响这个团队——与 User.storageQuota 同一套语义。
+        storageQuota: settings.team.defaultQuota,
         memberLimit: 0,
         status: "active",
         createdAt: now(),
@@ -80,6 +96,9 @@ export async function createTeam(userId: string, input: TeamInput) {
             joinedAt: now(),
             updatedAt: now(),
         });
+        // 0 表示不限。限制的是创建，加入别人的团队不受它影响。
+        const limit = settings.team.maxPerUser;
+        if (limit > 0 && (await ownedTeamCount(manager, userId)) > limit) throw fail(`最多只能创建 ${limit} 个团队，请先解散不再使用的团队`, 400, "TEAM_LIMIT_EXCEEDED");
     });
     return team;
 }
@@ -104,6 +123,12 @@ export async function listMyTeams(userId: string) {
 export async function getTeam(userId: string, teamId: string) {
     const { team, role } = await requireTeamRole(userId, teamId, "team.read");
     return teamView(team, role);
+}
+
+/** 团队云空间用量。与个人的 /v1/storage 同形，已用量按文件对象实时聚合，任何成员都能看。 */
+export async function teamStorage(userId: string, teamId: string) {
+    await requireTeamRole(userId, teamId, "team.read");
+    return storageOfTeam(teamId);
 }
 
 export async function updateTeam(teamId: string, actorId: string, input: TeamInput) {
@@ -316,6 +341,10 @@ export async function disbandTeam(teamId: string, actorId: string) {
         const rows = await manager.getRepository(TeamMember).findBy({ teamId });
         await manager.getRepository(Team).update({ id: teamId }, { status: "disbanded", updatedAt: now() });
         await manager.getRepository(Project).update({ teamId }, { teamId: "", updatedAt: now() });
+        // 文件跟着画布一起回到个人名下。留在解散了的团队上的话，这些文件既不算任何人的用量、
+        // 也没有任何入口能看到或删掉，而收回来的画布还在引用它们——等于一批永远清不掉的幽灵占用。
+        // 回收后它们开始计入各自 userId 的个人配额；超配额只会挡住新的上传，已有文件照常可读。
+        await manager.getRepository(StoredFile).update({ teamId }, { teamId: "" });
         await manager.getRepository(TeamMember).delete({ teamId });
         await manager.getRepository(TeamInvite).update({ teamId }, { enabled: false });
         return rows;
