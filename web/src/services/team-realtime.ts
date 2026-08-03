@@ -49,17 +49,20 @@ function terminalStatusOf(error: unknown) {
     return TERMINAL_STATUS.includes(status) ? status : 0;
 }
 
+// 正常睡醒也要把 abort 监听摘掉：signal 活到整个团队页的生命周期，每退避一次就挂一个不再有用的监听，
+// 一晚上下来这个 signal 上会积满闭包，连同它捕获的 timer 一起留在内存里。
 const sleep = (ms: number, signal: AbortSignal) =>
     new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, ms);
-        signal.addEventListener(
-            "abort",
-            () => {
-                clearTimeout(timer);
-                reject(new DOMException("Aborted", "AbortError"));
-            },
-            { once: true },
-        );
+        let timer = 0 as unknown as ReturnType<typeof setTimeout>;
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(new DOMException("Aborted", "AbortError"));
+        };
+        timer = setTimeout(() => {
+            signal.removeEventListener("abort", onAbort);
+            resolve();
+        }, ms);
+        signal.addEventListener("abort", onAbort, { once: true });
     });
 
 /** 读流并按帧回调。分帧与解析都交给 sse-frames，坏帧只跳过它自己，不会掀翻整条连接。 */
@@ -155,6 +158,10 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
                     },
                     signal,
                 );
+                // 服务端正常 EOF 也是一次失败：多实例部署下另一个实例的事件本来就推不过来，
+                // 而一条秒断秒连的流会让 failure 永远停在 0，轮询兜底永远不启动，余额可以一整天不动。
+                // 只有真正收到 ready 才把计数清零——那才是「这条连接确实在工作」的唯一证据。
+                failure += 1;
             } catch (error) {
                 if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) break;
                 const terminal = terminalStatusOf(error);
@@ -166,7 +173,6 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
                 failure += 1;
             }
             if (signal.aborted) break;
-            // 服务端正常结束连接（被移除、被降级）也走到这里，按失败计数重连，重连时会重新鉴权。
             if (failure >= FAILURES_BEFORE_POLLING) startPolling();
             await sleep(RETRIES[Math.min(failure, RETRIES.length - 1)], signal).catch(() => undefined);
         }

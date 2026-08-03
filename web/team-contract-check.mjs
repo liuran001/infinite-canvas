@@ -122,6 +122,50 @@ check("流失败携带 HTTP 状态码", /class TeamStreamError[\s\S]{0,200}?stat
 const statusLine = /setRealtimeStatus\((?![\s\S]{0,10}"failed")[^\n]*(?:connecting|reconnecting)[^\n]*\)/.exec(realtime)?.[0] || "";
 check("已降级到轮询时状态保持 polling", /poller \? "polling"/.test(statusLine), `重连循环设置的状态没有考虑轮询是否在跑：${statusLine || "没找到那行"}`);
 check("分帧走共用实现", /decodeSseFrames\(/.test(realtime) && /parseSseJson[<(]/.test(realtime), "team-realtime 没有用共用的分帧实现");
+// 服务端正常 EOF（多实例部署里另一个实例根本不会推事件、反代到点掐流）不计失败的话，
+// 一条秒断秒连的流会让 failure 永远停在 0，轮询兜底永远不启动，余额可以一整天不动。
+const loop = /let failure = 0;[\s\S]*?clearPolling\(\);\n    \}\)\(\);/.exec(realtime)?.[0] || "";
+check("找得到重连循环", Boolean(loop), "重连循环的形状变了，下面几条断言会落空");
+const afterStream = /await openStream\([\s\S]*?\n            \} catch/.exec(loop)?.[0] || "";
+check("正常 EOF 也计一次失败", /failure \+= 1;/.test(afterStream), "openStream 正常返回没有 failure++，流一直秒断秒连也不会降级到轮询");
+// 只有 ready 才是「这条连接确实在工作」的证据；在别的地方清零等于把一条什么都没推的流当成健康。
+const zeroing = (loop.match(/(?<!let )failure = 0/g) || []).length;
+check("只有 ready 才清零失败计数", zeroing === 1 && /"ready"[\s\S]{0,200}?failure = 0/.test(loop), `failure = 0 出现了 ${zeroing} 次`);
+// signal 活到整个团队页的生命周期。退避一次挂一个不摘的 abort 监听，闭包连同 timer 一直留在内存里。
+const sleepFn = /const sleep = [\s\S]*?\n    \}\);/.exec(realtime)?.[0] || "";
+check("退避正常结束时摘掉 abort 监听", /removeEventListener\("abort"/.test(sleepFn), "sleep 正常超时没有 removeEventListener，每次重连都往 signal 上堆一个死监听");
+
+const layoutSrc = read("pages/teams/layout.tsx");
+// 403 正是被降级或挂起，404 是团队没了或人已被移出，401 连会话都没了：这之后「我是什么角色」已经没有可信答案。
+// 还按最后一次已知角色渲染管理入口，用户就对着一排点了必然报错的按钮反复试。
+check("终止状态下按只读收起管理入口", /realtimeStatus === "failed" \? "viewer"/.test(layoutSrc), "永久失败后仍按旧角色渲染管理按钮，全是点了必然被拒的死按钮");
+check("传给子页面的角色用收敛后的值", /myRole: contextRole/.test(layoutSrc), "Outlet 还在传未收敛的角色");
+
+console.log("表单提交的契约");
+
+// validateFields 会 reject。放在 try 外面就是一条没人接的 promise rejection：
+// 必填项留空时按钮不动、控制台报错，用户只当页面卡住了。
+for (const [file, form] of [
+    ["pages/teams/index.tsx", "createForm"],
+    ["pages/teams/detail.tsx", "editForm"],
+    ["pages/teams/members.tsx", "form"],
+]) {
+    const source = read(file);
+    const guarded = new RegExp(`try \\{[\\s\\S]{0,400}?await ${form}\\.validateFields\\(\\)`).test(source);
+    check(`${file} 的 validateFields 在 try 内`, guarded, "校验失败会变成 unhandled rejection");
+    check(`${file} 不把校验失败当服务端错误报`, /"errorFields" in \w+\) return;/.test(source), "字段已经标红了还再弹一句失败，会被当成服务端出错");
+}
+
+const members = read("pages/teams/members.tsx");
+// InputNumber 清空给的是 null，直接发出去被服务端当成缺字段或坏类型；0 正是表单上写的「不限」。
+check("清空额度按 0（不限）提交", /Number\(values\.creditLimit\) \|\| 0/.test(members), "InputNumber 清空后的 null 会被原样发给服务端");
+check("owner 与非 owner 两条路都用归一后的额度", (members.match(/creditLimit,?\s*(\}|limitWindow)/g) || []).length >= 2 && !/creditLimit: values\.creditLimit/.test(members), "还有分支直接用了未归一的 values.creditLimit");
+
+const detail = read("pages/teams/detail.tsx");
+// 转让不可逆：请求飞行期间确定按钮还能再点，第二次请求发出时自己已经不是 owner，用户看到一句莫名其妙的「无权限」。
+check("转让按钮防重复提交", /confirmLoading=\{transferSubmitting\}/.test(detail) && /if \(transferSubmitting\) return;/.test(detail), "转让弹窗没有 confirmLoading / 重入保护");
+
+console.log("团队页面的其余契约");
 
 const layout = read("pages/teams/layout.tsx");
 // 占位必须发生在开流之前，否则第一份 ready 会被 store 当成别的团队的事件丢掉。

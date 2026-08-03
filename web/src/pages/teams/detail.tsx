@@ -16,6 +16,7 @@ export default function TeamDetailPage() {
     const [editing, setEditing] = useState(false);
     const [saving, setSaving] = useState(false);
     const [transferring, setTransferring] = useState(false);
+    const [transferSubmitting, setTransferSubmitting] = useState(false);
     const [transferTo, setTransferTo] = useState("");
     const manageable = canManageTeam(team.myRole);
     const owner = isTeamOwner(team.myRole);
@@ -28,14 +29,18 @@ export default function TeamDetailPage() {
     };
 
     const save = async () => {
-        const values = await editForm.validateFields();
         setSaving(true);
         try {
+            // 校验失败会 reject，放在 try 外面就是一条没人接的 promise rejection：
+            // 名称留空时按钮不动、控制台报错，用户只当页面卡住了。
+            const values = await editForm.validateFields();
             await teamApi.updateTeam(team.id, values);
             setEditing(false);
             message.success("已保存");
             refresh();
         } catch (error) {
+            // 校验失败表单自己已经标红，再弹一句「保存失败」会被当成服务端出错。
+            if (error && typeof error === "object" && "errorFields" in error) return;
             message.error(error instanceof Error ? error.message : "保存团队失败");
         } finally {
             setSaving(false);
@@ -44,6 +49,10 @@ export default function TeamDetailPage() {
 
     const transfer = async () => {
         if (!transferTo) return message.warning("请选择要转让给谁");
+        // 转让是不可逆的：没有这个开关，弹窗的确定按钮在请求飞行期间还能再点，
+        // 第二次请求发出时自己已经不是 owner 了，用户看到的是一句莫名其妙的「无权限」。
+        if (transferSubmitting) return;
+        setTransferSubmitting(true);
         try {
             await teamApi.transferOwner(team.id, transferTo);
             setTransferring(false);
@@ -52,6 +61,8 @@ export default function TeamDetailPage() {
             refresh();
         } catch (error) {
             message.error(error instanceof Error ? error.message : "转让团队失败");
+        } finally {
+            setTransferSubmitting(false);
         }
     };
 
@@ -133,7 +144,7 @@ export default function TeamDetailPage() {
                 </Form>
             </Modal>
 
-            <Modal open={transferring} title="转让团队" okText="确认转让" cancelText="取消" onOk={() => void transfer()} onCancel={() => setTransferring(false)} destroyOnHidden>
+            <Modal open={transferring} title="转让团队" okText="确认转让" cancelText="取消" confirmLoading={transferSubmitting} onOk={() => void transfer()} onCancel={() => setTransferring(false)} destroyOnHidden>
                 <p className="mt-4 text-sm text-stone-500">转让后你会变成管理员，新的所有者接管解散与转让的权限。</p>
                 <Select
                     className="mt-3 w-full"

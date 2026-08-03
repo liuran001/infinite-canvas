@@ -26,9 +26,11 @@ export default function TeamsPage() {
     }, [data, setTeams]);
 
     const create = async () => {
-        const values = await createForm.validateFields();
         setSubmitting(true);
         try {
+            // 校验失败会 reject，放在 try 外面就是一条没人接的 promise rejection：
+            // 名称留空时按钮不动、控制台报错，用户只当页面卡住了。
+            const values = await createForm.validateFields();
             const team = await teamApi.createTeam(values);
             setCreating(false);
             createForm.resetFields();
@@ -36,6 +38,8 @@ export default function TeamsPage() {
             await refetch();
             navigate(`/teams/${team.id}`);
         } catch (createError) {
+            // 校验失败表单已经在字段下面标红了，再弹一句「创建失败」只会误导成服务端出错。
+            if (createError && typeof createError === "object" && "errorFields" in createError) return;
             message.error(createError instanceof Error ? createError.message : "创建团队失败");
         } finally {
             setSubmitting(false);

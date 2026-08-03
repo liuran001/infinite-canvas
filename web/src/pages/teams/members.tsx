@@ -31,15 +31,22 @@ export default function TeamMembersPage() {
 
     const save = async () => {
         if (!editing) return;
-        const values = await form.validateFields();
         setSaving(true);
         try {
+            // validateFields 失败会 reject。放在 try 外面的话，点「保存」时留了一个空必填项
+            // 就是一条没人接的 promise rejection，控制台报错、按钮却毫无反应。
+            const values = await form.validateFields();
+            // InputNumber 清空后给的是 null，直接发出去会被服务端当成缺字段或坏类型。
+            // 这里的 0 就是表单上写的「填 0 表示不限」，与清空的语义一致。
+            const creditLimit = Number(values.creditLimit) || 0;
             // owner 的角色不能在这里改，服务端也会拒；表单里对 owner 直接禁掉角色项，这里原样不传。
-            await teamApi.updateMember(team.id, editing.userId, editing.role === "owner" ? { creditLimit: values.creditLimit, limitWindow: values.limitWindow } : values);
+            await teamApi.updateMember(team.id, editing.userId, editing.role === "owner" ? { creditLimit, limitWindow: values.limitWindow } : { ...values, creditLimit });
             setEditing(null);
             message.success("已保存");
             await refetch();
         } catch (saveError) {
+            // 校验失败由表单自己在字段下面标红，再弹一句「保存失败」只会让人以为是服务端出了问题。
+            if (saveError && typeof saveError === "object" && "errorFields" in saveError) return;
             message.error(saveError instanceof Error ? saveError.message : "保存成员设置失败");
         } finally {
             setSaving(false);

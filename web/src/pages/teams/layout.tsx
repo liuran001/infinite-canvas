@@ -66,6 +66,10 @@ export default function TeamLayout() {
     const active = pathname.replace(/\/+$/, "").split("/")[3] || "";
     // 角色以实时连接推下来的为准：被降级的人如果还留着旧角色，页面上会挂着一堆点了必然被拒的按钮。
     const role = (myRole || data.myRole) as TeamRole;
+    // 401/403/404 之后我们对「你现在还是什么角色」已经没有可信的答案了：403 正是被降级或挂起，
+    // 404 是团队没了或人已被移出，401 连会话都没了。这时候继续按最后一次已知角色渲染管理入口，
+    // 用户会对着一排点了必然报错的按钮反复试。头衔照旧显示，但操作一律按只读收起来。
+    const contextRole: TeamRole = realtimeStatus === "failed" ? "viewer" : role;
 
     return (
         <main className="h-full overflow-y-auto bg-background text-stone-950 dark:text-stone-100">
@@ -110,7 +114,7 @@ export default function TeamLayout() {
                     </nav>
                 </header>
                 <div className="mt-6">
-                    <Outlet context={{ team: { ...data, myRole: role }, refresh: () => void refetch() } satisfies TeamOutletContext} />
+                    <Outlet context={{ team: { ...data, myRole: contextRole }, refresh: () => void refetch() } satisfies TeamOutletContext} />
                 </div>
             </div>
         </main>
