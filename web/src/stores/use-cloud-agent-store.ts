@@ -4,6 +4,7 @@ import { create } from "zustand";
 import { buildDraftReference, expandDraftReferences, type CloudAgentDraftReference } from "@/components/agent/cloud-agent-references";
 import { serverAgentStream, serverApi, type ServerAgentEvent, type ServerAgentMessage, type ServerAgentPendingAction, type ServerAgentSession, type ServerAgentSessionStatus } from "@/services/api/server";
 import { serverFileIdOf, uploadImage } from "@/services/image-storage";
+import { realtimeAvailable, subscribeRealtime, type RealtimeSubscription } from "@/services/realtime/connection";
 import { notifyTeamCreditsExhausted, notifyTeamQuotaExceeded } from "@/services/team-realtime";
 import { resolveAgentModel, useConfigStore } from "@/stores/use-config-store";
 import { isServerMode, useServerStore } from "@/stores/use-server-store";
@@ -20,6 +21,8 @@ const RETRY_LIMIT = 6;
 const MAX_ATTACHMENTS = 6;
 
 let streamAbort: AbortController | null = null;
+/** 共享 WebSocket 上的会话订阅。与 streamAbort 二选一：同一时刻只会有一条传输在跑。 */
+let agentSocket: RealtimeSubscription | null = null;
 let streamToken = 0;
 /** 已经拉过会话列表的画布；登录态与服务端配置是异步就绪的，就绪前不算绑定成功，之后要补拉一次。 */
 let loadedProjectId = "";
@@ -35,7 +38,6 @@ export type CloudAgentAttachment = { id: string; name: string; url: string; stor
 
 /** 换画布、换会话时必须收回引用高亮，否则画布上会留下一个永远亮着、也没人再取消得掉的节点。 */
 const clearedHighlight = { referenceNodeId: "", referenceReveal: null };
-
 
 function errorText(error: unknown) {
     return error instanceof Error ? error.message : "操作失败";
@@ -118,6 +120,8 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         streamToken += 1;
         streamAbort?.abort();
         streamAbort = null;
+        agentSocket?.close();
+        agentSocket = null;
     };
 
     const applyEvent = (sessionId: string, event: ServerAgentEvent) => {
@@ -137,9 +141,38 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
         if (event.message.role === "tool" && event.message.toolResult && CANVAS_WRITE_TOOLS.has(event.message.toolName)) set((state) => ({ canvasReload: state.canvasReload + 1 }));
     };
 
-    /** 挂 SSE 并在断线后自动重连：服务端循环不受前端连接影响，重连带 sinceSeq 就能续上。 */
+    /**
+     * 挂事件流并在断线后自动重连。优先走共享 WebSocket，它不可用或被判定为终态时退回 SSE 循环。
+     * 服务端的推理循环不受前端连接影响，两条路径都靠 sinceSeq 续上，切换传输不会丢消息。
+     */
     const attach = async (sessionId: string) => {
         detach();
+        if (realtimeAvailable()) {
+            const token = streamToken;
+            agentSocket = subscribeRealtime<ServerAgentEvent>({
+                channel: `agent:${sessionId}`,
+                payload: () => ({ sinceSeq: resumeSeq(get().messages) }),
+                onEvent: (event) => applyEvent(sessionId, event),
+                onDegrade: () => {
+                    // WebSocket 连不上就交给 SSE：Agent 还在后台跑，界面不能停在半截消息上。
+                    if (token !== streamToken) return;
+                    agentSocket?.close();
+                    agentSocket = null;
+                    void attachViaSse(sessionId);
+                },
+                onTerminal: () => {
+                    if (token !== streamToken) return;
+                    agentSocket = null;
+                    void attachViaSse(sessionId);
+                },
+            });
+            return;
+        }
+        await attachViaSse(sessionId);
+    };
+
+    /** 已上线的 SSE 实现，保留为降级路径。 */
+    const attachViaSse = async (sessionId: string) => {
         const token = ++streamToken;
         const abort = new AbortController();
         streamAbort = abort;
@@ -358,7 +391,13 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
                 // 团队云空间满同理：面板里一句红字会让用户跑去删自己的个人画布，而占满的根本不是他那本账。
                 notifyTeamQuotaExceeded(error);
                 // 发送失败把草稿、引用和图片都还回输入框，用户可以直接重发；幂等键留着复用。
-                set((state) => ({ sending: false, error: errorText(error), prompt: state.prompt || draft, draftReferences: state.draftReferences.length ? state.draftReferences : draftReferences, attachments: state.attachments.length ? state.attachments : attachments }));
+                set((state) => ({
+                    sending: false,
+                    error: errorText(error),
+                    prompt: state.prompt || draft,
+                    draftReferences: state.draftReferences.length ? state.draftReferences : draftReferences,
+                    attachments: state.attachments.length ? state.attachments : attachments,
+                }));
             }
         },
 

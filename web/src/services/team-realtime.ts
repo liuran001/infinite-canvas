@@ -3,6 +3,7 @@ import { Modal } from "antd";
 import { serverApiUrl } from "@/services/api/server";
 import { teamApi, type TeamRole } from "@/services/api/teams";
 import { decodeSseFrames, parseSseJson } from "@/services/sse-frames";
+import { subscribeRealtime } from "@/services/realtime/connection";
 import { useServerStore } from "@/stores/use-server-store";
 import { useTeamStore } from "@/stores/use-team-store";
 
@@ -21,6 +22,8 @@ const RETRIES = [1500, 3000, 6000];
  */
 const FAILURES_BEFORE_POLLING = 3;
 const POLL_INTERVAL = 30_000;
+/** WebSocket 健康时的纠偏间隔。比降级轮询稀疏一倍：推送正常时它只是兜住跨实例丢事件。 */
+const CORRECTION_INTERVAL = 60_000;
 
 /** 连接失败要带上 HTTP 状态码：只留一句中文文案的话，调用方只能去匹配字符串来决定还要不要重连。 */
 class TeamStreamError extends Error {
@@ -102,13 +105,13 @@ async function openStream(teamId: string, onEvent: (event: TeamRealtimeEvent) =>
 }
 
 /**
- * 订阅团队余额与成员变更。
+ * 已上线的 SSE 实现，保留为 WebSocket 的降级路径，行为一字未改。
  *
  * 连续 FAILURES_BEFORE_POLLING 次失败后起一个 30 秒轮询兜底，但重连循环不停：SSE 一旦重新连上
  * （收到 ready）就立刻把轮询停掉，否则降级会变成永久的——用户看到的余额永远慢 30 秒。
  * 定时器只此一处创建、由 clearPolling 统一清理，abort 时连同 fetch 一起收尾，不会留下野定时器。
  */
-export function watchTeam(teamId: string, signal: AbortSignal) {
+function watchTeamViaSse(teamId: string, signal: AbortSignal) {
     const store = () => useTeamStore.getState();
     let poller = 0;
     const clearPolling = () => {
@@ -190,6 +193,94 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
 
     // 调用方在卸载时 abort：fetch 随之取消，循环退出，轮询定时器在上面的 finally 位置被清掉。
     signal.addEventListener("abort", clearPolling, { once: true });
+}
+
+/**
+ * 订阅团队余额与成员变更。优先走共享 WebSocket；它连不上（旧服务端、反代不放行 Upgrade）
+ * 才退回原来的 SSE 循环，SSE 又连续失败才起 30 秒轮询。
+ *
+ * WebSocket 健康时仍保留一份低频纠偏轮询：服务端的实时总线是进程内 EventEmitter，
+ * 多实例部署下别的实例发的事件本来就推不过来，只靠推送的话余额可以一整天停在旧值。
+ */
+export function watchTeam(teamId: string, signal: AbortSignal) {
+    const store = () => useTeamStore.getState();
+    let sse: AbortController | null = null;
+    let corrector = 0;
+    const stopSse = () => {
+        sse?.abort();
+        sse = null;
+    };
+    const stopCorrector = () => {
+        if (!corrector) return;
+        window.clearInterval(corrector);
+        corrector = 0;
+    };
+    const startSse = () => {
+        if (sse || signal.aborted) return;
+        sse = new AbortController();
+        signal.addEventListener("abort", () => sse?.abort(), { once: true });
+        watchTeamViaSse(teamId, sse.signal);
+    };
+    /** 纠偏轮询：只在 WebSocket 已经 ready 时跑，间隔取降级轮询的两倍，纯粹用来兜住跨实例丢事件。 */
+    const startCorrector = () => {
+        if (corrector || signal.aborted) return;
+        corrector = window.setInterval(() => {
+            void teamApi
+                .team(teamId)
+                .then((team) => {
+                    if (signal.aborted) return;
+                    store().setCredits(teamId, team.credits);
+                    store().setStorage(teamId, team.storageUsed, team.storageQuota);
+                    store().setMyRole(teamId, team.myRole);
+                })
+                .catch(() => undefined);
+        }, CORRECTION_INTERVAL);
+    };
+
+    const subscription = subscribeRealtime<TeamRealtimeEvent>({
+        channel: `team:${teamId}`,
+        onReady: (payload) => {
+            const ready = (payload || {}) as { role?: TeamRole; credits?: number; storage?: { used?: number; quota?: number } };
+            stopSse();
+            store().setCredits(teamId, Number(ready.credits) || 0);
+            store().setStorage(teamId, Number(ready.storage?.used) || 0, Number(ready.storage?.quota) || 0);
+            if (ready.role) store().setMyRole(teamId, ready.role);
+            store().setRealtimeStatus(teamId, "ready");
+            startCorrector();
+        },
+        onEvent: (event) => {
+            if (event.type === "team.credits") store().setCredits(teamId, event.credits);
+            else if (event.type === "team.storage") store().setStorage(teamId, event.storageUsed, event.storageQuota);
+        },
+        onDegrade: () => {
+            stopCorrector();
+            // 状态交给降级路径自己写：SSE 可能已经退到轮询，这里再写一次 reconnecting
+            // 就会让界面说「马上就好」，而用户看的其实是一个每 30 秒才动一次的数字。
+            if (!sse) store().setRealtimeStatus(teamId, "reconnecting");
+            startSse();
+        },
+        onRecover: stopSse,
+        onTerminal: (failure) => {
+            stopCorrector();
+            // 权限类终态与 SSE 那边判定一致：换传输也是同一个结果，直接落到失败提示，不再重连。
+            if (failure.code === "FORBIDDEN" || failure.code === "REVOKED") {
+                stopSse();
+                store().setRealtimeStatus(teamId, "failed", terminalMessage(403));
+                return;
+            }
+            startSse();
+        },
+    });
+    store().setRealtimeStatus(teamId, "connecting");
+    signal.addEventListener(
+        "abort",
+        () => {
+            subscription.close();
+            stopSse();
+            stopCorrector();
+        },
+        { once: true },
+    );
 }
 
 /** 服务端 billing.ts 里团队池不足时的错误码。 */

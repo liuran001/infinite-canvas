@@ -1,4 +1,5 @@
 import { notifyTeamCreditsExhausted, notifyTeamQuotaExceeded } from "@/services/team-realtime";
+import { realtimeAvailable, subscribeRealtime, type RealtimeSubscription } from "@/services/realtime/connection";
 import { serverApi, serverJobStream, type ServerJob, type ServerJobEvent, type ServerJobStatus } from "./server";
 
 /**
@@ -47,6 +48,8 @@ let lastSeq = 0;
 let controller: AbortController | null = null;
 let streaming = false;
 let fallbackTimer = 0;
+/** 共享 WebSocket 上的 jobs 订阅；没有任务在等时和 SSE 一样立刻退订，不留空订阅。 */
+let socket: RealtimeSubscription | null = null;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -132,9 +135,47 @@ async function reconcile(waiter: Waiter) {
 function startStream() {
     if (streaming) return;
     streaming = true;
+    // 优先走共享 WebSocket：生成任务的事件量最大，和画布、团队挤同一条连接比各开一条 SSE 省得多。
+    // WebSocket 连不上时才起 SSE 循环，SSE 也失败才退到 5 秒轮询——三层都保留，任何一层挂掉都还有下一层。
+    if (startSocket()) return;
     void streamLoop().finally(() => {
         streaming = false;
     });
+}
+
+/**
+ * WebSocket 通道。事件形状与 SSE 完全一致，直接喂给同一个 onEvent，
+ * 因此断线切到 SSE 时不需要任何状态转换，游标 lastSeq 也是同一份。
+ */
+function startSocket() {
+    if (socket || !realtimeAvailable()) return false;
+    socket = subscribeRealtime<ServerJobEvent>({
+        channel: "jobs",
+        payload: () => ({ sinceSeq: lastSeq }),
+        onReady: (payload) => {
+            stopFallback();
+            for (const waiter of waiters) waiter.seen = false;
+            onEvent({ type: "ready", seq: Number((payload as { seq?: number } | null)?.seq) || lastSeq });
+        },
+        onEvent,
+        onDegrade: startFallback,
+        onRecover: stopFallback,
+        onTerminal: () => {
+            stopSocket();
+            // WebSocket 这条频道彻底不可用了，退回原来的 SSE 循环，任务照样能收敛。
+            streaming = true;
+            void streamLoop().finally(() => {
+                streaming = false;
+            });
+        },
+    });
+    return true;
+}
+
+function stopSocket() {
+    socket?.close();
+    socket = null;
+    streaming = false;
 }
 
 async function streamLoop() {
@@ -145,10 +186,14 @@ async function streamLoop() {
         // 每次重连都重新判定：补齐会把还在跑的任务重新推一遍，推不到的才需要单独补查。
         for (const waiter of waiters) waiter.seen = false;
         let connected = false;
-        await serverJobStream(lastSeq, (event) => {
-            if (event.type === "ready") connected = true;
-            onEvent(event);
-        }, current.signal).catch(() => undefined);
+        await serverJobStream(
+            lastSeq,
+            (event) => {
+                if (event.type === "ready") connected = true;
+                onEvent(event);
+            },
+            current.signal,
+        ).catch(() => undefined);
         controller = null;
         if (!waiters.size) return;
         // 上一批任务等完时连接会被主动断开，紧接着又来了新任务：这不算失败，直接重连，不用退避。
@@ -166,6 +211,7 @@ async function streamLoop() {
 function stopWhenIdle() {
     if (waiters.size) return;
     stopFallback();
+    stopSocket();
     controller?.abort();
     controller = null;
     // 游标只在有人等的时候才有意义，清掉它下次重新建连会按「所有未结束的任务」补齐，换账号也不会用错游标。
