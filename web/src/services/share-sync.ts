@@ -2,6 +2,7 @@ import { isShareConflict, isShareGone, isShareReadOnly, shareApi, shareProjectSt
 import type { ServerProject, ServerProjectEvent, ServerProjectPresence } from "@/services/api/server";
 import { mergeProjectSnapshots } from "@/services/project-merge";
 import { subscribeRealtime, type RealtimeScope, type RealtimeSubscription } from "@/services/realtime/connection";
+import { PRESENCE_MIN_INTERVAL_MS } from "@/services/realtime/protocol";
 import { useShareStore } from "@/stores/use-share-store";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
 
@@ -15,6 +16,11 @@ import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
 
 const PUSH_DELAY = 2000;
 const RETRIES = [1500, 3000, 6000, 12000, 24000, 30000];
+/**
+ * presence 去抖间隔，与账号侧同一条理由：必须严格大于服务端的最小上报间隔。
+ * 取成相等时，定时器与网络抖动会让相邻两帧落在阈值下方，被 RATE_LIMITED 静默丢掉。
+ */
+const PRESENCE_DEBOUNCE_MS = PRESENCE_MIN_INTERVAL_MS + 60;
 
 /** 每个标签页一个身份，与账号侧同构（Presence 按 clientId 去重）。 */
 const shareClientId = `share_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -175,11 +181,13 @@ export function watchShareProject(projectId: string, handlers: { onProject?: (pr
         fallback?.abort();
         fallback = null;
     };
+    // 外层 signal 一停，降级流也要跟着停，否则离开分享页之后它还在往 store 里写状态。
+    // 监听只挂这一次：挂在 startFallback 里的话，每降级一轮就往一个活到整页生命周期的 signal 上
+    // 再堆一个闭包，这些闭包连同它们捕获的 controller 会一直留在内存里。
+    signal.addEventListener("abort", () => stopFallback(), { once: true });
     const startFallback = () => {
         if (fallback || signal.aborted) return;
         fallback = new AbortController();
-        // 外层 signal 一停，降级流也要跟着停，否则离开分享页之后它还在往 store 里写状态。
-        signal.addEventListener("abort", () => fallback?.abort(), { once: true });
         watchShareProjectViaSse(projectId, handlers, fallback.signal);
     };
 
@@ -300,10 +308,11 @@ export function createSharePresenceReporter(projectId: string) {
     let current: { nodeIds: string[]; activity: ServerProjectPresence["activity"] } = { nodeIds: [], activity: "idle" };
     let timer = 0;
     // 与账号侧同构：presence 优先走 WebSocket 上行，和事件同一条连接，不会因为 HTTP 排队而比画布变更晚到。
-    // 没有可用订阅时仍打 HTTP 接口——在 WebSocket 起不来的环境里这是唯一能让别人看到你的方式。
+    // 但「有订阅对象」不等于「这一帧真的发出去了」：订阅可能还没 ready、socket 可能正在重连或已经降级。
+    // 只有 presence() 明确回 true 才算发送成功，否则一律补一次 HTTP——
+    // 少了这一步，从 WebSocket 掉到 SSE 的那段时间里，这个访客在别人的画布上完全是隐身的。
     const send = () => {
-        const subscription = sharePresence.get(projectId);
-        if (subscription) return subscription.presence({ clientId: shareClientId, ...current });
+        if (sharePresence.get(projectId)?.presence({ clientId: shareClientId, ...current })) return;
         const { guestToken } = useShareStore.getState();
         if (!guestToken) return;
         void shareApi.updatePresence(projectId, guestToken, { clientId: shareClientId, ...current }).catch(() => undefined);
@@ -313,7 +322,7 @@ export function createSharePresenceReporter(projectId: string) {
         update(nodeIds: string[], activity: ServerProjectPresence["activity"]) {
             current = { nodeIds: [...new Set(nodeIds)], activity };
             window.clearTimeout(timer);
-            timer = window.setTimeout(send, 200);
+            timer = window.setTimeout(send, PRESENCE_DEBOUNCE_MS);
         },
         dispose() {
             window.clearTimeout(timer);

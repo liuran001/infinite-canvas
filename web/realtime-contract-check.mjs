@@ -177,6 +177,12 @@ check("分享 ready 后停止 SSE 降级", /onRecover: stopFallback/.test(shareS
 check("撤销后重新鉴权而不是直接判失效", /onTerminal: \(failure\) => \{[\s\S]*?startFallback\(\);\s*\n\s*\},/.test(shareSync), "撤销与降级走同一条断流路径，直接判失效会把「变只读」误报成「链接没了」");
 check("确证失效才进 gone 终态", /markGone\(/.test(shareSync) && /FORBIDDEN|PROJECT_NOT_FOUND/.test(shareSync));
 check("分享 presence 优先 WebSocket 且保留 HTTP", /subscription\.presence\(|presence\(\{/.test(shareSync) && /shareApi\.updatePresence\(/.test(shareSync));
+// 「有订阅对象」不等于「这一帧发出去了」：不看返回值就直接 return，会让访客在降级窗口里彻底隐身。
+check("分享 presence 只在发送成功时跳过 HTTP", /sharePresence\.get\(projectId\)\?\.presence\(\{[^)]*\}\)\) return;/.test(shareSync), "share-sync 没有按 presence() 的返回值决定是否回落 HTTP");
+// 去抖取成 200（正好等于服务端阈值）会被 RATE_LIMITED 静默丢掉，和账号侧同一个坑。
+check("分享 presence 去抖大于服务端限流阈值", /PRESENCE_DEBOUNCE_MS = PRESENCE_MIN_INTERVAL_MS \+ \d+/.test(shareSync) && /setTimeout\(send, PRESENCE_DEBOUNCE_MS\)/.test(shareSync) && /setTimeout\(send, 200\)/.test(shareSync) === false);
+// 降级流的 abort 监听只能挂一次，否则每降级一轮就往整页生命周期的 signal 上堆一个闭包。
+check("分享降级 abort 监听只注册一次", /signal\.addEventListener\("abort", \(\) => fallback\?\.abort\(\)/.test(shareSync) === false && /signal\.addEventListener\("abort", \(\) => stopFallback\(\), \{ once: true \}\)/.test(shareSync));
 
 console.log("降级路径仍然存在");
 check("画布保留 SSE 降级", /serverProjectStream\(/.test(projectRealtime) && /watchProjectViaSse/.test(projectRealtime));
