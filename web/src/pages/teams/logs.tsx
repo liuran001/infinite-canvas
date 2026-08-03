@@ -17,13 +17,15 @@ const typeLabels: Record<TeamCreditLogType, string> = {
 export default function TeamLogsPage() {
     const { team } = useTeamContext();
     const all = canReadAllLogs(team.myRole);
-    // 只有管理员看得到全员流水，普通成员的开关本来就只有一档，默认也只能是自己那一档。
-    const [scope, setScope] = useState<"mine" | "all">(all ? "all" : "mine");
+    const [scope, setScope] = useState<"mine" | "all">("all");
+    // 范围每次渲染都按当前角色重算，而不是只在初始化时判一次：
+    // 被降级成 member 的人如果 scope 还停在 all，这一页会一直打一个必然 403 的接口。
+    const effectiveScope = all ? scope : "mine";
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(20);
     const { data, isPending, error } = useQuery({
-        queryKey: ["team-logs", team.id, scope, page, pageSize],
-        queryFn: () => (scope === "all" ? teamApi.creditLogs(team.id, { page, pageSize }) : teamApi.myCreditLogs(team.id, { page, pageSize })),
+        queryKey: ["team-logs", team.id, effectiveScope, page, pageSize],
+        queryFn: () => (effectiveScope === "all" ? teamApi.creditLogs(team.id, { page, pageSize }) : teamApi.myCreditLogs(team.id, { page, pageSize })),
     });
 
     return (
@@ -35,7 +37,7 @@ export default function TeamLogsPage() {
                 </div>
                 {all ? (
                     <Segmented
-                        value={scope}
+                        value={effectiveScope}
                         aria-label="切换流水范围"
                         onChange={(value) => {
                             setScope(value as "mine" | "all");

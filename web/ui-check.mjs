@@ -30,6 +30,14 @@ function isVisible(locator) {
     return locator.isVisible().catch(() => false);
 }
 
+/**
+ * 前置步骤没成功时，后面的断言不能在一个错误的页面上继续跑——那样只会报出一堆无关的失败，
+ * 真正的原因反而被埋住。但也不能让它们悄悄消失，所以按失败记账并写明原因。
+ */
+function skip(names, reason) {
+    names.forEach((name) => check(name, false, reason));
+}
+
 async function main() {
     const browser = await chromium.launch(EXECUTABLE ? { executablePath: EXECUTABLE } : {});
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -49,15 +57,21 @@ async function main() {
     });
     page.on("pageerror", (error) => errors.push(`pageerror: ${String(error).slice(0, 200)}`));
 
-    const visit = async (path, waitFor) => {
+    // 每一段自己申报预期内的控制台错误，绝不在这里全局放行某个状态码：
+    // 一旦全局忽略 400，「某个页面把请求打坏了」和「这条断言故意造出来的失败」就共用一个出口，
+    // 前者从此再也不会让脚本变红。申报的范围只到下一次导航为止。
+    let expectedErrors = [];
+    const visit = async (path, waitFor, expected = []) => {
         errors.length = 0;
+        expectedErrors = expected;
         await page.goto(`${WEB}${path}`, { waitUntil: "networkidle", timeout: 45000 });
         if (waitFor) await page.waitForSelector(waitFor, { timeout: 15000 }).catch(() => {});
         await page.waitForTimeout(600);
     };
     // 忽略与本次改动无关的噪音（favicon、devtools、第三方图片 CDN）
-    // 400 是几条断言故意造出来的（无效邀请链接等），它们本来就该被服务端拒绝，不是运行时故障。
-    const realErrors = () => errors.filter((e) => !/favicon|DevTools|net::ERR_(NAME_NOT_RESOLVED|CONNECTION)|jsdelivr|githubusercontent|status of 400/i.test(e));
+    const realErrors = () => errors.filter((e) => !/favicon|DevTools|net::ERR_(NAME_NOT_RESOLVED|CONNECTION)|jsdelivr|githubusercontent/i.test(e) && !expectedErrors.some((pattern) => pattern.test(e)));
+    /** 申报了却没出现，说明这条白名单已经过期：留着它只会在以后替真故障挡枪，必须报出来让人删掉。 */
+    const missingExpected = () => expectedErrors.filter((pattern) => !errors.some((item) => pattern.test(item)));
 
     console.log("公开页面");
     await visit("/", "h1");
@@ -225,38 +239,50 @@ async function main() {
     await page.getByLabel("团队名称").fill("UI 验证团队");
     // antd 会在两个汉字的按钮里插一个空格，可访问名因此是「确 定」，写死两字会永远等不到。
     await page.getByRole("button", { name: /确\s*定/ }).click();
-    await page.waitForURL(/\/teams\/team-/, { timeout: 15000 }).catch(() => {});
-    const uiTeamId = new URL(page.url()).pathname.split("/")[2] || "";
-    check("创建后进入团队详情", await isVisible(page.getByText("UI 验证团队").first()), `当前地址 ${page.url()}`);
-    check("详情页展示团队积分", await isVisible(page.getByText(/团队积分/).first()));
+    // 超时不能吞：吞掉的话下面全部断言会在一个错误的页面上继续跑，最后报一堆和真正原因无关的失败。
+    const entered = await page
+        .waitForURL(/\/teams\/team-/, { timeout: 15000 })
+        .then(() => true)
+        .catch(() => false);
+    check("创建团队后跳进详情页", entered, `当前地址 ${page.url()}`);
+    const uiTeamId = entered ? new URL(page.url()).pathname.split("/")[2] || "" : "";
 
-    await page.getByRole("link", { name: "成员" }).click();
-    await page.waitForTimeout(800);
-    check("成员页展示自己为 owner", await isVisible(page.getByText("owner").first()));
+    if (entered) {
+        check("创建后进入团队详情", await isVisible(page.getByText("UI 验证团队").first()));
+        check("详情页展示团队积分", await isVisible(page.getByText(/团队积分/).first()));
 
-    await page.getByRole("link", { name: "邀请" }).click();
-    await page.waitForTimeout(800);
-    await page
-        .getByRole("button", { name: /生成邀请链接/ })
-        .first()
-        .click();
-    await page.waitForTimeout(1000);
-    check("生成后展示可复制的完整链接", await isVisible(page.getByRole("button", { name: /复制链接/ }).first()));
-    await page.keyboard.press("Escape");
-    await page
-        .getByRole("button", { name: /生成邀请码/ })
-        .first()
-        .click();
-    await page.waitForTimeout(1000);
-    const inviteCode = await page
-        .getByTestId("team-invite-code")
-        .first()
-        .innerText()
-        .catch(() => "");
-    check("邀请码常驻可见", inviteCode.trim().length === 10, `当前值「${inviteCode.trim()}」`);
+        await page.getByRole("link", { name: "成员" }).click();
+        await page.waitForTimeout(800);
+        check("成员页展示自己为 owner", await isVisible(page.getByText("owner").first()));
 
-    await visit("/join/not-a-real-token");
+        await page.getByRole("link", { name: "邀请" }).click();
+        await page.waitForTimeout(800);
+        await page
+            .getByRole("button", { name: /生成邀请链接/ })
+            .first()
+            .click();
+        await page.waitForTimeout(1000);
+        check("生成后展示可复制的完整链接", await isVisible(page.getByRole("button", { name: /复制链接/ }).first()));
+        await page.keyboard.press("Escape");
+        await page
+            .getByRole("button", { name: /生成邀请码/ })
+            .first()
+            .click();
+        await page.waitForTimeout(1000);
+        const inviteCode = await page
+            .getByTestId("team-invite-code")
+            .first()
+            .innerText()
+            .catch(() => "");
+        check("邀请码常驻可见", inviteCode.trim().length === 10, `当前值「${inviteCode.trim()}」`);
+    } else {
+        skip(["创建后进入团队详情", "详情页展示团队积分", "成员页展示自己为 owner", "生成后展示可复制的完整链接", "邀请码常驻可见"], "没有进入团队详情页，依赖它的断言无法执行");
+    }
+
+    // 这一段故意用一个不存在的 token，预期服务端回 400；只在这一次导航里放行它。
+    await visit("/join/not-a-real-token", null, [/status of 400/]);
     check("无效邀请链接给出明确提示", await isVisible(page.getByText(/邀请链接无效或已失效/).first()));
+    check("无效邀请确实被服务端拒绝", missingExpected().length === 0, "预期内的 400 没有出现，这条白名单已经过期");
     check("团队页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
 
     console.log("余额实时同步与回落开关");

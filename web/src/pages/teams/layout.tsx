@@ -33,26 +33,32 @@ export function useTeamContext() {
 export default function TeamLayout() {
     const { id = "" } = useParams();
     const { pathname } = useLocation();
-    const setCurrentTeam = useTeamStore((state) => state.setCurrentTeam);
+    const bindTeam = useTeamStore((state) => state.bindTeam);
+    const applyTeamSnapshot = useTeamStore((state) => state.applyTeamSnapshot);
     const clear = useTeamStore((state) => state.clear);
     const credits = useTeamStore((state) => state.credits);
     const myRole = useTeamStore((state) => state.myRole);
     const realtimeStatus = useTeamStore((state) => state.realtimeStatus);
+    const realtimeError = useTeamStore((state) => state.realtimeError);
     const { data, isPending, error, refetch } = useQuery({ queryKey: ["team", id], queryFn: () => teamApi.team(id), enabled: Boolean(id) });
 
     useEffect(() => {
-        if (data) setCurrentTeam(data);
-    }, [data, setCurrentTeam]);
-
-    useEffect(() => {
         if (!id) return;
+        // 占位必须发生在开流之前：连接一建好就推 ready，而 REST 那边还在排队，
+        // 没占位的话 store 认不出这个 teamId，第一份余额被直接丢掉，界面停在 0。
+        bindTeam(id);
         const controller = new AbortController();
         watchTeam(id, controller.signal);
         return () => {
             controller.abort();
             clear();
         };
-    }, [clear, id]);
+    }, [bindTeam, clear, id]);
+
+    // 快照只在实时还没接管时填充，接管之后由 store 挡住，不会把推来的新余额盖回旧值。
+    useEffect(() => {
+        if (data) applyTeamSnapshot(data);
+    }, [applyTeamSnapshot, data]);
 
     if (isPending) return <main className="flex h-full items-center justify-center bg-background text-sm text-stone-500">加载中…</main>;
     if (error || !data) return <main className="flex h-full items-center justify-center bg-background text-sm text-red-500">{error instanceof Error ? error.message : "团队不存在或你不在这个团队里"}</main>;
@@ -78,7 +84,12 @@ export default function TeamLayout() {
                             <div className="text-2xl font-semibold tabular-nums" data-testid="team-credits">
                                 {credits}
                             </div>
-                            <div className="mt-1 text-xs text-stone-400">{realtimeStatus === "polling" ? "实时推送不可用，正在每 30 秒刷新" : realtimeStatus === "ready" ? "余额实时同步中" : "正在连接实时同步…"}</div>
+                            {/* 断开之后余额就停在最后收到的那个数上，不说明白的话用户会一直把它当成真值。 */}
+                            {realtimeStatus === "failed" ? (
+                                <div className="mt-1 text-xs text-red-500">{realtimeError || "实时同步已断开，请刷新页面"}</div>
+                            ) : (
+                                <div className="mt-1 text-xs text-stone-400">{realtimeStatus === "polling" ? "实时推送不可用，正在每 30 秒刷新" : realtimeStatus === "ready" ? "余额实时同步中" : "正在连接实时同步…"}</div>
+                            )}
                         </div>
                     </div>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -90,6 +101,7 @@ export default function TeamLayout() {
                             <Link
                                 key={tab.key || "overview"}
                                 to={`/teams/${id}${tab.key ? `/${tab.key}` : ""}`}
+                                aria-current={active === tab.key ? "page" : undefined}
                                 className={active === tab.key ? "font-medium text-stone-950 underline underline-offset-8 dark:text-stone-100" : "text-stone-500 hover:text-stone-800 dark:hover:text-stone-200"}
                             >
                                 {tab.label}

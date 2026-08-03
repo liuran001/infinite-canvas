@@ -2,6 +2,7 @@ import { Modal } from "antd";
 
 import { serverApiUrl } from "@/services/api/server";
 import { teamApi, type TeamRole } from "@/services/api/teams";
+import { decodeSseFrames, parseSseJson } from "@/services/sse-frames";
 import { useServerStore } from "@/stores/use-server-store";
 import { useTeamStore } from "@/stores/use-team-store";
 
@@ -20,6 +21,34 @@ const RETRIES = [1500, 3000, 6000];
 const FAILURES_BEFORE_POLLING = 3;
 const POLL_INTERVAL = 30_000;
 
+/** 连接失败要带上 HTTP 状态码：只留一句中文文案的话，调用方只能去匹配字符串来决定还要不要重连。 */
+class TeamStreamError extends Error {
+    constructor(
+        message: string,
+        readonly status: number,
+    ) {
+        super(message);
+    }
+}
+
+/**
+ * 永久失败的状态码。401 的会话已经被就地清掉，403 是被挂起或降级，404 是团队没了或人已被移出——
+ * 这三种重连一万次都是同一个结果，继续转只是每几秒打一次必然失败的请求，外加一个永远停不下来的轮询。
+ */
+const TERMINAL_STATUS = [401, 403, 404];
+
+function terminalMessage(status: number) {
+    if (status === 401) return "登录状态已失效，请重新登录";
+    if (status === 403) return "你在这个团队中的权限已变更，请刷新页面";
+    return "你已不在这个团队里，或团队已解散";
+}
+
+/** ServerApiError 与 TeamStreamError 都带 status，这里统一取。不是永久失败就返回 0。 */
+function terminalStatusOf(error: unknown) {
+    const status = error && typeof error === "object" ? Number((error as { status?: unknown }).status) : 0;
+    return TERMINAL_STATUS.includes(status) ? status : 0;
+}
+
 const sleep = (ms: number, signal: AbortSignal) =>
     new Promise<void>((resolve, reject) => {
         const timer = setTimeout(resolve, ms);
@@ -33,7 +62,7 @@ const sleep = (ms: number, signal: AbortSignal) =>
         );
     });
 
-/** SSE 按空行分块，保活帧是没有 data 行的注释，天然被跳过。 */
+/** 读流并按帧回调。分帧与解析都交给 sse-frames，坏帧只跳过它自己，不会掀翻整条连接。 */
 async function readSse(response: Response, onEvent: (event: TeamRealtimeEvent) => void) {
     const reader = response.body?.getReader();
     if (!reader) throw new Error("团队实时连接没有返回内容");
@@ -42,16 +71,11 @@ async function readSse(response: Response, onEvent: (event: TeamRealtimeEvent) =
     for (;;) {
         const { done, value } = await reader.read();
         if (done) return;
-        buffer += decoder.decode(value, { stream: true });
-        for (let index = buffer.indexOf("\n\n"); index >= 0; index = buffer.indexOf("\n\n")) {
-            const data = buffer
-                .slice(0, index)
-                .split("\n")
-                .filter((line) => line.startsWith("data:"))
-                .map((line) => line.slice(5).trim())
-                .join("");
-            buffer = buffer.slice(index + 2);
-            if (data) onEvent(JSON.parse(data) as TeamRealtimeEvent);
+        const decoded = decodeSseFrames(buffer + decoder.decode(value, { stream: true }));
+        buffer = decoded.rest;
+        for (const frame of decoded.data) {
+            const event = parseSseJson<TeamRealtimeEvent>(frame);
+            if (event) onEvent(event);
         }
     }
 }
@@ -67,9 +91,9 @@ async function openStream(teamId: string, onEvent: (event: TeamRealtimeEvent) =>
     if (response.status === 401) {
         useServerStore.getState().clearSession();
         useServerStore.getState().setLoginOpen(true);
-        throw new Error("登录状态已失效，请重新登录");
+        throw new TeamStreamError("登录状态已失效，请重新登录", 401);
     }
-    if (!response.ok) throw new Error(`团队实时连接失败（HTTP ${response.status}）`);
+    if (!response.ok) throw new TeamStreamError(`团队实时连接失败（HTTP ${response.status}）`, response.status);
     await readSse(response, onEvent);
 }
 
@@ -93,8 +117,12 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
             const team = await teamApi.team(teamId);
             store().setCredits(teamId, team.credits);
             store().setMyRole(teamId, team.myRole);
-        } catch {
-            // 轮询失败只是这一轮没拿到新数字，下一轮照常再来；这里报错只会刷屏。
+        } catch (error) {
+            // 轮询是降级路径，不该比主连接更执着：撞上同样的永久失败就一起收手。
+            const terminal = terminalStatusOf(error);
+            if (!terminal) return;
+            clearPolling();
+            store().setRealtimeStatus("failed", terminalMessage(terminal));
         }
     };
     const startPolling = () => {
@@ -127,10 +155,10 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
                 );
             } catch (error) {
                 if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) break;
-                // 团队没了或自己已经不在里面，再怎么重连都是同一个 404，直接收手。
-                if (error instanceof Error && /HTTP 404/.test(error.message)) {
+                const terminal = terminalStatusOf(error);
+                if (terminal) {
                     clearPolling();
-                    store().setRealtimeStatus("idle");
+                    store().setRealtimeStatus("failed", terminalMessage(terminal));
                     break;
                 }
                 failure += 1;
