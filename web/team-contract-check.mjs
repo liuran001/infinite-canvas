@@ -15,6 +15,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { decodeSseFrames, parseSseJson } from "./src/services/sse-frames.ts";
+import { validateInviteCode, normalizeInviteCode, INVITE_CODE_MAX_LENGTH, INVITE_CODE_MIN_LENGTH } from "./src/lib/invite-code.ts";
+import { ownedTeamCount, teamCreateBlockedReason } from "./src/lib/team-limits.ts";
 import { useTeamStore } from "./src/stores/use-team-store.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "src");
@@ -33,7 +35,21 @@ function check(name, ok, detail = "") {
 
 const read = (relative) => readFileSync(join(root, relative), "utf8");
 const store = () => useTeamStore.getState();
-const team = (id, credits, myRole = "owner") => ({ id, name: id, description: "", avatarUrl: "", ownerId: "u1", credits, memberLimit: 0, status: "active", myRole, createdAt: "", updatedAt: "" });
+const team = (id, credits, myRole = "owner", storageUsed = 0, storageQuota = 0) => ({
+    id,
+    name: id,
+    description: "",
+    avatarUrl: "",
+    ownerId: "u1",
+    credits,
+    storageUsed,
+    storageQuota,
+    memberLimit: 0,
+    status: "active",
+    myRole,
+    createdAt: "",
+    updatedAt: "",
+});
 
 console.log("团队 store 的时序契约");
 
@@ -81,6 +97,119 @@ store().setRealtimeStatus("team-2", "failed", "你已不在这个团队里");
 check("终止状态记下失败原因", store().realtimeStatus === "failed" && store().realtimeError === "你已不在这个团队里", `${store().realtimeStatus} / ${store().realtimeError}`);
 store().clear();
 check("clear 一并清掉失败原因", store().realtimeStatus === "idle" && store().realtimeError === "", `${store().realtimeStatus} / ${store().realtimeError}`);
+
+console.log("团队云空间的时序契约");
+
+// 云空间和余额是同一条管道推下来的，所以它必须遵守同一套隔离规则。
+// 少挡一处，B 队页面上就会显示 A 队的用量——而且那个数字看着完全正常，没有任何迹象说明它是错的。
+store().clear();
+store().bindTeam("team-1");
+store().setStorage("team-1", 1024, 4096);
+check("占位之后推来的云空间用量能落库", store().storageUsed === 1024 && store().storageQuota === 4096, `${store().storageUsed} / ${store().storageQuota}`);
+
+store().setRealtimeStatus("team-1", "ready");
+store().applyTeamSnapshot(team("team-1", 0, "owner", 0, 4096));
+check("实时已就绪时 REST 快照不覆盖云空间用量", store().storageUsed === 1024, `当前 ${store().storageUsed}`);
+
+// 还没连上时快照是唯一来源，必须能写进去，否则首屏进度条永远是 0。
+store().clear();
+store().bindTeam("team-1");
+store().applyTeamSnapshot(team("team-1", 0, "admin", 2048, 8192));
+check("未就绪时 REST 快照负责填充云空间", store().storageUsed === 2048 && store().storageQuota === 8192, `${store().storageUsed} / ${store().storageQuota}`);
+
+store().bindTeam("team-2");
+check("切换团队清掉上一支队伍的云空间", store().storageUsed === 0 && store().storageQuota === 0, `${store().storageUsed} / ${store().storageQuota}`);
+store().setStorage("team-1", 9999, 9999);
+check("迟到的旧团队云空间事件不会写进新团队", store().storageUsed === 0 && store().storageQuota === 0, `${store().storageUsed} / ${store().storageQuota}`);
+store().clear();
+
+const realtimeSource = read("services/team-realtime.ts");
+// ready 是第一条事件，也是唯一一条能在首屏之前到达的。不在这里写云空间，进度条要等到下一次有人上传才会动。
+check("ready 事件同时落库云空间", /"ready"[\s\S]{0,400}?setStorage\(teamId, event\.storageUsed, event\.storageQuota\)/.test(realtimeSource), "ready 只写了余额，首屏的云空间要等下一次变化才出现");
+check("team.storage 事件写进 store", /"team\.storage"[\s\S]{0,200}?setStorage\(teamId,/.test(realtimeSource), "云空间的实时事件没有落库，用量不会实时更新");
+// 降级之后余额每 30 秒动一次而用量永远停在进页面时的值，用户会照着一个偏小的数字继续传。
+const pollSource = /const pollOnce[\s\S]*?const startPolling/.exec(realtimeSource)?.[0] || "";
+check("降级轮询也刷新云空间", /setStorage\(teamId, team\.storageUsed, team\.storageQuota\)/.test(pollSource), "轮询只刷了余额，降级后云空间用量会一直停在旧值");
+const storageCalls = realtimeSource.match(/setStorage\([^)]*/g) || [];
+check(
+    "每次写云空间都带上 teamId",
+    storageCalls.length >= 3 && storageCalls.every((call) => call.startsWith("setStorage(teamId,")),
+    `没带 teamId 的调用：${storageCalls.filter((call) => !call.startsWith("setStorage(teamId,")).join(" | ") || "无"}`,
+);
+const teamStoreSource = read("stores/use-team-store.ts");
+check("store 按当前团队挡住迟到的云空间", /setStorage: \(teamId, [^\n]*state\.currentTeamId === teamId/.test(teamStoreSource), "setStorage 没有 currentTeamId 守卫，切队之后旧连接还能改新页面的用量");
+
+// 团队空间满和个人空间满是两本账。说成「你的云空间不足」，用户会跑去删自己的个人画布，删完一点用都没有。
+check("团队配额错误码与个人分开", /TEAM_QUOTA_EXCEEDED = "TEAM_QUOTA_EXCEEDED"/.test(realtimeSource), "团队云空间不足没有独立错误码，会和个人配额混为一谈");
+check("团队配额失败也能按文案识别", /团队云空间不足/.test(realtimeSource), "异步任务的失败原因只有文案，不按文案认就漏掉整条生成路径");
+// 两种失败可能在同一批任务里同时发生，共用一个去重开关会让后弹的那条被永久吞掉。
+check("配额弹窗与积分弹窗各自去重", /let quotaModalOpen = false/.test(realtimeSource) && /let exhaustedModalOpen = false/.test(realtimeSource), "两种弹窗共用一个开关，其中一条提示会被吞掉");
+for (const file of ["services/api/job-stream.ts", "services/api/image.ts", "stores/use-cloud-agent-store.ts"]) {
+    const source = read(file);
+    check(`${file} 接上团队配额提示`, /notifyTeamQuotaExceeded\(/.test(source), "这条路径上团队空间满只会显示一句干巴巴的失败，用户不知道该清理谁的空间");
+}
+
+const detailSource = read("pages/teams/detail.tsx");
+// 读 outlet 里那份 REST 快照的话，只有手动刷新数字才会变，实时推送等于白接。
+check("详情页的云空间读实时 store", /useTeamStore\(\(state\) => state\.storageUsed\)/.test(detailSource), "用量读的是 REST 快照，SSE 推下来的新值显示不出来");
+// Zustand 5 走 useSyncExternalStore：selector 返回新对象引用会无限重渲染并抛 React error #185。
+check("云空间 selector 不返回新对象", !/useTeamStore\(\(state\) => \(\{/.test(detailSource), "selector 返回了新对象引用，会无限重渲染（React error #185）");
+check("云空间用量有 data-testid", /data-testid="team-storage"/.test(detailSource), "UI 自动化脚本定位不到团队云空间");
+
+console.log("创建团队的数量上限");
+
+const owned = (count) => Array.from({ length: count }, (_, index) => team(`t${index}`, 0)).map((item) => ({ ...item, ownerId: "me" }));
+check("只统计自己创建的团队", ownedTeamCount([...owned(2), { ...team("other", 0), ownerId: "someone-else" }], "me") === 2, `当前 ${ownedTeamCount([...owned(2), { ...team("other", 0), ownerId: "someone-else" }], "me")}`);
+// 解散掉的团队不占名额，否则用户解散了也建不了新的，界面上还说「解散不再需要的团队后可以再建」。
+check("已解散的团队不占名额", ownedTeamCount([...owned(1), { ...team("gone", 0), ownerId: "me", status: "disbanded" }], "me") === 1);
+check("没登录时不算任何名额", ownedTeamCount(owned(3), "") === 0);
+check("没到上限时不拦", teamCreateBlockedReason(owned(2), "me", 5) === "");
+check("到达上限时给出原因", teamCreateBlockedReason(owned(5), "me", 5).includes("最多创建 5 个"), `当前「${teamCreateBlockedReason(owned(5), "me", 5)}」`);
+check("超过上限同样拦住", teamCreateBlockedReason(owned(7), "me", 5) !== "");
+// 0 是「管理员把创建关掉了」，再删团队也不会解锁，文案必须和「你建满了」区分开，否则用户白删一通。
+check("上限为 0 时说明是平台关闭而非建满", teamCreateBlockedReason([], "me", 0).includes("不允许自行创建"), `当前「${teamCreateBlockedReason([], "me", 0)}」`);
+// 坏配置不能把所有人的创建入口锁死。
+check("配置异常时按不限处理", teamCreateBlockedReason(owned(99), "me", -1) === "" && teamCreateBlockedReason(owned(99), "me", Number.NaN) === "");
+
+const teamsPage = read("pages/teams/index.tsx");
+check("创建按钮按上限禁用", /disabled=\{Boolean\(blockedReason\)\}/.test(teamsPage), "达到上限后按钮还亮着，点下去只会拿到一句原始的接口错误");
+// 禁用的按钮点不动也悬停不出提示（触屏尤其如此），原因必须在页面上直接写一遍。
+check("上限原因在页面上直接可见", /data-testid="team-create-blocked"/.test(teamsPage), "原因只挂在 Tooltip 上，触屏用户永远看不到");
+// settings 还没拉回来就把入口锁死的话，慢一拍的网络会让所有人都建不了团队。
+check("配置未就绪时不拦创建", /maxTeamsPerUser === undefined \? "" :/.test(teamsPage), "配置还没拉回来就按上限拦，网络慢一拍所有人都建不了团队");
+
+console.log("指定邀请码的校验");
+
+check("留空表示随机生成，不算错", validateInviteCode("") === "" && validateInviteCode("   ") === "");
+check("小写会被归一成大写", normalizeInviteCode(" abc9 ") === "ABC9");
+check("合法码通过校验", validateInviteCode("autumn26") === "", `当前「${validateInviteCode("autumn26")}」`);
+// 0/O/1/I/L 正是因为肉眼难分才被排除；报错必须点名是哪几个字符，只说「含非法字符」用户盯着码也看不出来。
+const illegal = validateInviteCode("WELC0ME");
+check("形近字被拒绝", illegal !== "", "0 应当不在字母表里");
+check("报错点名违规字符", illegal.includes("0"), `当前「${illegal}」`);
+check("太短的码被拒绝", validateInviteCode("AB").includes(String(INVITE_CODE_MIN_LENGTH)), `当前「${validateInviteCode("AB")}」`);
+check("超长的码被拒绝", validateInviteCode("A".repeat(INVITE_CODE_MAX_LENGTH + 1)) !== "", "超过长度上限没有被拦住");
+check("刚好在边界上的码通过", validateInviteCode("A".repeat(INVITE_CODE_MIN_LENGTH)) === "" && validateInviteCode("A".repeat(INVITE_CODE_MAX_LENGTH)) === "");
+
+const invitesPage = read("pages/admin/invites/index.tsx");
+// 只禁用数量输入框是不够的：禁用不会改已经填进去的值，提交上去仍然是 count=10，服务端只能整批拒掉。
+check("指定码值时数量强制为 1", /batchForm\.setFieldsValue\(\{ count: 1 \}\)/.test(invitesPage), "只禁用了数量框，已填的值仍会原样提交并被服务端拒绝");
+check("指定码值时禁用数量输入", /disabled=\{singleCode\}/.test(invitesPage), "指定码值时数量还能改");
+check("提交前把码值归一成大写", /normalizeInviteCode\(values\.code/.test(invitesPage), "小写码原样发出去，管理员发出的码和实际存的对不上");
+check("批量生成的校验在 try 内", /try \{[\s\S]{0,400}?await batchForm\.validateFields\(\)/.test(invitesPage), "校验失败会变成 unhandled rejection，界面看着像卡住");
+check("不把校验失败当服务端错误报", /"errorFields" in \w+\) return;/.test(invitesPage), "字段已经标红了还再弹一句失败，会被当成服务端出错");
+
+console.log("昵称修改");
+
+const accountModal = read("components/layout/account-settings-modal.tsx");
+// 只提示「已保存」而不更新 store 的话，顶栏、成员列表、协作 presence 会一直是旧昵称，用户以为没改成功又改一遍。
+check("改完昵称写回登录态", /setUser\(await serverApi\.updateProfile\(/.test(accountModal), "没有把新用户对象写回 store，全站还显示旧昵称");
+// 用户名是登录凭据也是历史记录里定位到人的锚点，不能自助改。
+check("弹窗里没有用户名输入框", !/name="username"/.test(accountModal), "账号设置里出现了可改用户名的输入框");
+check("昵称有长度上限", /maxLength=\{DISPLAY_NAME_MAX\}/.test(accountModal), "昵称没有长度限制，填超了会被服务端悄悄截断");
+// 弹窗不销毁表单，上次改了一半又关掉的草稿会留着，下次打开看到的就不是账号真正的昵称。
+check("每次打开用当前昵称重置表单", /if \(open\) profileForm\.setFieldsValue/.test(accountModal), "上次没保存的草稿会留在输入框里，看着像是账号的真实昵称");
+check("昵称允许留空并回落到用户名", /displayName \|\| user\?\.username/.test(accountModal), "空昵称没有回落，界面上会出现无名氏");
 
 console.log("SSE 分帧");
 

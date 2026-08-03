@@ -257,6 +257,16 @@ async function main() {
     if (entered) {
         check("创建后进入团队详情", await isVisible(page.getByText("UI 验证团队").first()));
         check("详情页展示团队积分", await isVisible(page.getByText(/团队积分/).first()));
+        // 团队云空间和个人云空间是两本账，详情页必须把团队那本单独摆出来。
+        check("详情页展示团队云空间", await isVisible(page.getByTestId("team-storage").first()));
+        const teamStorageText = await page
+            .getByTestId("team-storage")
+            .first()
+            .innerText()
+            .catch(() => "");
+        // 「已用 / 配额」两个数都要有：只显示已用的话，用户根本不知道离满还有多远。
+        check("团队云空间显示已用与配额", /\/\s*\d/.test(teamStorageText), `当前「${teamStorageText.trim()}」`);
+        check("详情页说明团队空间不占个人配额", (await page.getByText(/与你的个人云空间是两本账/).count()) > 0);
 
         await page.getByRole("link", { name: "成员" }).click();
         await page.waitForTimeout(800);
@@ -283,7 +293,10 @@ async function main() {
             .catch(() => "");
         check("邀请码常驻可见", inviteCode.trim().length === 10, `当前值「${inviteCode.trim()}」`);
     } else {
-        skip(["创建后进入团队详情", "详情页展示团队积分", "成员页展示自己为 owner", "生成后展示可复制的完整链接", "邀请码常驻可见"], "没有进入团队详情页，依赖它的断言无法执行");
+        skip(
+            ["创建后进入团队详情", "详情页展示团队积分", "详情页展示团队云空间", "团队云空间显示已用与配额", "详情页说明团队空间不占个人配额", "成员页展示自己为 owner", "生成后展示可复制的完整链接", "邀请码常驻可见"],
+            "没有进入团队详情页，依赖它的断言无法执行",
+        );
     }
 
     // 这一段故意用一个不存在的 token，预期服务端回 400；只在这一次导航里放行它。
@@ -291,6 +304,50 @@ async function main() {
     check("无效邀请链接给出明确提示", await isVisible(page.getByText(/邀请链接无效或已失效/).first()));
     check("无效邀请确实被服务端拒绝", missingExpected().length === 0, "预期内的 400 没有出现，这条白名单已经过期");
     check("团队页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+
+    console.log("账号设置 · 修改昵称");
+    await visit("/");
+    await page.getByRole("button", { name: "账号" }).first().click();
+    await page.waitForTimeout(600);
+    await page.getByRole("menuitem", { name: "账号设置" }).click();
+    await page.waitForTimeout(800);
+    const nicknameInput = page.getByLabel("昵称");
+    check("账号设置里有昵称输入框", await isVisible(nicknameInput.first()));
+    // 用户名是登录凭据，也是历史记录里定位到人的锚点，明确决定不给自助改。
+    check("账号设置里没有用户名输入框", (await page.getByLabel("用户名").count()) === 0);
+    const newNickname = `昵称-${Date.now().toString(36).slice(-4)}`;
+    let nicknameSaved = false;
+    if (await isVisible(nicknameInput.first())) {
+        await nicknameInput.first().fill(newNickname);
+        await page.getByRole("button", { name: "保存昵称" }).click();
+        await page.waitForTimeout(1500);
+        // 弹窗顶部那行「当前账号」读的是 store 里的用户对象：它变了才说明新昵称真的写回了登录态，
+        // 而不是只弹了一句「已更新」。全站的顶栏、成员列表、协作 presence 读的都是同一个来源。
+        const current = await page
+            .getByTestId("account-current-name")
+            .first()
+            .innerText()
+            .catch(() => "");
+        nicknameSaved = current.includes(newNickname);
+        check("改完昵称后当前账号立即更新", nicknameSaved, `当前「${current.trim()}」`);
+    } else {
+        skip(["改完昵称后当前账号立即更新"], "账号设置里没有昵称输入框，无法验证保存");
+    }
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    if (nicknameSaved) {
+        // 刷新一次再看：改完只更新内存里的 store 不算数，重新拉 /auth/me 之后仍是新昵称才说明服务端真的存下了。
+        await visit("/");
+        const headerTitle = await page
+            .getByRole("button", { name: "账号" })
+            .first()
+            .getAttribute("title")
+            .catch(() => "");
+        check("刷新后顶栏显示新昵称", (headerTitle || "").includes(newNickname), `当前「${headerTitle}」`);
+    } else {
+        skip(["刷新后顶栏显示新昵称"], "昵称没有保存成功，无法验证持久化");
+    }
+    check("账号设置无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
 
     console.log("余额实时同步与回落开关");
     await visit("/config");
@@ -397,6 +454,7 @@ async function main() {
     for (const [path, label] of [
         ["/admin/users", "用户管理"],
         ["/admin/invites", "邀请码"],
+        ["/admin/teams", "团队管理"],
         ["/admin/credit-logs", "算力点流水"],
         ["/admin/settings", "系统设置"],
         ["/admin/prompts", "提示词"],
@@ -409,6 +467,52 @@ async function main() {
         check(`${label}页可打开`, notForbidden, notForbidden ? "" : "被权限拦截");
         check(`${label}页无运行时报错`, realErrors().length === 0, realErrors().join("\n       "));
     }
+    console.log("管理后台 · 团队配额与指定邀请码");
+    await visit("/admin/teams");
+    check("团队管理页列出团队云空间", (await page.getByTestId("admin-team-storage").count()) > 0);
+    check("团队管理页有单独调配额的入口", (await page.getByTitle("调整团队云空间配额").count()) > 0);
+    if (await page.getByTitle("调整团队云空间配额").count()) {
+        await page.getByTitle("调整团队云空间配额").first().click();
+        await page.waitForTimeout(600);
+        // 调的是团队那本账，成员的个人配额一动不动；不写清楚容易被当成给全队每个人加空间。
+        check("配额弹窗说明只影响该团队", (await page.getByText(/只影响这一个团队/).count()) > 0);
+        await page.keyboard.press("Escape");
+        await page.waitForTimeout(400);
+    } else {
+        skip(["配额弹窗说明只影响该团队"], "团队管理页没有调整配额的入口，无法打开弹窗");
+    }
+    check("团队管理页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+
+    await visit("/admin/settings");
+    check("系统设置里有团队默认云空间", (await page.getByText("团队默认云空间").count()) > 0);
+    check("系统设置里有可创建团队数上限", (await page.getByText("每个用户最多可创建的团队数").count()) > 0);
+
+    await visit("/admin/invites");
+    await page.getByRole("button", { name: /批量生成/ }).first().click();
+    await page.waitForTimeout(600);
+    const codeInput = page.getByLabel("指定邀请码");
+    check("批量生成弹窗有指定邀请码输入框", await isVisible(codeInput.first()));
+    check("指定邀请码写明了字母表规则", (await page.getByText(/已去掉形近的 0 O 1 I L/).count()) > 0);
+    if (await isVisible(codeInput.first())) {
+        // 填了指定码值，数量必须被锁成 1：只禁用输入框而不改值的话，提交上去仍是 10，服务端只能整批拒掉。
+        await codeInput.first().fill("AUTUMN26");
+        await page.waitForTimeout(500);
+        const countInput = page.getByLabel("生成数量");
+        const countValue = await countInput.first().inputValue().catch(() => "");
+        check("指定码值后数量被锁成 1", countValue.trim() === "1", `当前「${countValue}」`);
+        check("指定码值后数量输入被禁用", await countInput.first().isDisabled().catch(() => false));
+        // 形近字在前端就要拦下来，不能等服务端打回。
+        await codeInput.first().fill("WELC0ME");
+        await page.getByRole("button", { name: /生\s*成/ }).click();
+        await page.waitForTimeout(800);
+        check("非法字符在前端就被拦住", (await page.getByText(/只能使用/).count()) > 0);
+    } else {
+        skip(["指定码值后数量被锁成 1", "指定码值后数量输入被禁用", "非法字符在前端就被拦住"], "没有找到指定邀请码输入框");
+    }
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    check("邀请码页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
+
     await page.screenshot({ path: "ui-check-admin.png", fullPage: false }).catch(() => {});
 
     await browser.close();
