@@ -299,6 +299,45 @@ async function main() {
         check("分享面板有匿名开关", (await page.getByText("允许匿名访问").count()) > 0);
         check("分享面板有克隆开关", (await page.getByText("允许保存到自己账号").count()) > 0);
         check("分享面板有过期设置", (await page.getByText("过期时间").count()) > 0);
+
+        // 链接随时可复制：建一条，关掉「已创建」弹窗，回到列表里仍然要能复制到完整地址。
+        // 这正是改造前做不到的事——那时候关掉弹窗就只剩一截前缀了。
+        await page
+            .getByRole("button", { name: /创建分享链接/ })
+            .first()
+            .click()
+            .catch(() => {});
+        await page.waitForTimeout(1800);
+        const createdDialogUrl = await page
+            .getByText(/\/s\//)
+            .first()
+            .innerText()
+            .catch(() => "");
+        check("创建后给出完整链接", createdDialogUrl.includes("/s/"), `当前显示「${createdDialogUrl.trim()}」`);
+        // 文案不能再说「只显示这一次」，那和现在的行为直接矛盾。
+        check("创建弹窗不再说链接只显示一次", (await page.getByText(/只在这一次显示/).count()) === 0);
+        await page
+            .getByRole("button", { name: /知道了/ })
+            .first()
+            .click()
+            .catch(() => {});
+        await page.waitForTimeout(900);
+        const copyButtons = page.getByRole("button", { name: "复制完整链接" });
+        check("已有链接在列表里也能复制", (await copyButtons.count()) > 0, "列表里没有复制入口，链接还是只能在创建那一次拿到");
+        // 列表里直接把完整地址摆出来，只给一截前缀对用户没有任何用处。
+        const listedUrl = await page
+            .locator("text=/\\/s\\/[A-Za-z0-9_-]{8,}/")
+            .first()
+            .innerText()
+            .catch(() => "");
+        check("列表里显示的是完整链接而不是前缀", !listedUrl.includes("…") && listedUrl.includes("/s/"), `当前显示「${listedUrl.trim()}」`);
+        // 存量记录（服务端只留了哈希）必须退回旧行为：不给复制入口，并说明为什么。
+        // 这个环境里跑出来的都是新建的链接，所以这里只反向确认「没有出现无法复制却仍给了按钮」的组合。
+        const legacyNotes = await page.getByText(/早期创建的链接/).count();
+        const copyCount = await copyButtons.count();
+        const rowCount = await page.getByText(/^\/s\//).count();
+        check("不可复制的链接没有复制按钮", copyCount + legacyNotes >= rowCount, `复制按钮 ${copyCount} 个、旧链接说明 ${legacyNotes} 条，但列表里有 ${rowCount} 条链接`);
+
         check("分享面板无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
         await page.keyboard.press("Escape");
         await page.waitForTimeout(400);

@@ -78,5 +78,24 @@ check("分享页拖拽上传只给可编辑访客", /onDrop=\{\s*editable/.test(
 check("分享页粘贴上传只给可编辑访客", /if \(!editable\) return;[\s\S]{0,600}?addEventListener\("paste"/.test(sharePage), "粘贴监听没有按 editable 收口");
 check("分享页上传前再兜一次权限", /if \(!editableRef\.current\) return;/.test(sharePage), "上传函数自身没有拦只读，绕过 UI 的路径会打到服务端");
 
+console.log("分享链接的可复制性");
+
+const sharePanel = read("components/canvas/share-panel.tsx");
+
+// 服务端额外存了一份明文，链接因此随时可复制；但存量记录只有不可逆的哈希，永远还原不出完整地址。
+// 这两类必须靠服务端给的 copyable 区分，不能拿 token 是否为空串去猜：
+// 「旧记录取不回明文」和「这次请求出了别的岔子」在前端看来都是一个空字符串，
+// 猜错的后果是把一条残缺链接渲染成可复制的样子，让用户复制了发出去。
+check("类型里有 copyable 这个显式状态", /copyable: boolean/.test(shareApi), "ShareRecord 上没有 copyable，前端只能拿空串去猜有没有明文");
+check("列表按 copyable 决定给不给复制入口", /share\.copyable \?/.test(sharePanel), "复制入口没有按 copyable 收口");
+check("不靠 token 是否为空串来猜", !/share\.token\s*\?\s*</.test(sharePanel) && !/Boolean\(share\.token\)/.test(sharePanel), "还在拿 token 是否有值判断能不能复制");
+// 不能复制时不能只是把按钮藏了：用户会以为是自己的问题，反复刷新等它出现。
+check("不能复制时说明原因", /copyable \? null :/.test(sharePanel) && /早期创建的链接/.test(sharePanel), "旧链接没有给出「为什么复制不了」的说明");
+// 拼链接优先用服务端给的 url：反代下前端自己拼主机名会拼错。
+check("优先用服务端给的完整链接", /share\.url \|\|/.test(sharePanel), "没有优先使用服务端下发的 url");
+// 顶部那段注释是这个文件的行为契约，改了行为却留着旧注释，下一个人会照着错的做。
+check("顶部注释已同步成随时可复制", /完整链接随时可复制/.test(sharePanel), "文件顶部还写着「只在创建那一次可复制」");
+check("创建弹窗不再说只显示一次", !/完整链接只在这一次显示/.test(sharePanel), "创建弹窗还在说链接只显示一次，和实际行为矛盾");
+
 console.log(`\n通过 ${pass}，失败 ${fail}`);
 process.exit(fail ? 1 : 0);

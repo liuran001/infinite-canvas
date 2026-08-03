@@ -12,7 +12,10 @@ import { useThemeStore } from "@/stores/use-theme-store";
  * 所有者侧的分享管理面板。
  *
  * 三条与设计文档对齐的约束体现在交互上：
- * 1. 完整链接只在创建那一次可复制，列表里永远只有 tokenPrefix；
+ * 1. 完整链接随时可复制——服务端额外存了一份明文，不再是「只在创建那一次显示」。
+ *    但存量记录建于「只存哈希」的年代，明文再也取不回来，这类记录退回旧行为：
+ *    只显示前缀、不给复制入口，并当场说明为什么，绝不能渲染出一条残缺链接让人复制了发出去。
+ *    有没有明文一律看服务端给的 copyable，不拿 token 是否为空串去猜；
  * 2. 停用是软删除语义，列表仍能看到已停用的链接与它的访问记录；
  * 3. 访问日志是服务端节流后的结果，这里如实展示，不再二次聚合。
  */
@@ -141,11 +144,11 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
                 onCancel={() => setCreated(null)}
                 footer={
                     <Button type="primary" onClick={() => setCreated(null)}>
-                        我已复制
+                        知道了
                     </Button>
                 }
             >
-                <p className="text-sm opacity-70">完整链接只在这一次显示。关闭后只能看到链接前缀，想再分享请重新创建一条。</p>
+                <p className="text-sm opacity-70">这条链接随时可以在下面的列表里再复制，不必现在就存下来。</p>
                 <div className="mt-3 flex items-center gap-2 rounded-xl border px-3 py-2" style={{ borderColor: theme.node.stroke, background: theme.node.fill }}>
                     <Link2 className="size-4 shrink-0 opacity-60" />
                     <span className="min-w-0 flex-1 truncate font-mono text-xs">{created ? shareUrl(created) : ""}</span>
@@ -161,8 +164,8 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
 }
 
 /** 服务端可能直接给完整链接；没给时按当前站点域名拼，避免在反代下拼出错误的主机名。 */
-function shareUrl(share: ShareCreated) {
-    return share.url || `${window.location.origin}/s/${share.token}`;
+function shareUrl(share: { url?: string; token?: string }) {
+    return share.url || `${window.location.origin}/s/${share.token || ""}`;
 }
 
 function ShareRow({
@@ -178,14 +181,27 @@ function ShareRow({
     onRevoke: (share: ShareRecord) => void;
     onViewLogs: () => void;
 }) {
+    const copyText = useCopyText();
     const expired = Boolean(share.expiresAt && Date.parse(share.expiresAt) < Date.now());
     const dead = !share.enabled || expired;
     return (
         <div className="space-y-3 rounded-2xl border p-3" style={{ borderColor: theme.node.stroke, opacity: dead ? 0.6 : 1 }}>
             <div className="flex items-center justify-between gap-2">
-                <span className="truncate font-mono text-xs opacity-70">/s/{share.tokenPrefix}…</span>
+                {/* 能复制时就把完整链接摆出来，不再只给一截前缀——前缀本身对用户没有任何用处。 */}
+                <span className="min-w-0 flex-1 truncate font-mono text-xs opacity-70">{share.copyable ? shareUrl(share) : `/s/${share.tokenPrefix}…`}</span>
+                {share.copyable ? (
+                    <Tooltip title="复制完整链接">
+                        <Button size="small" type="text" aria-label="复制完整链接" icon={<Copy className="size-3.5" />} onClick={() => copyText(shareUrl(share), "已复制分享链接")} />
+                    </Tooltip>
+                ) : null}
                 {dead ? <Tag color="default">{expired ? "已过期" : "已停用"}</Tag> : <Tag color={share.role === "editor" ? "green" : "blue"}>{share.role === "editor" ? "可编辑" : "只读"}</Tag>}
             </div>
+            {/*
+             * 老链接建于「只存哈希」的年代，服务端手里也只有不可逆的哈希，没法再还原出完整链接。
+             * 这时候必须把原因说清楚：不解释的话，用户只会觉得「别的链接都能复制，就这条按钮不见了」，
+             * 然后反复刷新等它出现。给的出路也要具体——重建一条，而不是让他自己琢磨。
+             */}
+            {share.copyable ? null : <p className="!mb-0 text-[11px] opacity-55">这是早期创建的链接，服务端只留了不可逆的摘要，没法再还原出完整地址。需要发给别人的话，新建一条链接即可。</p>}
 
             <div className="grid grid-cols-2 gap-2 text-xs">
                 <label className="flex items-center justify-between gap-2">

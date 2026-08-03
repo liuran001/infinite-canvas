@@ -13,7 +13,14 @@ import { useServerStore } from "@/stores/use-server-store";
 
 export type ShareRole = "viewer" | "editor";
 
-/** 服务端只在创建那一次返回明文 token 与完整链接，之后列表里只有 tokenPrefix。 */
+/**
+ * 分享链接。所有者拿到的每一条都带 copyable：服务端额外存了一份明文 token，链接因此随时可复制，
+ * 不再是「只在创建那一次显示」。
+ *
+ * copyable 一定要按服务端给的这个布尔判，不能拿 token 是否为空串去猜：
+ * 「这条是旧记录、明文取不回来」和「这次请求出了别的岔子」在前端看来都是一个空字符串，
+ * 猜错的后果是把一条残缺链接渲染成可复制的样子，让用户复制了发出去。
+ */
 export type ShareRecord = {
     id: string;
     projectId: string;
@@ -22,6 +29,12 @@ export type ShareRecord = {
     allowClone: boolean;
     enabled: boolean;
     tokenPrefix: string;
+    /** 服务端手里还有没有这条链接的明文。存量记录建于「只存哈希」的年代，永远是 false。 */
+    copyable: boolean;
+    /** 只有 copyable 为真时才有；非所有者路径一律不下发。 */
+    token?: string;
+    /** 服务端按请求来源拼好的完整链接，反代下比前端自己拼主机名更准。 */
+    url?: string;
     expiresAt: string | null;
     createdAt: string;
     updatedAt: string;
