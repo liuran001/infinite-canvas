@@ -101,7 +101,11 @@ class Connection {
                     this.channels.delete(closedId);
                 },
             });
-            if (this.closed || selfClosed || !this.opening.delete(id)) return opened.close();
+            // 先取消占位再判：`||` 会短路，把 delete 写在条件里的话，
+            // 连接已关或频道自关这两条路径上占位永远删不掉——那个订阅 id 会被一条不存在的频道永久占住，
+            // 客户端拿同一个 id 重订只会一直收到「重复订阅」，而且每漏一个都在啃 32 个订阅的额度。
+            const wasOpening = this.opening.delete(id);
+            if (this.closed || selfClosed || !wasOpening) return opened.close();
             this.channels.set(id, opened);
         } catch (error) {
             this.opening.delete(id);
