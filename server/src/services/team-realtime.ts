@@ -14,8 +14,8 @@ import { EventEmitter } from "node:events";
 export type TeamMemberEvent = { type: "member.joined" | "member.left" | "member.removed" | "member.roleChanged" | "member.suspended"; teamId: string; userId: string; role: string };
 /** 余额事件只带最新余额，不带增量：跨进程丢过事件的客户端拿绝对值才能自己纠回来。 */
 export type TeamCreditsEvent = { type: "team.credits"; teamId: string; credits: number };
-/** 云空间上限变化。同样发绝对值，理由与余额一致；已用量前端自己再拉一次，它每次上传都在动，推它没有意义。 */
-export type TeamStorageEvent = { type: "team.storage"; teamId: string; quota: number };
+/** 云空间变化。与余额一样发绝对值：断线重连必然丢事件，增量会让界面上的数字永久偏掉。 */
+export type TeamStorageEvent = { type: "team.storage"; teamId: string; storageUsed: number; storageQuota: number };
 export type TeamRealtimeEvent = TeamMemberEvent | TeamCreditsEvent | TeamStorageEvent;
 
 const bus = new EventEmitter();
@@ -65,9 +65,13 @@ export function publishTeamCredits(teamId: string, credits: number) {
     bus.emit(channel(teamId), { type: "team.credits", teamId, credits } satisfies TeamCreditsEvent);
 }
 
-/** 平台管理员改了团队云空间上限。成员界面上的「已用 / 总量」得立刻跟上，否则他会一直照着旧上限估算。 */
-export function publishTeamStorage(teamId: string, quota: number) {
-    bus.emit(channel(teamId), { type: "team.storage", teamId, quota } satisfies TeamStorageEvent);
+/**
+ * 平台管理员改了团队云空间上限。成员界面上的「已用 / 总量」得立刻跟上，否则他会一直照着旧上限估算。
+ * 两个数一起发而不是只发上限：前端那一条进度条要两个数才画得出来，只给上限的话它还得自己再打一次请求，
+ * 而那次请求读到的用量与这次事件之间又隔着一个窗口。
+ */
+export function publishTeamStorage(teamId: string, storageUsed: number, storageQuota: number) {
+    bus.emit(channel(teamId), { type: "team.storage", teamId, storageUsed, storageQuota } satisfies TeamStorageEvent);
 }
 
 /**

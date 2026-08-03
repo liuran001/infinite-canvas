@@ -6,7 +6,7 @@ import { fail, newId, now } from "../lib/errors";
 import type { Query } from "../lib/response";
 import { nonNegativeInteger } from "../lib/validate";
 import { usedCreditsOfTeam } from "./billing";
-import { storageOfTeam } from "./quota";
+import { storageOfTeam, usedBytesOfTeam, usedBytesOfTeams } from "./quota";
 import { publicSettings } from "./settings";
 import { assertCanManageMember, canTeamAction, requireTeamRole } from "./team-access";
 import { closeTeamConnectionsOf, publishTeamMember } from "./team-realtime";
@@ -35,7 +35,12 @@ function normalizeName(value: unknown) {
     return normalizeTeamName(value);
 }
 
-export function teamView(team: Team, role: TeamRole) {
+/**
+ * 团队视图。用量随视图一起给出，省掉前端为了画一条「已用 / 总量」再打一次请求；
+ * 调用方必须自己把已经聚合好的用量传进来——放在这里现查的话，团队列表就成了 N+1，
+ * 而列表恰好是最常打开的那个页面。
+ */
+export function teamView(team: Team, role: TeamRole, storageUsed = 0) {
     return {
         id: team.id,
         name: team.name,
@@ -43,6 +48,7 @@ export function teamView(team: Team, role: TeamRole) {
         avatarUrl: team.avatarUrl || "",
         ownerId: team.ownerId,
         credits: team.credits,
+        storageUsed,
         // bigint 在部分方言下读出来是字符串，统一转数字，否则前端会拿到 "104857600" 做加减。
         storageQuota: Number(team.storageQuota),
         memberLimit: team.memberLimit,
@@ -114,15 +120,17 @@ export async function listMyTeams(userId: string) {
         where: { id: In(members.map((member) => member.teamId)) },
     });
     const byId = new Map(teams.map((team) => [team.id, team]));
-    return members
+    const rows = members
         .map((member) => ({ member, team: byId.get(member.teamId) }))
-        .filter((row): row is { member: TeamMember; team: Team } => Boolean(row.team) && row.team!.status !== "disbanded")
-        .map((row) => teamView(row.team, row.member.role));
+        .filter((row): row is { member: TeamMember; team: Team } => Boolean(row.team) && row.team!.status !== "disbanded");
+    // 一次 GROUP BY 拿齐所有团队的用量：逐个团队各查一次是 N+1，而这是最常打开的页面。
+    const used = await usedBytesOfTeams(rows.map((row) => row.team.id));
+    return rows.map((row) => teamView(row.team, row.member.role, used.get(row.team.id) || 0));
 }
 
 export async function getTeam(userId: string, teamId: string) {
     const { team, role } = await requireTeamRole(userId, teamId, "team.read");
-    return teamView(team, role);
+    return teamView(team, role, await usedBytesOfTeam(teamId));
 }
 
 /** 团队云空间用量。与个人的 /v1/storage 同形，已用量按文件对象实时聚合，任何成员都能看。 */
@@ -140,7 +148,7 @@ export async function updateTeam(teamId: string, actorId: string, input: TeamInp
         updatedAt: now(),
     };
     await repo(Team).update({ id: teamId }, next);
-    return teamView({ ...team, ...next }, role);
+    return teamView({ ...team, ...next }, role, await usedBytesOfTeam(teamId));
 }
 
 export async function listMembers(userId: string, teamId: string) {

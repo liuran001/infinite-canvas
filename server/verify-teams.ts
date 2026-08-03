@@ -1110,7 +1110,7 @@ async function teamStorageQuota({ check, rejects }: { check: (name: string, actu
     const { repo } = await import("./src/db/data-source");
     const { Project, StoredFile, Team, User } = await import("./src/db/entities");
     const { adminUpdateTeam } = await import("./src/services/admin-teams");
-    const { createTeam, disbandTeam, teamStorage } = await import("./src/services/teams");
+    const { createTeam, disbandTeam, getTeam, listMyTeams, teamStorage } = await import("./src/services/teams");
     const { saveFile } = await import("./src/services/files");
     const { storageOf, usedBytes, usedBytesOfTeam } = await import("./src/services/quota");
     const { publicSettings, saveSettings } = await import("./src/services/settings");
@@ -1149,7 +1149,14 @@ async function teamStorageQuota({ check, rejects }: { check: (name: string, actu
     // 上限用尽后团队上传被拒，但同一个人的个人空间还富余，个人上传照样能过——两本账互不担保。
     const otherPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
     await repo(Team).update({ id: team.id }, { storageQuota: png.length });
-    await rejects("团队空间不足时拒绝上传", () => saveFile("user-fs-owner", otherPng, "image/png", {}, team.id));
+    // 错误码必须与个人分开：前端据此决定是引导用户清个人文件，还是提示他找管理员加团队额度。
+    const denied = await saveFile("user-fs-owner", otherPng, "image/png", {}, team.id).then(() => null, (error: { code?: string; message?: string }) => error);
+    check("团队空间不足报 TEAM_QUOTA_EXCEEDED", denied?.code, "TEAM_QUOTA_EXCEEDED");
+    check("团队空间不足的文案带团队字样", denied?.message?.startsWith("团队云空间不足："), true);
+    await users.update({ id: "user-fs-mate" }, { storageQuota: 1 });
+    const deniedPersonal = await saveFile("user-fs-mate", otherPng, "image/png").then(() => null, (error: { code?: string }) => error);
+    check("个人空间不足仍报 QUOTA_EXCEEDED", deniedPersonal?.code, "QUOTA_EXCEEDED");
+    await users.update({ id: "user-fs-mate" }, { storageQuota: 1 << 20 });
     check("被拒的团队上传没有留下记录", await repo(StoredFile).countBy({ teamId: team.id, checksum: "" }), 0);
     check("团队空间不足不影响个人上传", (await saveFile("user-fs-owner", otherPng, "image/png")).teamId, "");
     await repo(Team).update({ id: team.id }, { storageQuota: 1 << 20 });
@@ -1169,7 +1176,11 @@ async function teamStorageQuota({ check, rejects }: { check: (name: string, actu
     await adminUpdateTeam(team.id, { storageQuota: 6 << 20 });
     await adminUpdateTeam(team.id, { storageQuota: 6 << 20 });
     unsubscribe();
-    check("配额变化会广播", events, [{ type: "team.storage", teamId: team.id, quota: 6 << 20 }]);
+    check("配额变化会广播", events, [{ type: "team.storage", teamId: team.id, storageUsed: png.length, storageQuota: 6 << 20 }]);
+    // 视图上的用量与 /storage 读到的必须是同一个数：两处各算一套的话，界面上会出现两个都自称权威的数字。
+    const view = await getTeam("user-fs-owner", team.id);
+    check("团队视图带出用量与上限", [view.storageUsed, view.storageQuota], [png.length, 6 << 20]);
+    check("团队列表里的用量与详情一致", (await listMyTeams("user-fs-owner")).find((row) => row.id === team.id)?.storageUsed, png.length);
 
     // 改系统默认值只影响之后新建的团队，已有团队一个字节都不动。
     await saveSettings({ public: { team: { defaultQuota: 7 << 20 } } } as never);

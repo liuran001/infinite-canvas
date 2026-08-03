@@ -1,6 +1,6 @@
 import { repo } from "../db/data-source";
 import { DEFAULT_STORAGE_QUOTA, DEFAULT_TEAM_STORAGE_QUOTA, StoredFile, Team, User } from "../db/entities";
-import { fail, QUOTA_EXCEEDED } from "../lib/errors";
+import { fail, QUOTA_EXCEEDED, TEAM_QUOTA_EXCEEDED } from "../lib/errors";
 
 /**
  * 云空间的归属方。个人与团队是两本完全独立的账：同一份内容分别挂在个人和团队名下时，
@@ -84,10 +84,15 @@ function mb(bytes: number) {
     return `${(bytes / (1 << 20)).toFixed(1)}MB`;
 }
 
-/** 写入新文件前校验，命中去重的上传不会走到这里，因此不占新增空间。 */
+/**
+ * 写入新文件前校验，命中去重的上传不会走到这里，因此不占新增空间。
+ *
+ * 个人与团队用两个错误码、两套文案：都回「云空间不足 / QUOTA_EXCEEDED」的话，
+ * 成员在团队画布里传图被拒时只会去清自己的个人文件，越清越困惑——而该加额度的是团队。
+ */
 export async function assertQuota(owner: StorageOwner, incomingBytes: number) {
     const { used, quota } = await storageOfOwner(owner);
-    // 文案区分个人与团队：都写「云空间不足」的话，成员在团队画布里传图被拒时会去清自己的个人文件，越清越困惑。
-    const scope = owner.kind === "team" ? "团队云空间" : "云空间";
-    if (used + incomingBytes > quota) throw fail(`${scope}不足：已用 ${mb(used)} / ${mb(quota)}，本次需要 ${mb(incomingBytes)}`, 403, QUOTA_EXCEEDED);
+    const team = owner.kind === "team";
+    const scope = team ? "团队云空间" : "云空间";
+    if (used + incomingBytes > quota) throw fail(`${scope}不足：已用 ${mb(used)} / ${mb(quota)}，本次需要 ${mb(incomingBytes)}`, 403, team ? TEAM_QUOTA_EXCEEDED : QUOTA_EXCEEDED);
 }

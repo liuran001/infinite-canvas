@@ -3,6 +3,7 @@ import { Router } from "express";
 import { handle, ok, parseQuery } from "../lib/response";
 import { createBufferedWriter, sseWriter } from "../lib/sse";
 import { requireUser, userAuth } from "../middleware/auth";
+import { storageOfTeam } from "../services/quota";
 import { requireTeamRole } from "../services/team-access";
 import { acceptTeamInvite, createTeamInvite, deleteTeamInvite, listTeamInvites, previewTeamInvite, updateTeamInvite } from "../services/team-invites";
 import { subscribeTeam, type TeamRealtimeEvent } from "../services/team-realtime";
@@ -107,8 +108,10 @@ teamRouter.get(
         const unsubscribe = subscribeTeam(teamId, userId, (event: TeamRealtimeEvent) => stream.push(event), () => res.end());
         let team;
         let role;
+        let storage;
         try {
             ({ team, role } = await requireTeamRole(userId, teamId, "team.read"));
+            storage = await storageOfTeam(teamId);
         } catch (error) {
             unsubscribe();
             throw error;
@@ -123,7 +126,9 @@ teamRouter.get(
         // 被移除或降级时由服务层调 closeTeamConnectionsOf 关掉这条连接，同时退订总线 listener。
         // 写入统一走 sseWriter：连接可能在 flush 补发的中途就被关掉，结束后再写会抛错并截断剩余事件。
         sink = sseWriter(res);
-        stream.flush({ type: "ready", teamId, role, credits: team.credits });
+        // ready 里带上云空间：不带的话首屏那条进度条要等到下一次配额变化才画得出来，
+        // 而配额可能几个月都不动一次。与 credits 同一个理由。
+        stream.flush({ type: "ready", teamId, role, credits: team.credits, storageUsed: storage.used, storageQuota: storage.quota });
         // keepalive 同理。它抛在定时器里，没有任何调用栈接得住，会直接掀翻整个进程。
         const keepAlive = setInterval(() => {
             if (res.writableEnded) return clearInterval(keepAlive);

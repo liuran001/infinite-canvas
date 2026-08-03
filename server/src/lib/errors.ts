@@ -26,6 +26,8 @@ export const SHARE_READ_ONLY = "SHARE_READ_ONLY";
 export const CLONE_DISABLED = "CLONE_DISABLED";
 export const RATE_LIMITED = "RATE_LIMITED";
 export const QUOTA_EXCEEDED = "QUOTA_EXCEEDED";
+/** 团队云空间不足。与个人分开一个码：两者是两本独立的账，前端要据此决定是引导清个人文件还是找管理员加团队额度。 */
+export const TEAM_QUOTA_EXCEEDED = "TEAM_QUOTA_EXCEEDED";
 export const FORBIDDEN = "FORBIDDEN";
 export const NOT_FOUND = "NOT_FOUND";
 

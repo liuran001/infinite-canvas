@@ -77,7 +77,7 @@ export async function adminUpdateTeam(teamId: string, patch: { status?: unknown;
     };
     await repo(Team).update({ id: teamId }, next);
     // 上限变了才广播：没变也发的话，每次改个团队名都会让所有成员的界面闪一下配额。
-    if (next.storageQuota !== Number(team.storageQuota)) publishTeamStorage(teamId, next.storageQuota);
+    if (next.storageQuota !== Number(team.storageQuota)) publishTeamStorage(teamId, await usedBytesOfTeam(teamId), next.storageQuota);
     return { ...team, ...next };
 }
 
