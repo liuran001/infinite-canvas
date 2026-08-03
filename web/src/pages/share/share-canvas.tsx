@@ -432,6 +432,7 @@ export default function ShareCanvasPage() {
                      * 平移与缩放仍然作用在外层容器上，照常可用。
                      */}
                     <div style={{ pointerEvents: editable ? undefined : "none" }}>
+                        {/* 缩放起止在这里是空实现：那对回调只用来临时藏掉跟随节点的浮层工具条，而分享页没有工具条。 */}
                         {visibleNodes.map((node) => (
                             <CanvasNode
                                 key={node.id}
@@ -451,7 +452,9 @@ export default function ShareCanvasPage() {
                                 onHoverStart={() => undefined}
                                 onHoverEnd={() => undefined}
                                 onConnectStart={() => undefined}
+                                onResizeStart={() => undefined}
                                 onResize={handleNodeResize}
+                                onResizeEnd={() => undefined}
                                 onContentChange={handleContentChange}
                                 onTitleChange={handleTitleChange}
                                 onContextMenu={(event) => event.preventDefault()}

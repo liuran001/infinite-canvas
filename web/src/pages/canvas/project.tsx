@@ -47,6 +47,7 @@ import { finishApplyingRemoteProject, onRemoteProjectApplied, useCanvasStore } f
 import { pullProject } from "@/services/remote-sync";
 import { createPresenceReporter, watchProject } from "@/services/project-realtime";
 import { useProjectPresenceStore } from "@/stores/use-project-presence-store";
+import type { ServerProjectPresence } from "@/services/api/server";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
@@ -126,6 +127,12 @@ const VIDEO_NODE_MAX_WIDTH = 420;
 const VIDEO_NODE_MAX_HEIGHT = 420;
 // 稳定的空引用数组:避免每次渲染 `... || []` 产生新数组引用而击穿 CanvasNode 的 React.memo
 const EMPTY_REFERENCES: CanvasResourceReference[] = [];
+/**
+ * 同理，但这一个是 zustand selector 的返回值，后果比掉 memo 严重得多：
+ * selector 就是 useSyncExternalStore 的 getSnapshot，每次返回新的 `[]` 会让 React 认为快照一直在变，
+ * 于是无限重渲染并抛「Maximum update depth exceeded」——协作状态还没绑上的那一瞬间画布就白屏了。
+ */
+const EMPTY_PRESENCE: ServerProjectPresence[] = [];
 const CONNECTION_HANDLE_HIT_RADIUS = 40;
 const CONNECTION_NODE_HIT_PADDING = 32;
 const NODE_STATUS_IDLE = "idle" as const;
@@ -212,7 +219,7 @@ function InfiniteCanvasPage() {
     const isServerModeReady = useIsServerMode();
     const serverToken = useServerStore((state) => state.token);
     const cloudAgentEnabled = useServerStore((state) => Boolean(state.settings?.agent.enabled));
-    const remotePresence = useProjectPresenceStore((state) => (state.projectId === projectId ? state.members : []));
+    const remotePresence = useProjectPresenceStore((state) => (state.projectId === projectId ? state.members : EMPTY_PRESENCE));
     const appliedCanvasReloadRef = useRef(0);
     const canvasReloadRetryRef = useRef(0);
     const theme = canvasThemes[useThemeStore((state) => state.theme)];

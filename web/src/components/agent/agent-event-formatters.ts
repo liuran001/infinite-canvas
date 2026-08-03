@@ -439,7 +439,12 @@ export function routeName(path: string) {
     return path;
 }
 
-export function workingActivity(item?: AgentChatItem) {
+/**
+ * 返回类型显式写出 `detail`：调用方会把它和带 detail 的 bootstrapStatus union 起来，
+ * 再用 `"detail" in working` 取值。不标注的话推断出的类型里没有这个属性，
+ * `in` 收窄只能把它当成 unknown，传给只收 string 的 props 就编译不过。
+ */
+export function workingActivity(item?: AgentChatItem): { key: string; text: string; detail?: string } {
     const status = String(objectField(item?.detail, "status") || "");
     const output = stringText(objectField(item?.detail, "output"));
     const key = `${item?.id || "waiting"}-${status}-${item?.text || ""}-${output.length}`;
