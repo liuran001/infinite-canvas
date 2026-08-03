@@ -11,6 +11,7 @@ import AdminGenerationsPage from "@/pages/admin/generations";
 import AdminInvitesPage from "@/pages/admin/invites";
 import AdminPromptsPage from "@/pages/admin/prompts";
 import AdminSettingsPage from "@/pages/admin/settings";
+import AdminTeamsPage from "@/pages/admin/teams";
 import AdminUsersPage from "@/pages/admin/users";
 import AssetsPage from "@/pages/assets";
 import CanvasPage from "@/pages/canvas";
@@ -100,6 +101,7 @@ export const router = createBrowserRouter([
             { index: true, element: <AdminUsersPage /> },
             { path: "users", element: <AdminUsersPage /> },
             { path: "invites", element: <AdminInvitesPage /> },
+            { path: "teams", element: <AdminTeamsPage /> },
             { path: "credit-logs", element: <AdminCreditLogsPage /> },
             { path: "generations", element: <AdminGenerationsPage /> },
             { path: "contents", element: <AdminContentsPage /> },

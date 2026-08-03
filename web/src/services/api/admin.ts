@@ -126,6 +126,27 @@ export type AdminAsset = {
     updatedAt: string;
 };
 
+/**
+ * 平台后台视角的团队。与团队前台的 Team 刻意不共用类型：那边有 myRole（「我在这个团队里的角色」），
+ * 而平台管理员一个团队都不在，借用过来就得给他编一个角色出来，编出来的角色迟早会被别处当成真的成员身份。
+ * storageUsed 由服务端按文件对象实时聚合，storageQuota 是这个团队的上限，都是字节。
+ */
+export type AdminTeam = {
+    id: string;
+    name: string;
+    description: string;
+    avatarUrl: string;
+    ownerId: string;
+    credits: number;
+    storageQuota: number;
+    storageUsed: number;
+    memberLimit: number;
+    memberCount: number;
+    status: "active" | "disabled" | "disbanded";
+    createdAt: string;
+    updatedAt: string;
+};
+
 export type AdminQuery = { keyword?: string; category?: string; type?: string; tag?: string[]; page?: number; pageSize?: number };
 
 /** 内容审查列表的额外筛选项，`search()` 会一并拼进查询串。 */
@@ -237,4 +258,14 @@ export const adminApi = {
         serverRequest<AdminInvite>(`/admin/invites/${encodeURIComponent(code)}`, { method: "PATCH", body: JSON.stringify(patch) }, "保存邀请码失败"),
     deleteInvite: (code: string) => serverRequest<boolean>(`/admin/invites/${encodeURIComponent(code)}`, remove, "删除邀请码失败"),
     inviteUses: (code: string) => serverRequest<{ items: AdminInviteUse[]; total: number }>(`/admin/invites/${encodeURIComponent(code)}/uses`, {}, "读取邀请码使用记录失败"),
+
+    teams: (query: AdminQuery) => serverRequest<{ items: AdminTeam[]; total: number }>(`/admin/teams${search(query)}`, {}, "读取团队列表失败"),
+    setTeamCredits: (id: string, credits: number, remark = "") => serverRequest<unknown>(`/admin/teams/${id}/credits`, post({ credits, remark }), "调整团队积分失败"),
+    /**
+     * 单团队配额。走 PATCH /admin/teams/:id 而不是像用户那样一个独立的 /quota 端点：
+     * 服务端把配额和成员上限、状态放在同一个 patch 里校验，独立端点会多出一条绕过那套校验的路径。
+     * 单位是字节，传绝对值。
+     */
+    setTeamQuota: (id: string, storageQuota: number) => serverRequest<AdminTeam>(`/admin/teams/${id}`, { method: "PATCH", body: JSON.stringify({ storageQuota }) }, "调整团队云空间配额失败"),
+    updateTeam: (id: string, patch: { status?: string; memberLimit?: number; name?: string }) => serverRequest<AdminTeam>(`/admin/teams/${id}`, { method: "PATCH", body: JSON.stringify(patch) }, "保存团队失败"),
 };
