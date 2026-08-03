@@ -44,6 +44,7 @@ async function main() {
     const { initDatabase, repo } = await import("./src/db/data-source");
     const { Project, ProjectShare, User } = await import("./src/db/entities");
     const { attachRealtime } = await import("./src/services/realtime-hub");
+    const protocol = await import("./src/lib/realtime-protocol");
     const { consumeTicket, issueTicket, resetRealtimeTickets } = await import("./src/services/realtime-tickets");
     const { createApp } = await import("./src/app");
     const { createShare, guestSessionOf, signGuestToken } = await import("./src/services/project-share");
@@ -128,6 +129,64 @@ async function main() {
     });
     live.send(Buffer.alloc(64 * 1024 + 1));
     check("超过 64KiB 的帧被 1009 关闭", await closed, 1009);
+
+    console.log("协议帧解析");
+    const { MAX_FRAME_BYTES, MAX_SEND_BUFFER_BYTES, MAX_SUBSCRIPTIONS, PRESENCE_MIN_INTERVAL_MS, parseClientFrame } = protocol;
+    const parse = (raw: string | Buffer) => parseClientFrame(raw);
+    const failureOf = (raw: string | Buffer) => {
+        const result = parse(raw);
+        return result.ok ? "解析成功" : result.code;
+    };
+    const frame = (extra: Record<string, unknown>) => JSON.stringify({ v: 1, ...extra });
+
+    check("硬限制取自协议模块", [MAX_FRAME_BYTES, MAX_SUBSCRIPTIONS, MAX_SEND_BUFFER_BYTES, PRESENCE_MIN_INTERVAL_MS], [65_536, 32, 4_194_304, 200]);
+
+    check("非法 JSON 被拒", failureOf("{not json"), "INVALID_FRAME");
+    check("空帧被拒", failureOf(""), "INVALID_FRAME");
+    check("顶层数组被拒", failureOf("[]"), "INVALID_FRAME");
+    check("顶层 null 被拒", failureOf("null"), "INVALID_FRAME");
+    check("顶层字符串被拒", failureOf('"subscribe"'), "INVALID_FRAME");
+    // 版本先于 type 判定：老客户端发来的未知 type 应报「版本不支持」，否则升级提示会指错方向。
+    check("v 缺失被拒", failureOf(JSON.stringify({ type: "subscribe", id: "s1", channel: "project:p1" })), "UNSUPPORTED_VERSION");
+    check("v=2 被拒", failureOf(JSON.stringify({ v: 2, type: "subscribe", id: "s1", channel: "project:p1" })), "UNSUPPORTED_VERSION");
+    check('v="1" 字符串被拒', failureOf(JSON.stringify({ v: "1", type: "subscribe", id: "s1", channel: "project:p1" })), "UNSUPPORTED_VERSION");
+    check("未知 type 被拒", failureOf(frame({ type: "shutdown", id: "s1" })), "UNKNOWN_TYPE");
+    check("服务端 type 不能由客户端发来", failureOf(frame({ type: "event", id: "s1", channel: "project:p1" })), "UNKNOWN_TYPE");
+    check("type 非字符串被拒", failureOf(frame({ type: 1, id: "s1" })), "UNKNOWN_TYPE");
+    check("缺 id 被拒", failureOf(frame({ type: "subscribe", channel: "project:p1" })), "INVALID_SUBSCRIPTION");
+    check("id 非字符串被拒", failureOf(frame({ type: "subscribe", id: 1, channel: "project:p1" })), "INVALID_SUBSCRIPTION");
+    check("id 含非法字符被拒", failureOf(frame({ type: "subscribe", id: "s 1", channel: "project:p1" })), "INVALID_SUBSCRIPTION");
+    check("超长 id 被拒", failureOf(frame({ type: "subscribe", id: "s".repeat(129), channel: "project:p1" })), "INVALID_SUBSCRIPTION");
+    check("subscribe 缺 channel 被拒", failureOf(frame({ type: "subscribe", id: "s1" })), "INVALID_SUBSCRIPTION");
+    check("channel 含非法字符被拒", failureOf(frame({ type: "subscribe", id: "s1", channel: "project/p1" })), "INVALID_SUBSCRIPTION");
+    check("超长 channel 被拒", failureOf(frame({ type: "subscribe", id: "s1", channel: "c".repeat(129) })), "INVALID_SUBSCRIPTION");
+    check("presence.update 缺 id 被拒", failureOf(frame({ type: "presence.update", payload: {} })), "INVALID_SUBSCRIPTION");
+    check("unsubscribe 缺 id 被拒", failureOf(frame({ type: "unsubscribe" })), "INVALID_SUBSCRIPTION");
+
+    // 大小按 UTF-8 字节数而不是字符串长度：一个中文字符 3 字节，按 length 判会放进三倍大的帧。
+    const padding = (bytes: number) => "x".repeat(bytes);
+    const overhead = frame({ type: "presence.update", id: "s1", payload: { note: "" } }).length;
+    check("恰好 64KiB 的帧被接受", parse(frame({ type: "presence.update", id: "s1", payload: { note: padding(MAX_FRAME_BYTES - overhead) } })).ok, true);
+    check("超过 64KiB 的帧被拒", failureOf(frame({ type: "presence.update", id: "s1", payload: { note: padding(MAX_FRAME_BYTES - overhead + 1) } })), "FRAME_TOO_LARGE");
+    const wide = JSON.stringify({ v: 1, type: "presence.update", id: "s1", payload: { note: "中".repeat(30_000) } });
+    check("多字节帧按字节数而不是字符数判定", [wide.length <= MAX_FRAME_BYTES, failureOf(wide)], [true, "FRAME_TOO_LARGE"]);
+    check("Buffer 入参同样受大小限制", failureOf(Buffer.alloc(MAX_FRAME_BYTES + 1, 0x20)), "FRAME_TOO_LARGE");
+    // 超大帧不能先 JSON.parse 再判长度：那样一个 100MB 的帧已经把内存吃掉了才被拒。
+    check("超大帧先于 JSON 解析被拒", failureOf("{not json".padEnd(MAX_FRAME_BYTES + 1, " ")), "FRAME_TOO_LARGE");
+
+    check("嵌套过深的 payload 被拒", failureOf(frame({ type: "presence.update", id: "s1", payload: JSON.parse("[".repeat(40) + "1" + "]".repeat(40)) })), "INVALID_FRAME");
+    check("__proto__ 键被拒", failureOf('{"v":1,"type":"presence.update","id":"s1","payload":{"__proto__":{"admin":true}}}'), "INVALID_FRAME");
+    check("constructor 键被拒", failureOf('{"v":1,"type":"presence.update","id":"s1","payload":{"constructor":{"x":1}}}'), "INVALID_FRAME");
+    check("原型没有被污染", ({} as Record<string, unknown>).admin, undefined);
+
+    const subscribed = parse(frame({ type: "subscribe", id: "sub-1", channel: "project:p1", payload: { sinceRevision: 7 } }));
+    check("合法 subscribe 解析出字段", subscribed.ok && [subscribed.frame.type, subscribed.frame.id, subscribed.frame.channel, subscribed.frame.payload], ["subscribe", "sub-1", "project:p1", { sinceRevision: 7 }]);
+    const unsubscribed2 = parse(frame({ type: "unsubscribe", id: "sub-1" }));
+    check("合法 unsubscribe 解析出字段", unsubscribed2.ok && [unsubscribed2.frame.type, unsubscribed2.frame.id], ["unsubscribe", "sub-1"]);
+    const presence = parse(frame({ type: "presence.update", id: "sub-1", payload: { clientId: "c1", nodes: ["n1"], active: true } }));
+    check("合法 presence.update 解析出字段", presence.ok && [presence.frame.type, presence.frame.id, presence.frame.payload], ["presence.update", "sub-1", { clientId: "c1", nodes: ["n1"], active: true }]);
+    check("unsubscribe 不要求 channel", unsubscribed2.ok, true);
+    check("缺省 payload 解析为 undefined", unsubscribed2.ok && "payload" in unsubscribed2.frame && unsubscribed2.frame.payload === undefined, true);
 
     live.terminate();
     server.closeAllConnections();
