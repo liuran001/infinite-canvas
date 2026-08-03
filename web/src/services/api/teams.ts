@@ -15,6 +15,12 @@ export type Team = {
     avatarUrl: string;
     ownerId: string;
     credits: number;
+    /**
+     * 团队云空间，单位字节。团队画布上传的文件计进这里，不动成员的个人配额——
+     * 反过来也一样，所以界面上这两个数字必须分开显示，混在一起用户会以为自己的空间被队友吃掉了。
+     */
+    storageUsed: number;
+    storageQuota: number;
     memberLimit: number;
     status: TeamStatus;
     myRole: TeamRole;

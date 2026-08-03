@@ -6,10 +6,11 @@ import { decodeSseFrames, parseSseJson } from "@/services/sse-frames";
 import { useServerStore } from "@/stores/use-server-store";
 import { useTeamStore } from "@/stores/use-team-store";
 
-/** 服务端 teams.ts 的 /v1/teams/:id/realtime 推的事件；ready 一定是第一条，带着当时的角色与余额。 */
+/** 服务端 teams.ts 的 /v1/teams/:id/realtime 推的事件；ready 一定是第一条，带着当时的角色、余额与云空间。 */
 export type TeamRealtimeEvent =
-    | { type: "ready"; teamId: string; role: TeamRole; credits: number }
+    | { type: "ready"; teamId: string; role: TeamRole; credits: number; storageUsed: number; storageQuota: number }
     | { type: "team.credits"; teamId: string; credits: number }
+    | { type: "team.storage"; teamId: string; storageUsed: number; storageQuota: number }
     | { type: "member.joined" | "member.left" | "member.removed" | "member.roleChanged" | "member.suspended"; teamId: string; userId: string; role: TeamRole };
 
 /** 重连退避。前几次快，后面拉开，避免服务端刚重启就被一群客户端打满。 */
@@ -119,6 +120,9 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
         try {
             const team = await teamApi.team(teamId);
             store().setCredits(teamId, team.credits);
+            // 云空间也要跟着轮：漏掉它的话，降级之后余额每 30 秒动一次而用量永远停在进页面时的值，
+            // 用户照着那个偏小的数字继续传，直到某一次上传突然失败才知道其实早就满了。
+            store().setStorage(teamId, team.storageUsed, team.storageQuota);
             store().setMyRole(teamId, team.myRole);
         } catch (error) {
             // 已经卸载/切走就什么都别写：这一轮请求是切走之前发出去的，它的失败只属于上一支队伍。
@@ -152,10 +156,13 @@ export function watchTeam(teamId: string, signal: AbortSignal) {
                             failure = 0;
                             clearPolling();
                             store().setCredits(teamId, event.credits);
+                            store().setStorage(teamId, event.storageUsed, event.storageQuota);
                             store().setMyRole(teamId, event.role);
                             store().setRealtimeStatus(teamId, "ready");
                         } else if (event.type === "team.credits") {
                             store().setCredits(teamId, event.credits);
+                        } else if (event.type === "team.storage") {
+                            store().setStorage(teamId, event.storageUsed, event.storageQuota);
                         }
                     },
                     signal,
@@ -201,6 +208,46 @@ export function isTeamCreditsExhausted(error: unknown) {
 
 /** 同一时刻只弹一个：一次批量生成会有好几张图同时失败，不去重就是连开十个一模一样的弹窗。 */
 let exhaustedModalOpen = false;
+
+/** 服务端 quota.ts 里团队云空间不足时的错误码，与个人的 QUOTA_EXCEEDED 分开。 */
+export const TEAM_QUOTA_EXCEEDED = "TEAM_QUOTA_EXCEEDED";
+/**
+ * 服务端对应的中文文案。和积分那条一样，异步任务的失败原因只以字符串落在任务行的 error 上，
+ * 错误码到不了前端，只能按文案认；同步调用仍然优先按错误码判。
+ */
+const TEAM_QUOTA_EXCEEDED_TEXT = "团队云空间不足";
+
+export function isTeamQuotaExceeded(error: unknown) {
+    if (error && typeof error === "object" && (error as { code?: unknown }).code === TEAM_QUOTA_EXCEEDED) return true;
+    const text = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+    return text.includes(TEAM_QUOTA_EXCEEDED_TEXT);
+}
+
+/** 和积分那个开关分开：两种失败可能在同一批任务里同时发生，共用一个开关会让后弹的那条被永久吞掉。 */
+let quotaModalOpen = false;
+
+/**
+ * 团队云空间不足时的提示。刻意和个人空间的提示分开：两者是两本独立的账，
+ * 说成「你的云空间不足」的话，用户会跑去删自己的画布，删完发现一点用都没有——
+ * 占满的是团队的空间，而清理它需要的是团队里有权限的人，或者管理员调大团队配额。
+ */
+export function notifyTeamQuotaExceeded(error: unknown) {
+    if (!isTeamQuotaExceeded(error) || quotaModalOpen) return false;
+    quotaModalOpen = true;
+    Modal.confirm({
+        title: "团队云空间已满",
+        content: "这次上传没有成功。占满的是团队的云空间，不是你个人的——删你自己的个人画布不会腾出空间。可以去团队里清理不再需要的画布与素材，或请平台管理员调大这个团队的配额。",
+        okText: "去团队页看看",
+        cancelText: "知道了",
+        afterClose: () => {
+            quotaModalOpen = false;
+        },
+        onOk: () => {
+            void import("@/router").then((module) => module.router.navigate("/teams"));
+        },
+    });
+    return true;
+}
 
 /**
  * 团队积分用尽时的提示。刻意给两个出口而不是一句「余额不足」：

@@ -4,7 +4,7 @@ import { create } from "zustand";
 import { buildDraftReference, expandDraftReferences, type CloudAgentDraftReference } from "@/components/agent/cloud-agent-references";
 import { serverAgentStream, serverApi, type ServerAgentEvent, type ServerAgentMessage, type ServerAgentPendingAction, type ServerAgentSession, type ServerAgentSessionStatus } from "@/services/api/server";
 import { serverFileIdOf, uploadImage } from "@/services/image-storage";
-import { notifyTeamCreditsExhausted } from "@/services/team-realtime";
+import { notifyTeamCreditsExhausted, notifyTeamQuotaExceeded } from "@/services/team-realtime";
 import { resolveAgentModel, useConfigStore } from "@/stores/use-config-store";
 import { isServerMode, useServerStore } from "@/stores/use-server-store";
 import type { CanvasNodeData } from "@/types/canvas";
@@ -355,6 +355,8 @@ export const useCloudAgentStore = create<CloudAgentStore>((set, get) => {
             } catch (error) {
                 // 团队积分被扣光时光把红字塞进面板没用：用户既不能自己充值，也不知道还有回落这条路。
                 notifyTeamCreditsExhausted(error);
+                // 团队云空间满同理：面板里一句红字会让用户跑去删自己的个人画布，而占满的根本不是他那本账。
+                notifyTeamQuotaExceeded(error);
                 // 发送失败把草稿、引用和图片都还回输入框，用户可以直接重发；幂等键留着复用。
                 set((state) => ({ sending: false, error: errorText(error), prompt: state.prompt || draft, draftReferences: state.draftReferences.length ? state.draftReferences : draftReferences, attachments: state.attachments.length ? state.attachments : attachments }));
             }

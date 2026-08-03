@@ -1,4 +1,4 @@
-import { notifyTeamCreditsExhausted } from "@/services/team-realtime";
+import { notifyTeamCreditsExhausted, notifyTeamQuotaExceeded } from "@/services/team-realtime";
 import { serverApi, serverJobStream, type ServerJob, type ServerJobEvent, type ServerJobStatus } from "./server";
 
 /**
@@ -97,7 +97,12 @@ function applyJob(waiter: Waiter, job: ServerJob) {
     if (job.text.length > waiter.text.length) applyText(waiter, 0, job.text);
     // 团队积分被扣光是所有生成路径的共同结局，弹窗挂在这里而不是各个页面：
     // 画布、生图、视频、Agent 都从这条流拿终态，写在页面里就得复制四份，漏一处那条路径就只剩一句干巴巴的红字。
-    if (job.status === "failed") notifyTeamCreditsExhausted(job.error);
+    if (job.status === "failed") {
+        notifyTeamCreditsExhausted(job.error);
+        // 生成结果要写回云空间，团队画布写的是团队那本账。和积分同样挂在这条汇聚点上，
+        // 否则画布、生图、视频、Agent 四条路径各自只会显示一句「上传失败」，用户完全不知道该去清理谁的空间。
+        notifyTeamQuotaExceeded(job.error);
+    }
     if (FINISHED.includes(job.status)) settle(waiter, job);
 }
 

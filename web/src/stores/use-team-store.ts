@@ -14,6 +14,13 @@ type TeamState = {
     currentTeamId: string;
     /** 当前团队池余额。SSE 的 team.credits 与轮询都写这里，界面只读它，两条来源不会各显示一个数。 */
     credits: number;
+    /**
+     * 当前团队的云空间用量与上限（字节）。团队画布的文件只计进这里，个人画布走个人配额，两本账互不相干。
+     * 与余额同源同管道：队友刚传完一张图，别人页面上的用量就该跟着动，否则用户会照着一个偏小的数字继续传，
+     * 直到某一次上传突然失败才知道其实早就满了。
+     */
+    storageUsed: number;
+    storageQuota: number;
     myRole: TeamRole | "";
     realtimeStatus: TeamRealtimeStatus;
     /** 终态的原因，直接显示给用户。 */
@@ -28,6 +35,11 @@ type TeamState = {
     /** REST 快照。只在实时还没接管时填充，接管之后一律不覆盖。 */
     applyTeamSnapshot: (team: Team) => void;
     setCredits: (teamId: string, credits: number) => void;
+    /**
+     * 云空间用量。和 setCredits 一样按 teamId 挡迟到事件：切队之后 A 队推来的用量写进 B 队页面，
+     * 用户看到的是一个完全不属于这个团队的数字，而且没有任何迹象表明它是错的。
+     */
+    setStorage: (teamId: string, used: number, quota: number) => void;
     setMyRole: (teamId: string, role: TeamRole) => void;
     /**
      * 连接状态也要带 teamId。余额和角色早就按 teamId 挡了迟到事件，状态却没挡：
@@ -38,7 +50,7 @@ type TeamState = {
     clear: () => void;
 };
 
-const EMPTY = { currentTeamId: "", credits: 0, myRole: "" as TeamRole | "", realtimeStatus: "idle" as TeamRealtimeStatus, realtimeError: "" };
+const EMPTY = { currentTeamId: "", credits: 0, storageUsed: 0, storageQuota: 0, myRole: "" as TeamRole | "", realtimeStatus: "idle" as TeamRealtimeStatus, realtimeError: "" };
 
 export const useTeamStore = create<TeamState>((set) => ({
     teams: [],
@@ -48,14 +60,17 @@ export const useTeamStore = create<TeamState>((set) => ({
     bindTeam: (teamId) => set((state) => (state.currentTeamId === teamId ? {} : { ...EMPTY, currentTeamId: teamId, realtimeStatus: "connecting" })),
     applyTeamSnapshot: (team) =>
         set((state) => {
-            if (state.currentTeamId !== team.id) return { ...EMPTY, currentTeamId: team.id, credits: team.credits, myRole: team.myRole, realtimeStatus: "connecting" };
+            if (state.currentTeamId !== team.id)
+                return { ...EMPTY, currentTeamId: team.id, credits: team.credits, storageUsed: team.storageUsed, storageQuota: team.storageQuota, myRole: team.myRole, realtimeStatus: "connecting" };
             // 改个团队名就会触发一次 refetch，而那份快照是实时推送之前拉的。
-            // 盖回去等于余额自己往回跳一格，用户会以为刚才那笔消费没记上。
+            // 盖回去等于余额自己往回跳一格，用户会以为刚才那笔消费没记上。云空间同理：
+            // 队友刚传的文件会从用量里凭空消失，看着像是文件被谁删了。
             if (state.realtimeStatus === "ready") return {};
-            return { credits: team.credits, myRole: team.myRole };
+            return { credits: team.credits, storageUsed: team.storageUsed, storageQuota: team.storageQuota, myRole: team.myRole };
         }),
     // 迟到的事件带着别的团队 id 时直接丢掉：用户可能已经切走，写进去就是把 A 队的余额显示在 B 队页面上。
     setCredits: (teamId, credits) => set((state) => (state.currentTeamId === teamId ? { credits } : {})),
+    setStorage: (teamId, storageUsed, storageQuota) => set((state) => (state.currentTeamId === teamId ? { storageUsed, storageQuota } : {})),
     setMyRole: (teamId, role) => set((state) => (state.currentTeamId === teamId ? { myRole: role } : {})),
     setRealtimeStatus: (teamId, realtimeStatus, realtimeError = "") => set((state) => (state.currentTeamId === teamId ? { realtimeStatus, realtimeError } : {})),
     clear: () => set(EMPTY),
