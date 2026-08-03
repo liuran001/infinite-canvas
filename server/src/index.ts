@@ -1,5 +1,7 @@
 import "reflect-metadata";
 
+import { createServer } from "node:http";
+
 import { createApp } from "./app";
 import { config } from "./config";
 import { initDatabase } from "./db/data-source";
@@ -10,6 +12,7 @@ import { startBlobGarbageCollector } from "./services/blob-gc";
 import { migratePhysicalBlobs } from "./services/file-migration";
 import { startJobWorker } from "./services/jobs";
 import { ensurePromptCategories, refreshPromptSyncScheduler } from "./services/prompts";
+import { attachRealtime } from "./services/realtime-hub";
 
 async function main() {
     await initDatabase();
@@ -21,7 +24,9 @@ async function main() {
     await startJobWorker();
     await resetRunningAgentSessions();
     publicBaseUrlWarning();
-    createApp().listen(config.port, () => console.log(`infinite-canvas server listening on :${config.port}`));
+    const server = createServer(createApp());
+    attachRealtime(server);
+    server.listen(config.port, () => console.log(`infinite-canvas server listening on :${config.port}`));
 }
 
 main().catch((error) => {
