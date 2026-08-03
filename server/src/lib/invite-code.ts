@@ -10,6 +10,13 @@ import { randomInt } from "node:crypto";
  */
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const CODE_LENGTH = 10;
+/**
+ * 管理员自定义码值的长度区间。下限 4 是防「随手敲一个 A 就发出去」——那种码几次就被人撞出来；
+ * 上限对齐 InviteCode.code 这一列的 varchar(64)，超了会在 MySQL 上被静默截断成另一个码，
+ * 管理员发出去的和库里存着的从此不是同一个。
+ */
+const CUSTOM_CODE_MIN = 4;
+const CUSTOM_CODE_MAX = 64;
 
 /** 用 CSPRNG 逐位取字符，31^10 ≈ 8e14 种组合，既猜不出也扫不完，不会被枚举出来。 */
 export function newInviteCode() {
@@ -26,4 +33,18 @@ export function normalizeInviteCode(code: string) {
     return String(code || "")
         .trim()
         .toUpperCase();
+}
+
+/**
+ * 管理员指定的码值。归一化之后必须完全落在同一张字母表里——不是洁癖：
+ * 放行 0/O/1/I/L 的话，用户照着纸条输入时把 0 输成 O 就会得到「邀请码无效」，
+ * 而管理员看着自己手里那张确实存在的码，完全无从判断问题出在哪。
+ * 返回归一化后的值，调用方直接拿它落库，别再各自 trim 一遍。
+ */
+export function normalizeCustomInviteCode(input: unknown, message: (reason: string) => Error): string {
+    const code = normalizeInviteCode(String(input ?? ""));
+    if (code.length < CUSTOM_CODE_MIN || code.length > CUSTOM_CODE_MAX) throw message(`邀请码长度需要在 ${CUSTOM_CODE_MIN} 到 ${CUSTOM_CODE_MAX} 位之间`);
+    const illegal = [...code].filter((char) => !CODE_ALPHABET.includes(char));
+    if (illegal.length) throw message(`邀请码只能使用 ${CODE_ALPHABET} 这些字符，不能包含 ${[...new Set(illegal)].join("")}`);
+    return code;
 }

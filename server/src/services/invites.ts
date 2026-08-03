@@ -2,9 +2,10 @@ import { In, Like } from "typeorm";
 
 import { dataSource, repo } from "../db/data-source";
 import { InviteCode, InviteUse, User } from "../db/entities";
+import { isUniqueViolation } from "../lib/db-errors";
 import { fail, newId, now } from "../lib/errors";
 // 码值规则住在 lib：启动时的旧库升级也要用同一套，而它不能依赖任何 service。
-import { newInviteCode, normalizeInviteCode } from "../lib/invite-code";
+import { newInviteCode, normalizeCustomInviteCode, normalizeInviteCode } from "../lib/invite-code";
 import type { Query } from "../lib/response";
 
 export { newInviteCode, normalizeInviteCode };
@@ -15,15 +16,31 @@ const MAX_BATCH = 200;
 /** 原子更新里要拼列名，各方言的引号不同，交给驱动去转义。 */
 const column = (name: string) => dataSource.driver.escape(name);
 
-export async function createInviteCodes(input: { count?: unknown; maxUses?: unknown; credits?: unknown; note?: unknown }) {
+/**
+ * 批量生成邀请码。code 留空是随机生成，填了就用管理员指定的那一个。
+ *
+ * 指定码值时 count 只能是 1：「指定这串字符，给我来 5 个」自相矛盾，静默按 1 处理的话，
+ * 管理员会以为自己拿到了 5 个码，实际只发出去一个，剩下 4 个人拿到的是「邀请码已用完」。
+ * 所以宁可直接拒绝，让他知道自己想要的是什么。
+ */
+export async function createInviteCodes(input: { code?: unknown; count?: unknown; maxUses?: unknown; credits?: unknown; note?: unknown }) {
     const count = Math.min(MAX_BATCH, Math.max(1, Math.floor(Number(input.count) || 1)));
     // 0 表示不限次。没传这个字段时按一次性码算，默认给「无限次」太容易被误发出去。
     const maxUses = input.maxUses === undefined ? 1 : Math.max(0, Math.floor(Number(input.maxUses) || 0));
     const credits = Math.max(0, Math.floor(Number(input.credits) || 0));
     const note = String(input.note || "").trim();
-    const rows = Array.from({ length: count }, () => ({ code: newInviteCode(), maxUses, usedCount: 0, credits, enabled: true, note, createdAt: now() }));
+    // 只有「非空字符串」才算指定；空串、空白与 undefined 都是「没填」，走随机那条路。
+    const custom = String(input.code ?? "").trim() ? normalizeCustomInviteCode(input.code, (reason) => fail(reason, 400, "INVITE_CODE_INVALID")) : "";
+    if (custom && count !== 1) throw fail("指定邀请码内容时只能生成 1 个", 400, "INVITE_CODE_INVALID");
+    const rows = custom ? [{ code: custom, maxUses, usedCount: 0, credits, enabled: true, note, createdAt: now() }] : Array.from({ length: count }, () => ({ code: newInviteCode(), maxUses, usedCount: 0, credits, enabled: true, note, createdAt: now() }));
     // 用 insert 而不是 save：save 撞上已有主键会变成更新，等于悄悄改掉别人的码；insert 会直接报冲突。
-    await repo(InviteCode).insert(rows);
+    // 指定码值时这条性质格外重要，所以不做「先查再写」的预检——那中间有窗口期，而唯一约束没有。
+    try {
+        await repo(InviteCode).insert(rows);
+    } catch (error) {
+        if (custom && isUniqueViolation(error)) throw fail(`邀请码 ${custom} 已存在，请换一个`, 409, "INVITE_CODE_DUPLICATE");
+        throw error;
+    }
     return rows;
 }
 

@@ -1463,6 +1463,27 @@ check "码值只含约定字母表" "$(echo "$BATCH" | jq -r '[.data[].code | te
 check "码值没有公共前缀（不可预测）" "$(echo "$BATCH" | jq -r '[.data[].code[0:4]] | unique | length > 1')" "true"
 check "生成时写入了配置" "$(echo "$BATCH" | jq -r '.data[0] | "\(.maxUses)/\(.credits)/\(.note)/\(.enabled)/\(.usedCount)"')" "2/7/冒烟批量/true/0"
 check "批量生成的码都能在列表里查到" "$(curl -s --get "$BASE/admin/invites" --data-urlencode 'keyword=冒烟批量' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "8"
+# 指定码值：留空随机、填了就用管理员给的那一个。
+CUSTOM=$(new_invites '{"code":"smkevp99","maxUses":2,"credits":3,"note":"指定码"}')
+check "指定的码按大写落库" "$(echo "$CUSTOM" | jq -r '.data[0].code')" "SMKEVP99"
+check "指定码时只出一个" "$(echo "$CUSTOM" | jq -r '.data | length')" "1"
+check "指定码的其余字段照常生效" "$(invite_row SMKEVP99 | jq -r '"\(.maxUses)/\(.credits)/\(.note)"')" "2/3/指定码"
+# 撞码必须报错而不是覆盖：覆盖等于悄悄改掉一个已经发出去的码，持码人从此莫名其妙用不了。
+check "重复的指定码被拒" "$(new_invites '{"code":"SMKEVP99"}' | jq -r .code)" "INVITE_CODE_DUPLICATE"
+check "撞码后原码没被改" "$(invite_row SMKEVP99 | jq -r .credits)" "3"
+# 字母表去掉了 0/O/1/I/L：放行它们，用户照着纸条输错一个字符就只会看到「邀请码无效」。
+check "含形近字的指定码被拒" "$(new_invites '{"code":"SMKE0VP99"}' | jq -r .code)" "INVITE_CODE_INVALID"
+check "含分隔符的指定码被拒" "$(new_invites '{"code":"SMKE-VP99"}' | jq -r .code)" "INVITE_CODE_INVALID"
+check "过短的指定码被拒" "$(new_invites '{"code":"AB"}' | jq -r .code)" "INVITE_CODE_INVALID"
+# 「指定这串字符，来 5 个」自相矛盾，静默按 1 处理会让管理员以为发出去 5 个能用的码。
+check "指定码时 count 必须是 1" "$(new_invites '{"code":"SMKEBATCH","count":5}' | jq -r .code)" "INVITE_CODE_INVALID"
+check "被拒的指定码一条都没落库" "$(curl -s --get "$BASE/admin/invites" --data-urlencode 'keyword=SMKEBATCH' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "0"
+check "code 传空串仍然随机生成" "$(new_invites '{"code":"","count":2}' | jq -r '[.data[].code | length] | unique | join(",")')" "10"
+# 指定的码要真的能用来注册，否则前面这些断言只是在验一张查得到但用不了的码。
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"requireInvite":true}}}' >/dev/null
+check "指定的码能真的注册进来" "$(register_invited smoke-custom-invited SMKEVP99 | jq -r .data.user.username)" "smoke-custom-invited"
+curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"requireInvite":false}}}' >/dev/null
+
 check "列表带出使用情况" "$(invite_row "$(echo "$BATCH" | jq -r '.data[0].code')" | jq -r '"\(.usedCount)/\(.maxUses)"')" "0/2"
 
 GIFT_CODE=$(echo "$BATCH" | jq -r '.data[0].code')

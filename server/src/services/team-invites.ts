@@ -117,6 +117,10 @@ export async function createTeamInvite(teamId: string, actorId: string, input: T
         createdAt: now(),
     });
     if (kind === "code") {
+        // 团队手输码刻意不支持「管理员指定内容」，与平台邀请码不同：平台邀请码只有平台管理员能建，
+        // 而团队邀请是任何团队 owner/admin 都能调的接口。一旦允许指定码值，撞码报错就成了一个在线的
+        // 「这个码存不存在」探测口——手输码的字母表只有 31 个字符，猜中一个就能直接加进别人的团队。
+        // 随机生成的码没有这个面：调用方无法选择要试的值。
         // 码由 insert 本身定夺：撞上唯一索引就换一个再写，不做「先查再写」那种有窗口期的预检。
         invite.code = await insertWithUniqueCode(newInviteCode, async (candidate) => {
             invite.code = candidate;
