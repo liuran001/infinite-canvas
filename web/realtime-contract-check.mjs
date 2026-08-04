@@ -188,6 +188,9 @@ check("分享降级 abort 监听只注册一次", /signal\.addEventListener\("ab
 
 console.log("降级路径仍然存在");
 check("画布保留 SSE 降级", /serverProjectStream\(/.test(projectRealtime) && /watchProjectViaSse/.test(projectRealtime));
+// 新建的画布要等首次保存落库才订阅：在那之前服务端只会回 PROJECT_NOT_FOUND，
+// 而这条通道把那个码当成「画布已被删除」，直接订的结果是刚建好的画布把用户踢回列表页。
+check("画布等落库之后才订阅", /if \(lastRevision\) subscribe\(\);/.test(projectRealtime) && /syncedRevisionOf/.test(projectRealtime));
 check("团队保留 SSE 与轮询降级", /decodeSseFrames\(/.test(teamRealtime) && /POLL_INTERVAL = 30_000/.test(teamRealtime));
 // 服务端总线是进程内 EventEmitter，多实例下推送本来就不完整，健康时也要低频纠偏。
 check("团队在 WebSocket 健康时仍纠偏", /CORRECTION_INTERVAL/.test(teamRealtime));

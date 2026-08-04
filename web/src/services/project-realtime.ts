@@ -26,6 +26,14 @@ const sleep = (ms: number, signal: AbortSignal) =>
     });
 
 /**
+ * 本地记录的服务端版本号。0 有确切含义：这个画布一次都没成功保存过，
+ * 服务端此刻根本不认识它，任何针对它的订阅都只会被回一句「画布项目不存在」。
+ */
+function syncedRevisionOf(projectId: string) {
+    return useCanvasStore.getState().projects.find((item) => item.id === projectId)?.revision || 0;
+}
+
+/**
  * 画布实时订阅。优先走共享 WebSocket，连不上（旧服务端、反代不支持 Upgrade）才退回原来的 SSE 循环。
  * SSE 那条路径一个字都没动：它是这条功能唯一被验证过的降级出口，WebSocket 在任何环境下失效时都得靠它兜底。
  */
@@ -34,7 +42,7 @@ export function watchProject(projectId: string, handlers: { onProject?: (revisio
     useProjectPresenceStore.getState().bind(projectId, clientId);
 
     const presence = useProjectPresenceStore.getState();
-    let lastRevision = useCanvasStore.getState().projects.find((item) => item.id === projectId)?.revision || 0;
+    let lastRevision = syncedRevisionOf(projectId);
     let fallback: AbortController | null = null;
     const stopFallback = () => {
         fallback?.abort();
@@ -60,45 +68,64 @@ export function watchProject(projectId: string, handlers: { onProject?: (revisio
         void pullProject(projectId).then(() => handlers.onProject?.(event.revision));
     };
 
-    const subscription = subscribeRealtime<ServerProjectEvent>({
-        channel: `project:${projectId}`,
-        payload: () => ({ clientId, sinceRevision: lastRevision }),
-        onReady: (payload) => {
-            const ready = (payload || {}) as { revision?: number; members?: ServerProjectPresence[] };
-            lastRevision = Math.max(lastRevision, Number(ready.revision) || 0);
-            presence.setMembers((ready.members || []).filter((item) => item.clientId !== clientId));
-            presence.setStatus("ready");
-            stopFallback();
-        },
-        onEvent: apply,
-        onDegrade: () => {
-            presence.setStatus("reconnecting");
-            startFallback();
-        },
-        onRecover: stopFallback,
-        onTerminal: (failure) => {
-            if (failure.code === "PROJECT_NOT_FOUND") {
-                presence.setStatus("failed");
-                handlers.onDeleted?.();
-                return;
-            }
-            // 其它终态错误说明这条 WebSocket 频道没戏了，但画布同步不能就此停掉：交给 SSE。
-            startFallback();
-        },
-    });
-    presence.setStatus("connecting");
-    signal.addEventListener(
-        "abort",
-        () => {
-            subscription.close();
-            stopFallback();
-            // 订阅表里留下一条已经关掉的记录，presence 就会一直往一条死连接上发，
-            // 而 HTTP 回落永远不会被走到——别人从此看不到这个人在画布上的位置。
-            if (realtimePresence.get(projectId) === subscription) realtimePresence.delete(projectId);
-        },
-        { once: true },
-    );
-    realtimePresence.set(projectId, subscription);
+    const subscribe = () => {
+        const subscription = subscribeRealtime<ServerProjectEvent>({
+            channel: `project:${projectId}`,
+            payload: () => ({ clientId, sinceRevision: lastRevision }),
+            onReady: (payload) => {
+                const ready = (payload || {}) as { revision?: number; members?: ServerProjectPresence[] };
+                lastRevision = Math.max(lastRevision, Number(ready.revision) || 0);
+                presence.setMembers((ready.members || []).filter((item) => item.clientId !== clientId));
+                presence.setStatus("ready");
+                stopFallback();
+            },
+            onEvent: apply,
+            onDegrade: () => {
+                presence.setStatus("reconnecting");
+                startFallback();
+            },
+            onRecover: stopFallback,
+            onTerminal: (failure) => {
+                if (failure.code === "PROJECT_NOT_FOUND") {
+                    presence.setStatus("failed");
+                    handlers.onDeleted?.();
+                    return;
+                }
+                // 其它终态错误说明这条 WebSocket 频道没戏了，但画布同步不能就此停掉：交给 SSE。
+                startFallback();
+            },
+        });
+        presence.setStatus("connecting");
+        signal.addEventListener(
+            "abort",
+            () => {
+                subscription.close();
+                stopFallback();
+                // 订阅表里留下一条已经关掉的记录，presence 就会一直往一条死连接上发，
+                // 而 HTTP 回落永远不会被走到——别人从此看不到这个人在画布上的位置。
+                if (realtimePresence.get(projectId) === subscription) realtimePresence.delete(projectId);
+            },
+            { once: true },
+        );
+        realtimePresence.set(projectId, subscription);
+    };
+
+    // 刚新建的画布还没落到服务端，此刻订阅只会拿到 PROJECT_NOT_FOUND，而这条通道把那个码
+    // 当成「画布已被删除」——于是用户刚建好的画布会在两秒内被踢回列表页，SSE 降级那条路一样。
+    // 等它拿到第一个服务端版本号再订：那时候服务端才真的认识这个画布，查不到就确实是被删了。
+    if (lastRevision) subscribe();
+    else {
+        presence.setStatus("connecting");
+        const stop = useCanvasStore.subscribe(() => {
+            const revision = syncedRevisionOf(projectId);
+            if (!revision && !signal.aborted) return;
+            stop();
+            if (signal.aborted) return;
+            lastRevision = revision;
+            subscribe();
+        });
+        signal.addEventListener("abort", () => stop(), { once: true });
+    }
 
     return clientId;
 }
