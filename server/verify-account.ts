@@ -24,10 +24,15 @@ async function main() {
 
     console.log("邀请码码值规则");
     const bad = (value: unknown) => normalizeCustomInviteCode(value, (reason) => fail(reason));
-    // 字母表刻意去掉了 0/O/1/I/L：放行它们，用户照着纸条输错一个字符就只会看到「邀请码无效」，
-    // 而管理员手里那张码确实存在，两边都无从判断问题出在哪。
-    for (const value of ["ABC0DEF", "OOOOOO", "111111", "IIIIII", "LLLLLL", "ABC-DEF", "ABC DEF", "ABC_DEF", "ABC中文"]) {
-        await rejects(`拒绝含非法字符的 ${String(value)}`, async () => bad(value));
+    // 形近字只对随机码有意义——那种码没人挑得动，混进 0/O 就是在制造「码是对的却输不进去」的客服工单。
+    // 管理员自己写的码不一样：他知道自己要 WELCOME2026 还是 VIP001，易混淆的代价也由他自己承担，
+    // 拿随机码的字母表去卡他，只会让人对着一个完全合理的码被打回来而不知所措。
+    for (const value of ["ABC0DEF", "OOOOOO", "111111", "IIIIII", "LLLLLL", "ABC-DEF", "ABC_DEF", "WELCOME2026", "VIP001"]) {
+        check(`放行管理员指定的 ${String(value)}`, bad(value), String(value).toUpperCase());
+    }
+    // 但仍然挡住会把注册链接搞坏的东西：邀请码要能原样放进 URL。
+    for (const value of ["ABC DEF", "ABC中文", "ABC/DEF", "ABC?DEF", "ABC#DEF", "ABC&DEF"]) {
+        await rejects(`拒绝会破坏链接的 ${String(value)}`, async () => bad(value));
     }
     await rejects("拒绝过短的码", async () => bad("AB"));
     await rejects("拒绝超过列长度的码", async () => bad("A".repeat(65)));
@@ -46,7 +51,7 @@ async function main() {
     await rejects("指定的码与已有码重复时报错", () => createInviteCodes({ code: "team99" }));
     check("撞码后原码的字段一个都没被改", (await codes.findOneByOrFail({ code: "TEAM99" })).credits, 50);
     await rejects("大小写不同的重复码同样被拒", () => createInviteCodes({ code: "TEAM99" }));
-    await rejects("指定码值时不接受非法字符", () => createInviteCodes({ code: "team-99" }));
+    await rejects("指定码值时仍然挡住会破坏链接的字符", () => createInviteCodes({ code: "team 99" }));
 
     // 「指定这串字符，来 5 个」是自相矛盾的。静默按 1 处理的话，管理员以为发出去 5 个码，
     // 实际只有一个能用，后面 4 个人拿到的是「邀请码已用完」。

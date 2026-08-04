@@ -201,10 +201,14 @@ console.log("指定邀请码的校验");
 check("留空表示随机生成，不算错", validateInviteCode("") === "" && validateInviteCode("   ") === "");
 check("小写会被归一成大写", normalizeInviteCode(" abc9 ") === "ABC9");
 check("合法码通过校验", validateInviteCode("autumn26") === "", `当前「${validateInviteCode("autumn26")}」`);
-// 0/O/1/I/L 正是因为肉眼难分才被排除；报错必须点名是哪几个字符，只说「含非法字符」用户盯着码也看不出来。
-const illegal = validateInviteCode("WELC0ME");
-check("形近字被拒绝", illegal !== "", "0 应当不在字母表里");
-check("报错点名违规字符", illegal.includes("0"), `当前「${illegal}」`);
+// 形近字只对随机码有意义：随机码由机器挑、由人手抄，混进 0/O 就是在造客服工单。
+// 管理员自己写的码是他自己定的，WELC0ME 这种必须放行，拿随机码的字母表去卡他只会让人莫名其妙被打回。
+check("管理员指定的形近字放行", validateInviteCode("WELC0ME") === "", `当前「${validateInviteCode("WELC0ME")}」`);
+check("连字符与下划线放行", validateInviteCode("SUMMER-26") === "" && validateInviteCode("VIP_001") === "");
+// 但会把注册链接搞坏的字符仍然要拦，而且报错必须点名是哪几个，只说「含非法字符」用户盯着码也看不出来。
+const illegal = validateInviteCode("WELC ME");
+check("会破坏链接的字符被拒绝", illegal !== "", "空格不该出现在邀请码里");
+check("报错点名违规字符", illegal.includes("只能使用"), `当前「${illegal}」`);
 check("太短的码被拒绝", validateInviteCode("AB").includes(String(INVITE_CODE_MIN_LENGTH)), `当前「${validateInviteCode("AB")}」`);
 check("超长的码被拒绝", validateInviteCode("A".repeat(INVITE_CODE_MAX_LENGTH + 1)) !== "", "超过长度上限没有被拦住");
 check("刚好在边界上的码通过", validateInviteCode("A".repeat(INVITE_CODE_MIN_LENGTH)) === "" && validateInviteCode("A".repeat(INVITE_CODE_MAX_LENGTH)) === "");

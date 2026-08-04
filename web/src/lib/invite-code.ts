@@ -6,8 +6,14 @@
  * 表现就是用户按提示填完仍然被服务端打回来，而界面上看不出哪里错了。
  */
 
-/** 与服务端 CODE_ALPHABET 一字不差。去掉 0/O/1/I/L 这些形近字：码是要人手抄手输的，留着只会让人反复输错。 */
-export const INVITE_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+/**
+ * 指定码值允许的字符，与服务端 CUSTOM_CODE_PATTERN 一字不差。
+ * 随机码那张去掉 0/O/1/I/L 的字母表只管随机码：那种码由机器挑、由人手抄，混进形近字就是在制造客服工单。
+ * 管理员自己写的码是他自己定的，WELCOME2026 或 VIP001 都该放行。这里只挡会把注册链接搞坏的字符。
+ */
+export const INVITE_CODE_PATTERN = /^[A-Z0-9_-]+$/;
+/** 给用户看的规则描述，跟上面那条正则同进同出。 */
+export const INVITE_CODE_RULE_TEXT = "字母、数字、- 和 _";
 /**
  * 长度区间对齐服务端 invite-code.ts 的 CUSTOM_CODE_MIN / CUSTOM_CODE_MAX。
  * 随机码固定 10 位；指定码下界 4（再短就能被人猜中），上界 64 对齐 code 列的 varchar(64)。
@@ -30,9 +36,8 @@ export function validateInviteCode(code: string) {
     const value = normalizeInviteCode(code);
     if (!value) return "";
     if (value.length < INVITE_CODE_MIN_LENGTH || value.length > INVITE_CODE_MAX_LENGTH) return `指定邀请码长度需在 ${INVITE_CODE_MIN_LENGTH}-${INVITE_CODE_MAX_LENGTH} 位之间`;
-    const illegal = [...value].filter((char) => !INVITE_CODE_ALPHABET.includes(char));
-    // 把违规字符原样列出来：只说「含有非法字符」的话，用户盯着一串码也看不出是哪一位，
-    // 尤其 0/O、1/I/L 这几组本来就是肉眼难分才被排除掉的。
-    if (illegal.length) return `指定邀请码只能使用 ${INVITE_CODE_ALPHABET} 中的字符，不支持：${[...new Set(illegal)].join(" ")}`;
-    return "";
+    if (INVITE_CODE_PATTERN.test(value)) return "";
+    // 把违规字符原样列出来：只说「含有非法字符」的话，用户盯着一串码也看不出是哪一位。
+    const illegal = [...value].filter((char) => !/[A-Z0-9_-]/.test(char));
+    return `指定邀请码只能使用${INVITE_CODE_RULE_TEXT}，不支持：${[...new Set(illegal)].join(" ")}`;
 }

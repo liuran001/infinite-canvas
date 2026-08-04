@@ -11,12 +11,20 @@ import { randomInt } from "node:crypto";
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const CODE_LENGTH = 10;
 /**
- * 管理员自定义码值的长度区间。下限 4 是防「随手敲一个 A 就发出去」——那种码几次就被人撞出来；
+ * 管理员指定码值的长度区间。下限 4 是防「随手敲一个 A 就发出去」——那种码几次就被人撞出来；
  * 上限对齐 InviteCode.code 这一列的 varchar(64)，超了会在 MySQL 上被静默截断成另一个码，
  * 管理员发出去的和库里存着的从此不是同一个。
  */
 const CUSTOM_CODE_MIN = 4;
 const CUSTOM_CODE_MAX = 64;
+/**
+ * 指定码值允许的字符。刻意比随机码的字母表宽：形近字之所以被排除，是因为随机码没人挑得动，
+ * 而管理员自己写的码是他自己定的——WELCOME2026、VIP001 一眼就能读，不该被随机码的规则挡在门外，
+ * 万一真挑了个 0/O 混着的码，代价也由他自己承担。
+ * 仍然只放行大写字母、数字、- 和 _：邀请码要能原样放进注册链接，
+ * 空格、中文和 /?#& 这些要么得转义、要么直接把链接从中间截断。
+ */
+const CUSTOM_CODE_PATTERN = /^[A-Z0-9_-]+$/;
 
 /** 用 CSPRNG 逐位取字符，31^10 ≈ 8e14 种组合，既猜不出也扫不完，不会被枚举出来。 */
 export function newInviteCode() {
@@ -36,15 +44,17 @@ export function normalizeInviteCode(code: string) {
 }
 
 /**
- * 管理员指定的码值。归一化之后必须完全落在同一张字母表里——不是洁癖：
- * 放行 0/O/1/I/L 的话，用户照着纸条输入时把 0 输成 O 就会得到「邀请码无效」，
- * 而管理员看着自己手里那张确实存在的码，完全无从判断问题出在哪。
+ * 管理员指定的码值。归一化之后按 CUSTOM_CODE_PATTERN 校验，比随机码宽松得多——
+ * 随机码要避开形近字是因为它由机器挑、由人手抄；指定码是管理员自己写的，那是他的决定。
  * 返回归一化后的值，调用方直接拿它落库，别再各自 trim 一遍。
  */
 export function normalizeCustomInviteCode(input: unknown, message: (reason: string) => Error): string {
     const code = normalizeInviteCode(String(input ?? ""));
     if (code.length < CUSTOM_CODE_MIN || code.length > CUSTOM_CODE_MAX) throw message(`邀请码长度需要在 ${CUSTOM_CODE_MIN} 到 ${CUSTOM_CODE_MAX} 位之间`);
-    const illegal = [...code].filter((char) => !CODE_ALPHABET.includes(char));
-    if (illegal.length) throw message(`邀请码只能使用 ${CODE_ALPHABET} 这些字符，不能包含 ${[...new Set(illegal)].join("")}`);
+    if (!CUSTOM_CODE_PATTERN.test(code)) {
+        // 把违规字符原样列出来：只说「含有非法字符」的话，管理员盯着一串码也看不出是哪一位。
+        const illegal = [...code].filter((char) => !/[A-Z0-9_-]/.test(char));
+        throw message(`邀请码只能使用字母、数字、- 和 _，不能包含 ${[...new Set(illegal)].join("")}`);
+    }
     return code;
 }

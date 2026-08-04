@@ -5,7 +5,7 @@ import { Copy, History, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { useCopyText } from "@/hooks/use-copy-text";
-import { INVITE_CODE_ALPHABET, INVITE_CODE_MAX_LENGTH, INVITE_CODE_MIN_LENGTH, normalizeInviteCode, validateInviteCode } from "@/lib/invite-code";
+import { INVITE_CODE_MAX_LENGTH, INVITE_CODE_MIN_LENGTH, INVITE_CODE_RULE_TEXT, normalizeInviteCode, validateInviteCode } from "@/lib/invite-code";
 import { useAdminAction } from "@/pages/admin/use-admin-action";
 import { adminApi, type AdminInvite, type AdminInviteBatch, type AdminQuery } from "@/services/api/admin";
 
@@ -218,7 +218,7 @@ export default function AdminInvitesPage() {
                     <Form.Item
                         name="code"
                         label="指定邀请码"
-                        extra={`留空则随机生成。指定时只能生成 1 个，长度 ${INVITE_CODE_MIN_LENGTH}-${INVITE_CODE_MAX_LENGTH} 位，且只能用 ${INVITE_CODE_ALPHABET} 这些字符（已去掉形近的 0 O 1 I L），与已有码重复会被拒绝。`}
+                        extra={`留空则随机生成（随机码会避开形近的 0 O 1 I L）。指定时只能生成 1 个，长度 ${INVITE_CODE_MIN_LENGTH}-${INVITE_CODE_MAX_LENGTH} 位，可用${INVITE_CODE_RULE_TEXT}，小写会转成大写，与已有码重复会被拒绝。`}
                         rules={[
                             {
                                 validator: (_, value) => {
