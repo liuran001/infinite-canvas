@@ -64,6 +64,18 @@ export function getAntThemeConfig(dark: boolean): ThemeConfig {
                 rowSelectedBg: color.tableSelectedBg,
                 rowSelectedHoverBg: color.tableSelectedHoverBg,
             },
+            Tooltip: {
+                /*
+                 * Tooltip 的底色两套主题下都是深色（浅色主题是 rgba(0,0,0,.85)，深色主题是 #424242），
+                 * 所以它的文字必须始终是浅色，跟当前主题无关。
+                 *
+                 * 而全局 colorTextLightSolid 是「主色背景上的文字」：深色主题里主色本身就是浅色（#fafafa），
+                 * 那个值只能是近黑的 #171717。Tooltip 一并吃到这个全局 token，深色主题下就成了
+                 * #171717 的字压在 #424242 的底上——用户看到的是一块什么都读不出来的黑方块。
+                 * 覆盖只落在 Tooltip 上：Button、Badge 这些确实是浅色底，它们要的就是那个深色文字。
+                 */
+                colorTextLightSolid: "#ffffff",
+            },
         },
     };
 }
