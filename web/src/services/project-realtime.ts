@@ -189,6 +189,9 @@ export function createPresenceReporter(projectId: string) {
     // 少了这一步，从 WebSocket 掉到降级路径的那段时间里，这个人在别人的画布上完全是隐身的。
     const send = () => {
         if (realtimePresence.get(projectId)?.presence({ clientId, ...current })) return;
+        // 画布还没落库时服务端不认识它，这一发必然 404；那会儿也不可能有别的协作者在看，
+        // 少报这一次没有任何人会察觉，用户的控制台却少一条看着像出事了的红字。
+        if (!syncedRevisionOf(projectId)) return;
         void serverApi.updateProjectPresence(projectId, { clientId, ...current }).catch(() => undefined);
     };
     const heartbeat = window.setInterval(send, 15_000);
@@ -204,7 +207,8 @@ export function createPresenceReporter(projectId: string) {
             window.clearTimeout(timer);
             window.clearInterval(heartbeat);
             realtimePresence.delete(projectId);
-            void serverApi.removeProjectPresence(projectId, clientId).catch(() => undefined);
+            // 没落库过的画布在服务端没有任何 presence 记录，没什么可清的。
+            if (syncedRevisionOf(projectId)) void serverApi.removeProjectPresence(projectId, clientId).catch(() => undefined);
         },
     };
 }

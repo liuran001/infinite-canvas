@@ -75,12 +75,23 @@ async function main() {
         if (waitFor) await page.waitForSelector(waitFor, { timeout: 15000 }).catch(() => {});
         await page.waitForTimeout(600);
     };
+    /*
+     * 本地开发时前端在 3000、API 在 8080，两者不同源。服务端出于 CSRF 考虑不会因为 CORS_ORIGIN=*
+     * 就放行 WebSocket 升级（见 realtime-hub 的 originAllowed），于是实时连接必然 403 并退回 SSE。
+     * 那是配置使然、不是故障，可它会在四个段落里各留一条控制台错误，把「无运行时报错」全打红——
+     * 假失败一多，真故障就没人看得见了。
+     *
+     * 只在确实跨源时放行：同源部署下再出现这条 403 就是真出了问题，必须让脚本红。
+     */
+    const crossOrigin = new URL(WEB).origin !== new URL(API).origin;
+    const degradedRealtime = (entry) => crossOrigin && /WebSocket connection to.*\/v1\/realtime.*(403|Forbidden)/i.test(entry);
     // 忽略与本次改动无关的噪音（favicon、devtools、第三方图片 CDN）
-    const realErrors = () => errors.filter((e) => !/favicon|DevTools|net::ERR_(NAME_NOT_RESOLVED|CONNECTION)|jsdelivr|githubusercontent/i.test(e) && !expectedErrors.some((pattern) => pattern.test(e)));
+    const realErrors = () => errors.filter((e) => !/favicon|DevTools|net::ERR_(NAME_NOT_RESOLVED|CONNECTION)|jsdelivr|githubusercontent/i.test(e) && !degradedRealtime(e) && !expectedErrors.some((pattern) => pattern.test(e)));
     /** 申报了却没出现，说明这条白名单已经过期：留着它只会在以后替真故障挡枪，必须报出来让人删掉。 */
     const missingExpected = () => expectedErrors.filter((pattern) => !errors.some((item) => pattern.test(item)));
 
     console.log("公开页面");
+    if (crossOrigin) console.log(`  \x1b[33m提示\x1b[0m 前端(${new URL(WEB).origin}) 与 API(${new URL(API).origin}) 不同源，实时连接会按预期退回 SSE；要覆盖 WebSocket 本身请跑 realtime-browser-check.mjs`);
     await visit("/", "h1");
     check("首页可渲染", await page.locator("h1").first().isVisible());
     check("首页无运行时报错", realErrors().length === 0, realErrors().join("\n       "));
@@ -231,6 +242,17 @@ async function main() {
             check(`${mode} 模式下分享按钮 hover 有背景变化`, rest.background !== hovered.background, `hover 前后都是 ${hovered.background}，说明 hover 根本没生效`);
             // 4.5 是 WCAG AA 对正文的要求；这里的按钮文字就是正文字号。
             check(`${mode} 模式下分享按钮 hover 文字仍然看得清`, hovered.ratio >= 4.5, `hover 时文字 ${hovered.color} 配底色 ${hovered.background}，对比度只有 ${hovered.ratio.toFixed(2)}`);
+            // hover 弹出的说明气泡自带一层深色底，文字色却取自全局 colorTextLightSolid——
+            // 那个 token 是给「主色背景上的文字」用的，深色主题里主色本身是浅色，于是它变成近黑，
+            // 压在气泡的深底上就是一块读不出字的黑方块。按钮本身看得清不代表气泡看得清，得单独判。
+            await page.waitForTimeout(700);
+            const tooltip = page.locator(".ant-tooltip-container, .ant-tooltip-inner").first();
+            if (await tooltip.count()) {
+                const tip = await contrastProbe(tooltip);
+                check(`${mode} 模式下按钮说明气泡看得清`, tip.ratio >= 4.5, `气泡文字 ${tip.color} 配底色 ${tip.background}，对比度只有 ${tip.ratio.toFixed(2)}`);
+            } else {
+                skip([`${mode} 模式下按钮说明气泡看得清`], "hover 之后没有出现说明气泡");
+            }
         }
         // 收尾切回深色之外的默认态，后面的段落不依赖主题，但留一个确定的起点更好排查。
         const backDark = await page.evaluate(() => document.documentElement.classList.contains("dark"));
@@ -244,7 +266,16 @@ async function main() {
         }
     } else {
         skip(
-            ["能切到深色模式", "dark 模式下分享按钮 hover 有背景变化", "dark 模式下分享按钮 hover 文字仍然看得清", "能切到浅色模式", "light 模式下分享按钮 hover 有背景变化", "light 模式下分享按钮 hover 文字仍然看得清"],
+            [
+                "能切到深色模式",
+                "dark 模式下分享按钮 hover 有背景变化",
+                "dark 模式下分享按钮 hover 文字仍然看得清",
+                "dark 模式下按钮说明气泡看得清",
+                "能切到浅色模式",
+                "light 模式下分享按钮 hover 有背景变化",
+                "light 模式下分享按钮 hover 文字仍然看得清",
+                "light 模式下按钮说明气泡看得清",
+            ],
             "没有进入画布页，hover 断言无法执行",
         );
     }
@@ -388,15 +419,17 @@ async function main() {
     const uiTeamId = entered ? new URL(page.url()).pathname.split("/")[2] || "" : "";
 
     if (entered) {
-        check("创建后进入团队详情", await isVisible(page.getByText("UI 验证团队").first()));
-        check("详情页展示团队积分", await isVisible(page.getByText(/团队积分/).first()));
-        // 团队云空间和个人云空间是两本账，详情页必须把团队那本单独摆出来。
-        // 刚创建完就跳进来时用量还在路上，先等元素出现再断言，否则测的是「加载够不够快」而不是「有没有这块内容」。
+        // 刚创建完就跳进来时详情还在路上，先等页面真的把内容渲染出来再断言。
+        // 等待必须放在这一组断言之前而不是只护住云空间那条：否则前面几条测的是「加载够不够快」，
+        // 而不是「有没有这块内容」，页面稍慢一点就红，红的还是跟改动毫无关系的地方。
         await page
             .getByTestId("team-storage")
             .first()
             .waitFor({ state: "visible", timeout: 8000 })
             .catch(() => {});
+        check("创建后进入团队详情", await isVisible(page.getByText("UI 验证团队").first()));
+        check("详情页展示团队积分", await isVisible(page.getByText(/团队积分/).first()));
+        // 团队云空间和个人云空间是两本账，详情页必须把团队那本单独摆出来。
         check("详情页展示团队云空间", await isVisible(page.getByTestId("team-storage").first()));
         const teamStorageText = await page
             .getByTestId("team-storage")
@@ -634,7 +667,7 @@ async function main() {
     await page.waitForTimeout(600);
     const codeInput = page.getByLabel("指定邀请码");
     check("批量生成弹窗有指定邀请码输入框", await isVisible(codeInput.first()));
-    check("指定邀请码写明了字母表规则", (await page.getByText(/已去掉形近的 0 O 1 I L/).count()) > 0);
+    check("指定邀请码写明了可用字符规则", (await page.getByText(/可用字母、数字、- 和 _/).count()) > 0);
     if (await isVisible(codeInput.first())) {
         // 填了指定码值，数量必须被锁成 1：只禁用输入框而不改值的话，提交上去仍是 10，服务端只能整批拒掉。
         await codeInput.first().fill("AUTUMN26");
@@ -652,8 +685,9 @@ async function main() {
                 .isDisabled()
                 .catch(() => false),
         );
-        // 形近字在前端就要拦下来，不能等服务端打回。
-        await codeInput.first().fill("WELC0ME");
+        // 会把注册链接搞坏的字符要在前端就拦下来，不能等服务端打回。
+        // 注意不能拿 0/O/1/I/L 来试：那几个只对随机码有意义，管理员指定的码是放行的。
+        await codeInput.first().fill("WELC ME");
         await page.getByRole("button", { name: /^生\s*成$/ }).click();
         await page.waitForTimeout(800);
         check("非法字符在前端就被拦住", (await page.getByText(/只能使用/).count()) > 0);
