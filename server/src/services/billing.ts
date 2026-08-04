@@ -311,8 +311,8 @@ export async function refund(receipt: ChargeReceipt, meta: ChargeMeta): Promise<
 }
 
 /** 任务上固化的付费方。存量任务读出来的 payerKind 就是 user，因此老任务的行为一字不变。 */
-export function payerOfJob(job: Pick<Job, "userId" | "payerKind" | "payerTeamId">): Payer {
-    return job.payerKind === "team" && job.payerTeamId ? { kind: "team", teamId: job.payerTeamId, memberId: job.userId } : { kind: "user", userId: job.userId };
+export function payerOfJob(job: Pick<Job, "userId" | "payerUserId" | "payerKind" | "payerTeamId">): Payer {
+    return job.payerKind === "team" && job.payerTeamId ? { kind: "team", teamId: job.payerTeamId, memberId: job.payerUserId || job.userId } : { kind: "user", userId: job.payerUserId || job.userId };
 }
 
 export function payerOfSession(session: Pick<AgentSession, "userId" | "payerKind" | "payerTeamId">): Payer {
@@ -323,7 +323,7 @@ export function payerOfSession(session: Pick<AgentSession, "userId" | "payerKind
  * 从任务行还原扣费回执。任务可能跨进程重启后才走到退款，那时内存里的回执早没了，
  * 而退款必须原路：付费方与原始流水 ID 都只能从行上读回来。
  */
-export function receiptOfJob(job: Pick<Job, "userId" | "payerKind" | "payerTeamId" | "payerLogId" | "credits">): ChargeReceipt {
+export function receiptOfJob(job: Pick<Job, "userId" | "payerUserId" | "payerKind" | "payerTeamId" | "payerLogId" | "credits">): ChargeReceipt {
     return { payer: payerOfJob(job), credits: job.credits, logId: job.payerLogId || "" };
 }
 

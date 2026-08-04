@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 
-import { requestImageQuestion, type AiTextMessage } from "@/services/api/image";
-import { generateImages, generateVideo, isGenerationReady } from "@/services/api/generation";
+import { generateImages, generateText as generateTaskText, generateVideo, isGenerationReady } from "@/services/api/generation";
 import { selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 import { buildGenerationConfig } from "@/lib/canvas/canvas-generation-helpers";
 import { buildNodeContext } from "@/lib/canvas/plugin-node-context";
@@ -16,6 +15,8 @@ import type { CanvasConnection, CanvasNodeData, ViewportTransform } from "@/type
 type CanvasTheme = (typeof canvasThemes)[keyof typeof canvasThemes];
 
 type PluginHostParams = {
+    projectId: string;
+    shared: boolean;
     effectiveConfig: AiConfig;
     openConfigDialog: (open: boolean) => void;
     theme: CanvasTheme;
@@ -32,7 +33,7 @@ type PluginHostParams = {
  * 并在挂载时加载已安装的远程插件。返回给画布用于渲染插件面板与工具条。
  */
 export function usePluginHost(params: PluginHostParams) {
-    const { effectiveConfig, openConfigDialog, theme, nodesRef, connectionsRef, viewportRef, setNodes, setDialogNodeId, applyAgentOps } = params;
+    const { projectId, shared, effectiveConfig, openConfigDialog, theme, nodesRef, connectionsRef, viewportRef, setNodes, setDialogNodeId, applyAgentOps } = params;
 
     // 提供给插件节点的宿主能力(节点无关,方法接收 nodeId)
     const pluginAi = useMemo<CanvasPluginAi>(() => {
@@ -45,11 +46,12 @@ export function usePluginHost(params: PluginHostParams) {
                 throw new Error("服务端还没有可用模型,请稍后重试或联系管理员");
             }
         };
+        const pluginGenerationContext = (prompt: string) => (shared ? { source: "canvas" as const, projectId, prompt } : undefined);
         return {
             generateImage: async (prompt, options) => {
                 const config = { ...buildGenerationConfig(effectiveConfig, undefined, "image"), count: String(options?.count || 1), ...(options?.model ? { model: options.model } : {}), ...(options?.size ? { size: options.size } : {}) };
                 ensureReady();
-                const items = await generateImages(config, prompt, toReferences(options?.references), { signal: options?.signal });
+                const items = await generateImages(config, prompt, toReferences(options?.references), { signal: options?.signal, context: pluginGenerationContext(prompt) });
                 return { images: items.map((item) => item.dataUrl) };
             },
             generateVideo: async (prompt, options) => {
@@ -60,21 +62,21 @@ export function usePluginHost(params: PluginHostParams) {
                     ...(options?.seconds ? { videoSeconds: options.seconds } : {}),
                 };
                 ensureReady();
-                const file = await generateVideo(config, prompt, toReferences(options?.references), [], [], { signal: options?.signal });
+                const file = await generateVideo(config, prompt, toReferences(options?.references), [], [], { signal: options?.signal, context: pluginGenerationContext(prompt) });
                 return { url: file.url, mimeType: file.mimeType, width: file.width, height: file.height, durationMs: file.durationMs };
             },
             generateText: async (prompt, options) => {
                 const config = { ...buildGenerationConfig(effectiveConfig, undefined, "text"), ...(options?.model ? { model: options.model } : {}) };
                 ensureReady();
-                const messages: AiTextMessage[] = [...(options?.system ? [{ role: "system" as const, content: options.system }] : []), { role: "user" as const, content: prompt }];
-                const text = await requestImageQuestion(config, messages, (delta) => options?.onDelta?.(delta), { signal: options?.signal });
+                const request = [options?.system?.trim(), prompt].filter(Boolean).join("\n\n");
+                const text = await generateTaskText(config, request, [], (delta) => options?.onDelta?.(delta), { signal: options?.signal, context: pluginGenerationContext(request) });
                 return { text };
             },
             // 列出服务端为该能力下发的模型
             listModels: (capability) => selectableModelsByCapability(effectiveConfig, capability as ModelCapability | undefined).map((value) => ({ value, label: value })),
             defaultModel: (capability) => buildGenerationConfig(effectiveConfig, undefined, capability).model,
         };
-    }, [effectiveConfig, openConfigDialog]);
+    }, [effectiveConfig, openConfigDialog, projectId, shared]);
 
     const pluginHost = useMemo<CanvasPluginHost>(
         () => ({

@@ -11,7 +11,7 @@ import { useThemeStore } from "@/stores/use-theme-store";
 
 const PANEL_MOTION_SECONDS = CANVAS_AGENT_PANEL_MOTION_MS / 1000;
 
-export function AgentPanel() {
+export function AgentPanel({ forceLocal = false }: { forceLocal?: boolean } = {}) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const width = useAgentStore((state) => state.width);
     const [resizing, setResizing] = useState(false);
@@ -23,7 +23,7 @@ export function AgentPanel() {
     const cloudEnabled = useServerStore((state) => Boolean(state.settings?.agent.enabled));
     const setAgentState = useAgentStore((state) => state.setAgentState);
     // 管理员关掉系统 Agent，或链接本身就是给本地 Agent 用的（带 agentUrl 参数），都直接落到本地模式。
-    const cloudMode = cloudEnabled && panelMode === "cloud" && !searchParams.has("agentUrl");
+    const cloudMode = !forceLocal && cloudEnabled && panelMode === "cloud" && !searchParams.has("agentUrl");
     const startResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
         event.preventDefault();
         const startX = event.clientX;
@@ -63,7 +63,7 @@ export function AgentPanel() {
                 style={{ width, background: theme.node.panel, borderColor: theme.node.stroke, color: theme.node.text }}
             >
                 <button type="button" className="absolute inset-y-0 left-0 z-40 w-4 -translate-x-1/2 cursor-col-resize" onPointerDown={startResize} aria-label="调整右侧面板宽度" />
-                {cloudMode ? <CloudAgentPanel /> : <LocalAgentPanel embedded />}
+                {cloudMode ? <CloudAgentPanel /> : <LocalAgentPanel embedded forceLocal={forceLocal} />}
             </motion.aside>
         </motion.div>
     );

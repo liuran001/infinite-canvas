@@ -40,11 +40,12 @@ async function shareAccess(guest: GuestSession, projectId: string, permission: P
     if (!share || share.projectId !== projectId || !shareUsable(share)) throw notFound();
     if (guest.anonymous && !share.allowAnonymous) throw notFound();
     const project = await liveProject(share.ownerId, projectId);
-    if (permission === "write" && share.role !== "editor") throw fail("这条分享链接是只读的", 403, SHARE_READ_ONLY);
+    const role = share.role === "editor" && guest.anonymous && (!share.ownerPays || !share.allowAnonymousEdit) ? "viewer" : share.role;
+    if (permission === "write" && role !== "editor") throw fail("这条分享链接是只读的", 403, SHARE_READ_ONLY);
     return {
         project,
         ownerId: share.ownerId,
-        role: share.role,
+        role,
         share,
         actor: { id: guest.actorId, displayName: guest.displayName, avatarUrl: guest.avatarUrl },
         actorId: guest.actorId,

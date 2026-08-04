@@ -3,6 +3,7 @@ import type { ServerProject, ServerProjectEvent, ServerProjectPresence } from "@
 import { mergeProjectSnapshots } from "@/services/project-merge";
 import { subscribeRealtime, type RealtimeScope, type RealtimeSubscription } from "@/services/realtime/connection";
 import { PRESENCE_MIN_INTERVAL_MS } from "@/services/realtime/protocol";
+import { refreshShareSession } from "@/services/share-session";
 import { useShareStore } from "@/stores/use-share-store";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
 
@@ -30,7 +31,12 @@ export function getShareClientId() {
 
 let pushTimer: ReturnType<typeof setTimeout> | null = null;
 /** 串行保存的三态：在途、期间又有改动、连续冲突重试次数。 */
-const saveState = { inflight: false, dirty: false, retries: 0, base: null as CanvasProject | null };
+type ShareSaveState = { inflight: boolean; dirty: boolean; retries: number; base: CanvasProject | null };
+type ShareSyncScope = { generation: number; state: ShareSaveState; token: string; projectId: string };
+
+const createSaveState = (): ShareSaveState => ({ inflight: false, dirty: false, retries: 0, base: null });
+let saveState = createSaveState();
+let syncGeneration = 0;
 
 function toProject(item: ServerProject): CanvasProject {
     return { ...(item.data as CanvasProject), id: item.id, title: item.title, updatedAt: item.updatedAt, revision: item.revision };
@@ -41,10 +47,36 @@ export function cancelSharePush() {
     pushTimer = null;
 }
 
+function invalidateShareWrites() {
+    cancelSharePush();
+    syncGeneration += 1;
+    saveState = createSaveState();
+}
+
+export function cancelSharePendingWrites() {
+    invalidateShareWrites();
+}
+
+function captureScope(projectId: string): ShareSyncScope {
+    const store = useShareStore.getState();
+    return { generation: syncGeneration, state: saveState, token: store.token, projectId };
+}
+
+function isCurrentScope(scope: ShareSyncScope, requireProject = true) {
+    const store = useShareStore.getState();
+    return (
+        scope.generation === syncGeneration &&
+        scope.state === saveState &&
+        scope.token === store.token &&
+        (!requireProject || store.project?.id === scope.projectId)
+    );
+}
+
 /** 只读分享连排队都不该发生：编辑入口全禁用之后这里是最后一道闸。 */
 export function pushShareProject(project: CanvasProject) {
     const state = useShareStore.getState();
     if (state.role !== "editor" || state.status !== "ready" || !state.guestToken) return;
+    saveState.base ||= state.project;
     useShareStore.setState({ project });
     cancelSharePush();
     pushTimer = setTimeout(() => {
@@ -57,77 +89,107 @@ export function pushShareProject(project: CanvasProject) {
 export async function flushShareProject(): Promise<void> {
     const store = useShareStore.getState();
     if (store.role !== "editor" || store.status !== "ready" || !store.guestToken) return;
-    if (saveState.inflight) {
-        saveState.dirty = true;
-        return;
-    }
     const project = store.project;
     if (!project) return;
-    saveState.inflight = true;
-    saveState.dirty = false;
-    saveState.base ||= project;
+    const state = saveState;
+    const scope = captureScope(project.id);
+    if (state.inflight) {
+        state.dirty = true;
+        return;
+    }
+    state.inflight = true;
+    state.dirty = false;
+    state.base ||= project;
     useShareStore.getState().setSyncState("saving");
     try {
         const saved = await shareApi.saveProject(project.id, store.guestToken, { title: project.title, data: project, revision: store.revision || 0, clientId: shareClientId });
+        if (!isCurrentScope(scope) || useShareStore.getState().role !== "editor" || useShareStore.getState().status !== "ready") return;
         const confirmed = { ...project, revision: saved.revision, updatedAt: saved.updatedAt };
-        saveState.base = confirmed;
-        saveState.retries = 0;
-        useShareStore.setState({ project: { ...useShareStore.getState().project!, revision: saved.revision, updatedAt: saved.updatedAt }, revision: saved.revision });
-        useShareStore.getState().setSyncState("saved");
+        state.retries = 0;
+        const current = useShareStore.getState();
+        // 这次 PUT 的响应可能晚于一次实时远程拉取；旧 revision 只能当作已完成请求，不能把
+        // 已经合并到更高 revision 的 base/store 倒退回去。远程拉取会把 dirty 置回 true，finally 再补发。
+        if (saved.revision >= current.revision && current.project?.id === project.id) {
+            state.base = confirmed;
+            useShareStore.setState({ project: { ...current.project, revision: saved.revision, updatedAt: saved.updatedAt }, revision: saved.revision });
+            useShareStore.getState().setSyncState("saved");
+        }
     } catch (error) {
+        if (!isCurrentScope(scope)) return;
         if (isShareGone(error)) {
             useShareStore.getState().markGone("链接已失效");
         } else if (isShareReadOnly(error)) {
             // 链接在编辑途中被降级成只读。继续留在可编辑状态只会让访客一直改、一直存不上，
             // 当场收权并说明原因，比默默失败诚实。
-            useShareStore.getState().setRole("viewer");
+            cancelSharePendingWrites();
+            useShareStore.setState({ role: "viewer", fullCanvas: false });
             useShareStore.getState().setSyncState("failed", "这条分享链接已被改为只读，你的最新改动没有保存");
-            saveState.dirty = false;
-        } else if (isShareConflict(error) && (error as ShareApiError).data && saveState.base && saveState.retries < 3) {
+            state.dirty = false;
+            void loadShareProject(project.id);
+        } else if (isShareConflict(error) && (error as ShareApiError).data && state.base && state.retries < 3) {
             // 与账号侧同一套三方合并：base 是上次确认过的快照，local 是当前内存快照，remote 是服务端最新版本。
             const remote = toProject((error as ShareApiError).data as ServerProject);
-            saveState.retries += 1;
-            const local = useShareStore.getState().project;
-            if (local) {
-                const merged = mergeProjectSnapshots(saveState.base, local, remote);
+            state.retries += 1;
+            const current = useShareStore.getState();
+            const local = current.project;
+            if (local && (remote.revision || 0) > current.revision) {
+                const merged = mergeProjectSnapshots(state.base, local, remote);
                 useShareStore.setState({ project: merged, revision: remote.revision || 0 });
-                saveState.base = remote;
-                saveState.dirty = true;
-            }
+                state.base = remote;
+                state.dirty = true;
+            } else state.dirty = true;
         } else {
             useShareStore.getState().setSyncState("failed", error instanceof Error ? error.message : "保存失败");
         }
     } finally {
-        saveState.inflight = false;
-        if (saveState.dirty) {
-            saveState.dirty = false;
+        state.inflight = false;
+        if (!isCurrentScope(scope)) return;
+        if (state.dirty) {
+            state.dirty = false;
             void flushShareProject();
         }
     }
 }
 
-/** 按 ID 强制以远程为准拉取。分享画布不落本地库，只回写 share store。 */
+/** 拉取远程版本；有本地待保存改动时先三方合并。分享画布不落本地库，只回写 share store。 */
 export async function pullShareProject() {
     const { project, guestToken, token } = useShareStore.getState();
     if (!project || !guestToken || !token) return null;
+    const scope = captureScope(project.id);
     const item = await shareApi.project(project.id, guestToken);
-    const next = toProject(item);
+    if (!isCurrentScope(scope)) return null;
+    if ((item.revision || 0) <= (useShareStore.getState().revision || 0)) return null;
+    const remote = toProject(item);
+    const current = useShareStore.getState();
+    const local = current.project;
+    const hasLocalChanges = Boolean(pushTimer) || scope.state.inflight || scope.state.dirty;
     cancelSharePush();
-    saveState.base = next;
-    useShareStore.setState({ project: next, revision: next.revision || 0 });
-    return next;
+    if (local && scope.state.base && hasLocalChanges) {
+        const merged = mergeProjectSnapshots(scope.state.base, local, remote);
+        scope.state.base = remote;
+        useShareStore.setState({ project: merged, revision: remote.revision || 0 });
+        if (scope.state.inflight) scope.state.dirty = true;
+        else pushShareProject(merged);
+        return merged;
+    }
+    scope.state.base = remote;
+    useShareStore.setState({ project: remote, revision: remote.revision || 0 });
+    return remote;
 }
 
 /** 首次载入：拿到 guest 令牌后读一次画布本体。 */
 export async function loadShareProject(projectId: string) {
     const { guestToken } = useShareStore.getState();
     if (!guestToken) return null;
+    const scope = captureScope(projectId);
     try {
         const project = toProject(await shareApi.project(projectId, guestToken));
-        saveState.base = project;
+        if (!isCurrentScope(scope, false)) return null;
+        scope.state.base = project;
         useShareStore.getState().setProject(project, project.revision || 0);
         return project;
     } catch (error) {
+        if (!isCurrentScope(scope, false)) return null;
         if (isShareGone(error)) useShareStore.getState().markGone("链接不存在或已失效");
         else useShareStore.getState().setStatus("error", error instanceof Error ? error.message : "读取分享画布失败");
         return null;
@@ -162,7 +224,15 @@ function applyMembers(members: ServerProjectPresence[] | undefined) {
 
 /** 服务端在 ready 里带的是这条链接此刻的角色；owner 直连时是 owner，不属于分享角色，跳过。 */
 function applyRole(role: unknown) {
-    if ((role === "viewer" || role === "editor") && role !== useShareStore.getState().role) useShareStore.getState().setRole(role);
+    if (role !== "viewer" && role !== "editor") return;
+    const state = useShareStore.getState();
+    if (role === "viewer") {
+        const projectId = state.project?.id;
+        cancelSharePendingWrites();
+        useShareStore.setState({ role, fullCanvas: false });
+        if (projectId) void loadShareProject(projectId);
+    }
+    else if (role !== state.role) state.setRole(role);
 }
 
 /**
@@ -176,6 +246,27 @@ function applyRole(role: unknown) {
  */
 export function watchShareProject(projectId: string, handlers: { onProject?: (project: CanvasProject) => void; onDeleted?: () => void }, signal: AbortSignal) {
     let lastRevision = useShareStore.getState().revision || 0;
+    let pendingPullRevision = lastRevision;
+    let pullInFlight: Promise<void> | null = null;
+    const pullReadyRevision = (revision: number) => {
+        pendingPullRevision = Math.max(pendingPullRevision, revision);
+        if (signal.aborted || pendingPullRevision <= lastRevision || pullInFlight) return;
+        pullInFlight = (async () => {
+            while (!signal.aborted && pendingPullRevision > lastRevision) {
+                const target = pendingPullRevision;
+                const project = await pullShareProject();
+                const applied = useShareStore.getState().revision || 0;
+                if (applied < target) return;
+                lastRevision = Math.max(lastRevision, applied);
+                if (project) handlers.onProject?.(project);
+            }
+        })()
+            .catch(() => undefined)
+            .finally(() => {
+                pullInFlight = null;
+                if (!signal.aborted && pendingPullRevision > lastRevision) window.setTimeout(() => pullReadyRevision(pendingPullRevision), RETRIES[0]);
+            });
+    };
     let fallback: AbortController | null = null;
     const stopFallback = () => {
         fallback?.abort();
@@ -197,10 +288,11 @@ export function watchShareProject(projectId: string, handlers: { onProject?: (pr
         payload: () => ({ clientId: shareClientId, sinceRevision: lastRevision }),
         onReady: (payload) => {
             const ready = (payload || {}) as { revision?: number; role?: unknown; members?: ServerProjectPresence[] };
-            lastRevision = Math.max(lastRevision, Number(ready.revision) || 0);
+            pullReadyRevision(Number(ready.revision) || 0);
             applyRole(ready.role);
             applyMembers(ready.members);
             useShareStore.getState().setStreamStatus("ready");
+            void refreshShareSession();
             stopFallback();
         },
         onEvent: (event) => {
@@ -208,15 +300,15 @@ export function watchShareProject(projectId: string, handlers: { onProject?: (pr
             if (event.type === "project.deleted") return handlers.onDeleted?.();
             if (event.type === "ready") return;
             if (event.revision <= lastRevision) return;
-            lastRevision = event.revision;
-            if (event.writerClientId === shareClientId) return;
-            void pullShareProject()
-                .then((project) => project && handlers.onProject?.(project))
-                .catch(() => undefined);
+            if (event.writerClientId === shareClientId) {
+                lastRevision = event.revision;
+                return;
+            }
+            pullReadyRevision(event.revision);
         },
         onDegrade: () => {
             useShareStore.getState().setStreamStatus("reconnecting");
-            startFallback();
+            void refreshShareSession().finally(startFallback);
         },
         onRecover: stopFallback,
         onTerminal: (failure) => {
@@ -227,7 +319,7 @@ export function watchShareProject(projectId: string, handlers: { onProject?: (pr
             }
             // 其余终态（撤销、降级、权限被收）都分不清是「没了」还是「变只读了」：让 SSE 重新鉴权一次去分。
             useShareStore.getState().setStreamStatus("reconnecting");
-            startFallback();
+            void refreshShareSession().finally(startFallback);
         },
     });
     useShareStore.getState().setStreamStatus("connecting");
@@ -251,10 +343,29 @@ export function watchShareProject(projectId: string, handlers: { onProject?: (pr
 function watchShareProjectViaSse(projectId: string, handlers: { onProject?: (project: CanvasProject) => void; onDeleted?: () => void }, signal: AbortSignal) {
     void (async () => {
         let failure = 0;
+        let lastRevision = useShareStore.getState().revision || 0;
+        let pendingPullRevision = lastRevision;
+        let pullInFlight: Promise<void> | null = null;
+        const pullReadyRevision = (revision: number) => {
+            pendingPullRevision = Math.max(pendingPullRevision, revision);
+            if (signal.aborted || pendingPullRevision <= lastRevision || pullInFlight) return;
+            pullInFlight = pullShareProject()
+                .then((project) => {
+                    const applied = useShareStore.getState().revision || 0;
+                    if (applied < pendingPullRevision) return;
+                    lastRevision = Math.max(lastRevision, applied);
+                    if (project) handlers.onProject?.(project);
+                })
+                .catch(() => undefined)
+                .finally(() => {
+                    pullInFlight = null;
+                    if (!signal.aborted && pendingPullRevision > lastRevision) window.setTimeout(() => pullReadyRevision(pendingPullRevision), RETRIES[0]);
+                });
+        };
         while (!signal.aborted) {
             const store = useShareStore.getState();
             if (!store.guestToken) break;
-            let lastRevision = store.revision || 0;
+            lastRevision = Math.max(lastRevision, store.revision || 0);
             store.setStreamStatus(failure ? "reconnecting" : "connecting");
             try {
                 await shareProjectStream(
@@ -264,24 +375,25 @@ function watchShareProjectViaSse(projectId: string, handlers: { onProject?: (pro
                     lastRevision,
                     (event: ServerProjectEvent) => {
                         if (event.type === "ready") {
-                            lastRevision = Math.max(lastRevision, event.revision);
+                            pullReadyRevision(event.revision);
                             // 降级为只读会先断流，重连后的 ready 是最早能拿到新角色的地方。
                             // 不在这里同步，访客最长要到下次续期（10 分钟）才知道自己已经不能编辑了。
                             // owner 不是分享角色（所有者自己开这条流时会带上），跳过不动。
-                            if ((event.role === "viewer" || event.role === "editor") && event.role !== useShareStore.getState().role) useShareStore.getState().setRole(event.role);
+                            applyRole(event.role);
                             useShareStore.getState().setMembers(event.members.filter((item) => item.clientId !== shareClientId));
                             useShareStore.getState().setStreamStatus("ready");
+                            void refreshShareSession();
                             failure = 0;
                         } else if (event.type === "presence.sync") {
                             useShareStore.getState().setMembers(event.members.filter((item) => item.clientId !== shareClientId));
                         } else if (event.type === "project.deleted") {
                             handlers.onDeleted?.();
                         } else if (event.revision > lastRevision) {
-                            lastRevision = event.revision;
-                            if (event.writerClientId === shareClientId) return;
-                            void pullShareProject()
-                                .then((project) => project && handlers.onProject?.(project))
-                                .catch(() => undefined);
+                            if (event.writerClientId === shareClientId) {
+                                lastRevision = event.revision;
+                                return;
+                            }
+                            pullReadyRevision(event.revision);
                         }
                     },
                     signal,
@@ -294,7 +406,10 @@ function watchShareProjectViaSse(projectId: string, handlers: { onProject?: (pro
                 }
                 useShareStore.getState().setStreamStatus("reconnecting");
             }
-            if (!signal.aborted) await sleep(RETRIES[Math.min(failure++, RETRIES.length - 1)], signal).catch(() => undefined);
+            if (!signal.aborted) {
+                await refreshShareSession();
+                await sleep(RETRIES[Math.min(failure++, RETRIES.length - 1)], signal).catch(() => undefined);
+            }
         }
     })();
     return shareClientId;
@@ -336,9 +451,5 @@ export function createSharePresenceReporter(projectId: string) {
 
 /** 页面卸载时把状态清干净，免得下一次打开别的分享链接读到上一次的残留。 */
 export function resetShareSync() {
-    cancelSharePush();
-    saveState.inflight = false;
-    saveState.dirty = false;
-    saveState.retries = 0;
-    saveState.base = null;
+    invalidateShareWrites();
 }

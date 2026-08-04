@@ -7,7 +7,7 @@ import { accessContext, projectAuth, requireUser, userAuth } from "../middleware
 import { resolveProjectAccess } from "../services/project-access";
 import { getProjectTeam, setProjectTeam } from "../services/project-team";
 import { listProjectPresence, PRESENCE_SOURCE_HTTP, removeProjectPresence, subscribeProject, updateProjectPresence, type ProjectActivity } from "../services/project-realtime";
-import { logShareAccess } from "../services/project-share";
+import { logShareAccess, scheduleShareExpiry } from "../services/project-share";
 import { deleteProject, deleteUserAsset, deleteUserPlugin, listProjects, listUserAssets, listUserPlugins, saveProject, saveUserAsset, saveUserPlugin, toProjectView } from "../services/sync";
 
 export const syncRouter = Router();
@@ -37,6 +37,7 @@ syncRouter.get(
         let sink: (event: unknown) => void = () => undefined;
         const stream = createBufferedWriter((event) => sink(event));
         let keepAlive: NodeJS.Timeout | undefined;
+        let cancelExpiry: () => void = () => undefined;
         let released = false;
         // 清理必须在订阅之后立刻挂上：读库这段 await 里对端就可能断开，
         // 等到最后再注册的话，这中间断掉的连接不会有人退订，listener 和 Presence 就永久留在内存里。
@@ -44,6 +45,7 @@ syncRouter.get(
             if (released) return;
             released = true;
             if (keepAlive) clearInterval(keepAlive);
+            cancelExpiry();
             unsubscribe();
             // 只删仍然属于 HTTP/SSE 这条路径的记录：客户端可能已经切到 WebSocket 并重新上报过，
             // 无条件删会把那条还活着的记录抹掉，用户在别人画布上消失到下一次心跳为止。
@@ -59,6 +61,12 @@ syncRouter.get(
         } catch (error) {
             release();
             throw error;
+        }
+        if (access.share?.expiresAt) {
+            cancelExpiry = scheduleShareExpiry(access.share.expiresAt, () => {
+                release();
+                if (!res.writableEnded) res.end();
+            });
         }
         res.status(200);
         res.setHeader("Content-Type", "text/event-stream; charset=utf-8");

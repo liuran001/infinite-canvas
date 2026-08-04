@@ -31,8 +31,15 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
     const [role, setRole] = useState<ShareRole>("viewer");
     const [allowAnonymous, setAllowAnonymous] = useState(true);
     const [allowClone, setAllowClone] = useState(false);
+    const [ownerPays, setOwnerPays] = useState(false);
+    const [allowAnonymousEdit, setAllowAnonymousEdit] = useState(false);
     const [expiresAt, setExpiresAt] = useState<Dayjs | null>(null);
     const [logShareId, setLogShareId] = useState("");
+    const anonymousEditEnabled = role === "editor" && allowAnonymous && ownerPays;
+
+    useEffect(() => {
+        if (!anonymousEditEnabled) setAllowAnonymousEdit(false);
+    }, [anonymousEditEnabled]);
 
     const load = useCallback(async () => {
         setLoading(true);
@@ -52,7 +59,7 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
     const create = async () => {
         setCreating(true);
         try {
-            const share = await shareAdminApi.create(projectId, { role, allowAnonymous, allowClone, expiresAt: expiresAt ? expiresAt.toISOString() : null });
+            const share = await shareAdminApi.create(projectId, { role, allowAnonymous, allowClone, ownerPays, allowAnonymousEdit: anonymousEditEnabled && allowAnonymousEdit, expiresAt: expiresAt ? expiresAt.toISOString() : null });
             setCreated(share);
             setShares((prev) => [share, ...prev]);
         } catch (error) {
@@ -117,6 +124,12 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
                     <Field label="允许保存到自己账号" hint={allowClone ? "访客可以克隆一份独立副本，副本与这张画布互不影响。" : "访客不能把这张画布克隆走。"}>
                         <Switch checked={allowClone} onChange={setAllowClone} />
                     </Field>
+                    <Field label="由我支付算力点" hint={ownerPays ? "分享访客触发的生成由你支付算力点。" : "关闭后，访客生成需要自己的账号承担算力点。"}>
+                        <Switch checked={ownerPays} onChange={setOwnerPays} />
+                    </Field>
+                    <Field label="允许匿名用户编辑" hint="仅当权限为可编辑、允许匿名访问且由我支付算力点时可用。">
+                        <Switch checked={allowAnonymousEdit} disabled={!anonymousEditEnabled} onChange={setAllowAnonymousEdit} />
+                    </Field>
                     <Field label="过期时间" hint={expiresAt ? `到 ${expiresAt.format("YYYY-MM-DD HH:mm")} 后链接自动失效。` : "留空表示永不过期。"}>
                         <DatePicker showTime value={expiresAt} onChange={setExpiresAt} placeholder="永不过期" disabledDate={(date) => date.isBefore(dayjs(), "day")} />
                     </Field>
@@ -177,7 +190,7 @@ function ShareRow({
 }: {
     share: ShareRecord;
     theme: CanvasTheme;
-    onPatch: (share: ShareRecord, input: { role?: ShareRole; allowAnonymous?: boolean; allowClone?: boolean; enabled?: boolean; expiresAt?: string | null }) => Promise<void>;
+    onPatch: (share: ShareRecord, input: { role?: ShareRole; allowAnonymous?: boolean; allowClone?: boolean; ownerPays?: boolean; allowAnonymousEdit?: boolean; enabled?: boolean; expiresAt?: string | null }) => Promise<void>;
     onRevoke: (share: ShareRecord) => void;
     onViewLogs: () => void;
 }) {
@@ -206,11 +219,19 @@ function ShareRow({
             <div className="grid grid-cols-2 gap-2 text-xs">
                 <label className="flex items-center justify-between gap-2">
                     <span className="opacity-70">匿名访问</span>
-                    <Switch size="small" disabled={dead} checked={share.allowAnonymous} onChange={(checked) => void onPatch(share, { allowAnonymous: checked })} />
+                    <Switch size="small" disabled={dead} checked={share.allowAnonymous} onChange={(checked) => void onPatch(share, { allowAnonymous: checked, ...(checked ? {} : { allowAnonymousEdit: false }) })} />
                 </label>
                 <label className="flex items-center justify-between gap-2">
                     <span className="opacity-70">允许克隆</span>
                     <Switch size="small" disabled={dead} checked={share.allowClone} onChange={(checked) => void onPatch(share, { allowClone: checked })} />
+                </label>
+                <label className="flex items-center justify-between gap-2">
+                    <span className="opacity-70">由我支付算力点</span>
+                    <Switch size="small" disabled={dead} checked={share.ownerPays} onChange={(checked) => void onPatch(share, { ownerPays: checked, ...(checked ? {} : { allowAnonymousEdit: false }) })} />
+                </label>
+                <label className="flex items-center justify-between gap-2">
+                    <span className="opacity-70">匿名用户编辑</span>
+                    <Switch size="small" disabled={dead || share.role !== "editor" || !share.allowAnonymous || !share.ownerPays} checked={share.allowAnonymousEdit} onChange={(checked) => void onPatch(share, { allowAnonymousEdit: checked })} />
                 </label>
             </div>
 
@@ -219,7 +240,7 @@ function ShareRow({
                     size="small"
                     disabled={dead}
                     value={share.role}
-                    onChange={(value) => void onPatch(share, { role: value as ShareRole })}
+                    onChange={(value) => void onPatch(share, { role: value as ShareRole, ...(value === "editor" ? {} : { allowAnonymousEdit: false }) })}
                     options={[
                         { label: "只读", value: "viewer" },
                         { label: "可编辑", value: "editor" },

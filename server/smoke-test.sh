@@ -246,6 +246,11 @@ let lastTools = [];
 let lastChat = null;
 // 最后一次生图请求的原始请求体，用来断言工具参数真的透传到了上游，而不是在半路被丢掉。
 let lastImage = null;
+// 生图上游真实收到的请求数。并发幂等回归用它确认多个同 clientJobId
+// 不只是返回了同一个任务 ID，后台也确实只执行了一次。
+let imageRequests = 0;
+// 晚取消回归：上游已经给出结果 URL、服务端正在落文件时再取消，任务仍要立即退款并保留已落下的产物。
+let lateCancelDownloads = 0;
 
 function streamText(res, toEvent) {
     res.setHeader("Content-Type", "text/event-stream");
@@ -323,6 +328,15 @@ require("http").createServer((req, res) => {
         if (req.url === "/_tools") return res.end(JSON.stringify({ tools: lastTools }));
         if (req.url === "/_last") return res.end(JSON.stringify(lastChat || {}));
         if (req.url === "/_lastimage") return res.end(JSON.stringify(lastImage || {}));
+        if (req.url === "/_imagecount") return res.end(JSON.stringify({ count: imageRequests }));
+        if (req.url === "/_latecancelhits") return res.end(JSON.stringify({ count: lateCancelDownloads }));
+        if (req.url === "/img/late-cancel.png") {
+            lateCancelDownloads += 1;
+            res.setHeader("Content-Type", "image/png");
+            return setTimeout(() => {
+                if (!res.destroyed && !res.writableEnded) res.end(Buffer.from(PNG_OTHER, "base64"));
+            }, 1800);
+        }
         if (IMAGES[req.url]) {
             const [type, buffer] = IMAGES[req.url];
             res.setHeader("Content-Type", type);
@@ -459,6 +473,16 @@ require("http").createServer((req, res) => {
         }
 
         lastImage = body;
+        imageRequests += 1;
+        if (String(body.prompt || "").includes("晚取消保留产物")) {
+            return res.end(JSON.stringify({ data: [{ url: `${IMG_ORIGIN}/img/late-cancel.png` }] }));
+        }
+        // 分享任务取消用例需要一个确定的 running 窗口；只对特定提示词延迟，不拖慢其它生图断言。
+        if (String(body.prompt || "").includes("等待取消")) {
+            return setTimeout(() => {
+                if (!res.destroyed && !res.writableEnded) res.end(JSON.stringify({ data: [{ b64_json: PNG }] }));
+            }, 3000);
+        }
         res.end(JSON.stringify({ data: [{ b64_json: PNG }] }));
     });
 // 监听所有网卡而不是只监听 127.0.0.1：import_image 的地址要用本机主机名才能过服务端的内网拦截，
@@ -512,6 +536,7 @@ check "按类型筛选生成记录生效" "$(curl -s "$BASE/admin/jobs?kind=vide
 check "按提示词关键词检索生效" "$(curl -s --get "$BASE/admin/jobs" --data-urlencode 'keyword=一只狗' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "1"
 check "任务详情带出完整参数" "$(curl -s "$BASE/admin/jobs/$JOB_OK" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.params.count)" "1"
 check "任务详情带出失败原因" "$(curl -s "$BASE/admin/jobs/$JOB1" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.error)" "算力点不足"
+
 check "按用户筛选画布生效" "$(curl -s "$BASE/admin/projects?userId=$USER_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "2"
 check "换个用户筛不出画布" "$(curl -s "$BASE/admin/projects?userId=$ADMIN_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)" "0"
 check "画布列表带出节点数" "$(curl -s --get "$BASE/admin/projects" --data-urlencode 'keyword=审查用画布' -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.items[0].nodeCount')" "2"
@@ -524,8 +549,9 @@ check "文件列表带出所属用户名" "$(curl -s "$BASE/admin/files?userId=$
 
 echo "画布分享"
 # 分享链接就是能力凭证：这一节要跑通「建链接 → 换 guest 令牌 → 访客读写 → 撤销断流 → 克隆」整条链路，
-# 并守住两条底线：明文 token 不出现在列表里，guest 身份碰不到账号级能力。
+# 并守住两条底线：只有所有者能从列表取回明文 token，guest 身份碰不到账号级能力。
 CLONER_TOKEN=$(curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' -d '{"username":"share-cloner","password":"cloner-pass"}' | jq -r .data.token)
+CLONER_ID=$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .data.id)
 curl -s -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"title":"分享画布","revision":0,"clientId":"smoke-share","data":{"nodes":[{"id":"s1","type":"image","metadata":{"storageKey":"server:'"$FILE_ID"'"}}],"connections":[]}}' >/dev/null
 check "未登录不能创建分享" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/projects/share-p1/shares" -H 'Content-Type: application/json' -d '{"role":"viewer"}')" "401"
 
@@ -546,6 +572,7 @@ check "他人管理分享按画布不存在处理" "$(curl -s -o /dev/null -w '%
 SESSION=$(curl -s -X POST "$BASE/v1/shares/$TOKEN/session")
 GUEST=$(echo "$SESSION" | jq -r .data.token)
 check "匿名换取 guest 令牌" "$(echo "$SESSION" | jq -r .data.role)" "viewer"
+check "viewer 分享不会进入完整画布" "$(echo "$SESSION" | jq -r .data.fullCanvas)" "false"
 check "换令牌时带出画布元信息" "$(echo "$SESSION" | jq -r '"\(.data.project.title)/\(.data.project.revision)"')" "分享画布/1"
 # 明文只给画布所有者。访客换令牌的响应里出现它的话，一条只读链接的持有者就能拿到
 # 同一条分享的原始 token——而这条 token 正是他手里那条，但更要紧的是这条路径绝不能有任何
@@ -565,7 +592,8 @@ check "访客不能管理分享" "$(curl -s -o /dev/null -w '%{http_code}' "$BAS
 check "访客不能列出画布" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects" -H "Authorization: Bearer $GUEST")" "403"
 check "访客不能用 Agent" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/agent/sessions" -H "Authorization: Bearer $GUEST" -H 'Content-Type: application/json' -d '{"projectId":"share-p1"}')" "403"
 check "访客不能调模型" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/ai/chat/completions" -H "Authorization: Bearer $GUEST" -H 'Content-Type: application/json' -d '{"model":"mock-image"}')" "403"
-check "访客不能提交生成任务" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $GUEST" -H 'Content-Type: application/json' -d '{"clientJobId":"guest-1","kind":"image","model":"mock-image","prompt":"x","params":{},"inputFileIds":[]}')" "403"
+check "只读访客不能提交生成任务" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $GUEST" -H 'Content-Type: application/json' -d '{"clientJobId":"guest-1","kind":"image","model":"mock-image","prompt":"x","params":{},"inputFileIds":[],"billingProjectId":"share-p1"}')" "403"
+check "分享访客不能建立账号任务事件流" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$BASE/v1/jobs/stream?sinceSeq=0" -H "Authorization: Bearer $GUEST")" "403"
 check "访客不能读账号偏好" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/preferences" -H "Authorization: Bearer $GUEST")" "403"
 check "访客不能读云空间用量" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/storage" -H "Authorization: Bearer $GUEST")" "403"
 check "guest 令牌换不出账号身份" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $GUEST" | jq -r .data.role)" "guest"
@@ -574,11 +602,24 @@ check "viewer 写入有稳定错误码" "$(curl -s -X PUT "$BASE/v1/projects/sha
 printf 'share-guest-upload-payload' >"$WORK/share-guest.png"
 check "只读访客不能上传" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/files" -H "Authorization: Bearer $GUEST" -F "file=@$WORK/share-guest.png;type=image/png" -F "projectId=share-p1")" "403"
 
-# 可编辑分享：写的是所有者的项目本体，复用现有 CAS 与广播，不另起一条写路径。
-ESHARE=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"editor","allowAnonymous":true,"allowClone":false}')
+# 没有房主代扣时，匿名即使拿到 editor 链接也只能看，服务端会把非法配置归一化掉。
+ANON_NO_PAY=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"editor","allowAnonymous":true,"allowClone":false,"ownerPays":false,"allowAnonymousEdit":true}')
+ANON_NO_PAY_TOKEN=$(echo "$ANON_NO_PAY" | jq -r .data.token)
+ANON_NO_PAY_SESSION=$(curl -s -X POST "$BASE/v1/shares/$ANON_NO_PAY_TOKEN/session")
+ANON_NO_PAY_GUEST=$(echo "$ANON_NO_PAY_SESSION" | jq -r .data.token)
+check "未代扣时匿名编辑开关被归一化关闭" "$(echo "$ANON_NO_PAY" | jq -r .data.allowAnonymousEdit)" "false"
+check "未代扣时匿名访客只进精简只读画布" "$(echo "$ANON_NO_PAY_SESSION" | jq -r .data.fullCanvas)" "false"
+check "未代扣时匿名访客写入被拒" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $ANON_NO_PAY_GUEST" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":1,"clientId":"anon-no-pay"}')" "403"
+
+# 可编辑匿名分享只有在房主代扣与匿名编辑同时开启时才获得完整能力。
+ESHARE=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"editor","allowAnonymous":true,"allowClone":false,"ownerPays":true,"allowAnonymousEdit":true}')
 ETOKEN=$(echo "$ESHARE" | jq -r .data.token)
 ESHARE_ID=$(echo "$ESHARE" | jq -r .data.id)
-EGUEST=$(curl -s -X POST "$BASE/v1/shares/$ETOKEN/session" | jq -r .data.token)
+ESESSION=$(curl -s -X POST "$BASE/v1/shares/$ETOKEN/session")
+EGUEST=$(echo "$ESESSION" | jq -r .data.token)
+check "房主代扣的匿名 editor 进入完整画布" "$(echo "$ESESSION" | jq -r .data.fullCanvas)" "true"
+check "匿名 editor 会话带出房主代扣" "$(echo "$ESESSION" | jq -r .data.ownerPays)" "true"
+check "匿名 editor 会话带出匿名编辑许可" "$(echo "$ESESSION" | jq -r .data.allowAnonymousEdit)" "true"
 REV=$(curl -s "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST" | jq -r .data.revision)
 WROTE=$(curl -s -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d "{\"title\":\"访客改标题\",\"data\":{\"nodes\":[{\"id\":\"s1\",\"type\":\"image\",\"metadata\":{\"storageKey\":\"server:$FILE_ID\"}}]},\"revision\":$REV,\"clientId\":\"share-editor-1\"}")
 check "editor 访客写入成功" "$(echo "$WROTE" | jq -r .data.revision)" "$((REV + 1))"
@@ -597,8 +638,74 @@ check "访客上传的文件归所有者" "$(curl -s "$BASE/v1/files/$FID" -H "A
 check "访客上传计入所有者名下" "$(curl -s "$BASE/admin/files?userId=$USER_ID" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r "[.data.items[] | select(.id==\"$FID\")] | length")" "1"
 check "别的账号读不到这个文件" "$(curl -s "$BASE/v1/files/$FID" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .msg)" "无权访问该文件"
 
+OWNER_CREDITS_BEFORE_SHARE_JOB=$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)
+SHARE_JOB=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d '{"clientJobId":"share-owner-pays","kind":"image","model":"mock-image","prompt":"房主代扣生成","params":{"count":1},"inputFileIds":[],"context":{"source":"canvas","projectId":"share-p1","nodeId":"share-job-owner"},"billingProjectId":"share-p1"}' | jq -r .data.id)
+for _ in $(seq 1 30); do
+    [ "$(curl -s "$BASE/v1/jobs/$SHARE_JOB" -H "Authorization: Bearer $EGUEST" | jq -r .data.status)" = "succeeded" ] && break
+    sleep 1
+done
+SHARE_JOB_VIEW=$(curl -s "$BASE/v1/jobs/$SHARE_JOB" -H "Authorization: Bearer $EGUEST")
+check "匿名完整画布可以生成" "$(echo "$SHARE_JOB_VIEW" | jq -r .data.status)" "succeeded"
+check "匿名生成扣房主个人算力点" "$((OWNER_CREDITS_BEFORE_SHARE_JOB - $(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)))" "1"
+SHARE_JOB_FILE=$(echo "$SHARE_JOB_VIEW" | jq -r .data.outputs[0].id)
+check "分享生成产物归房主文件空间" "$(curl -s "$BASE/v1/files/$SHARE_JOB_FILE" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.id)" "$SHARE_JOB_FILE"
+# 任务已经创建后，分享策略只影响新任务；同一幂等请求的网络重试必须直接命中旧任务，
+# 不能因为此刻关闭了房主代扣就突然要求匿名访客登录或确认自费。
+curl -s -X PATCH "$BASE/v1/projects/share-p1/shares/$ESHARE_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"ownerPays":false,"allowAnonymousEdit":false}' >/dev/null
+check "策略切换后原任务幂等重试仍命中旧任务" "$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d '{"clientJobId":"share-owner-pays","kind":"image","model":"mock-image","prompt":"房主代扣生成","params":{"count":1},"inputFileIds":[],"context":{"source":"canvas","projectId":"share-p1","nodeId":"share-job-owner"},"billingProjectId":"share-p1"}' | jq -r .data.id)" "$SHARE_JOB"
+curl -s -X PATCH "$BASE/v1/projects/share-p1/shares/$ESHARE_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"ownerPays":true,"allowAnonymousEdit":true}' >/dev/null
+OTHER_EGUEST=$(curl -s -X POST "$BASE/v1/shares/$ETOKEN/session" | jq -r .data.token)
+check "同一分享的其他协作者可续查生成任务" "$(curl -s "$BASE/v1/jobs/$SHARE_JOB" -H "Authorization: Bearer $OTHER_EGUEST" | jq -r .data.id)" "$SHARE_JOB"
+check "同一分享刷新能列出其他协作者的任务" "$(curl -s "$BASE/v1/jobs?status=succeeded" -H "Authorization: Bearer $OTHER_EGUEST" | jq -r '[.data.items[] | select(.id=="'"$SHARE_JOB"'")] | length')" "1"
+check "不同分享仍读不到这条任务" "$(curl -s "$BASE/v1/jobs/$SHARE_JOB" -H "Authorization: Bearer $ANON_NO_PAY_GUEST" | jq -r .msg)" "任务不存在"
+
+# 发起者离开分享页后，房主仍要能从普通账号画布恢复和停止写入自己画布的任务。
+OWNER_CANCEL_JOB=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d '{"clientJobId":"share-owner-cancel","kind":"image","model":"mock-image","prompt":"等待取消：房主止损","params":{"count":1},"inputFileIds":[],"context":{"source":"canvas","projectId":"share-p1","nodeId":"share-job-owner-cancel"},"billingProjectId":"share-p1"}' | jq -r .data.id)
+for _ in $(seq 1 20); do
+    [ "$(curl -s "$BASE/v1/jobs/$OWNER_CANCEL_JOB" -H "Authorization: Bearer $EGUEST" | jq -r .data.status)" = "running" ] && break
+    sleep 0.1
+done
+check "房主账号列表能恢复协作者分享任务" "$(curl -s "$BASE/v1/jobs?status=pending,running" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.items[] | select(.id=="'"$OWNER_CANCEL_JOB"'")] | length')" "1"
+check "房主账号可续查协作者分享任务" "$(curl -s "$BASE/v1/jobs/$OWNER_CANCEL_JOB" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.id)" "$OWNER_CANCEL_JOB"
+check "房主账号可取消协作者分享任务" "$(curl -s -X POST "$BASE/v1/jobs/$OWNER_CANCEL_JOB/cancel" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" "canceled"
+
+# 降为只读只阻止继续编辑；原发起者必须还能取消已经在跑的任务，避免没有任何止损入口。
+DOWNGRADE_CANCEL_JOB=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d '{"clientJobId":"share-downgrade-cancel","kind":"image","model":"mock-image","prompt":"等待取消：降级后止损","params":{"count":1},"inputFileIds":[],"context":{"source":"canvas","projectId":"share-p1","nodeId":"share-job-downgrade-cancel"},"billingProjectId":"share-p1"}' | jq -r .data.id)
+for _ in $(seq 1 20); do
+    [ "$(curl -s "$BASE/v1/jobs/$DOWNGRADE_CANCEL_JOB" -H "Authorization: Bearer $EGUEST" | jq -r .data.status)" = "running" ] && break
+    sleep 0.1
+done
+curl -s -X PATCH "$BASE/v1/projects/share-p1/shares/$ESHARE_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"viewer"}' >/dev/null
+check "分享降为只读后发起者仍可取消旧任务" "$(curl -s -X POST "$BASE/v1/jobs/$DOWNGRADE_CANCEL_JOB/cancel" -H "Authorization: Bearer $EGUEST" | jq -r .data.status)" "canceled"
+curl -s -X PATCH "$BASE/v1/projects/share-p1/shares/$ESHARE_ID" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"editor","ownerPays":true,"allowAnonymousEdit":true}' >/dev/null
+
+# 登录协作者在房主不代扣时仍获得完整画布，但第一次扣点操作必须显式确认由自己支付。
+curl -s -X POST "$BASE/admin/users/$CLONER_ID/credits" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"credits":5}' >/dev/null
+SELF_PAY_SHARE=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"editor","allowAnonymous":true,"allowClone":false,"ownerPays":false,"allowAnonymousEdit":false}')
+SELF_PAY_TOKEN=$(echo "$SELF_PAY_SHARE" | jq -r .data.token)
+SELF_PAY_ANON=$(curl -s -X POST "$BASE/v1/shares/$SELF_PAY_TOKEN/session")
+SELF_PAY_SESSION=$(curl -s -X POST "$BASE/v1/shares/$SELF_PAY_TOKEN/session" -H "X-User-Authorization: Bearer $CLONER_TOKEN")
+SELF_PAY_GUEST=$(echo "$SELF_PAY_SESSION" | jq -r .data.token)
+OWNER_SELF_PAY_SESSION=$(curl -s -X POST "$BASE/v1/shares/$SELF_PAY_TOKEN/session" -H "X-User-Authorization: Bearer $USER_TOKEN")
+check "未代扣时匿名访客仍是只读画布" "$(echo "$SELF_PAY_ANON" | jq -r .data.fullCanvas)" "false"
+check "未代扣时登录 editor 进入完整画布" "$(echo "$SELF_PAY_SESSION" | jq -r .data.fullCanvas)" "true"
+check "登录 editor 会话要求自费确认" "$(echo "$SELF_PAY_SESSION" | jq -r .data.selfPayRequired)" "true"
+check "房主打开自己的未代扣分享无需自费确认" "$(echo "$OWNER_SELF_PAY_SESSION" | jq -r .data.selfPayRequired)" "false"
+check "自费任务必须同时带当前账号凭据" "$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $SELF_PAY_GUEST" -H 'Content-Type: application/json' -d '{"clientJobId":"share-self-pay-no-account","kind":"image","model":"mock-image","prompt":"x","params":{},"inputFileIds":[],"billingProjectId":"share-p1","acceptSelfPay":true}' | jq -r .code)" "SELF_PAY_LOGIN_REQUIRED"
+check "缺少自费确认时任务被拒" "$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $SELF_PAY_GUEST" -H "X-User-Authorization: Bearer $CLONER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"share-self-pay-missing","kind":"image","model":"mock-image","prompt":"x","params":{},"inputFileIds":[],"billingProjectId":"share-p1"}' | jq -r .code)" "SELF_PAY_CONFIRM_REQUIRED"
+OWNER_BEFORE_SELF_PAY=$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)
+CLONER_BEFORE_SELF_PAY=$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .data.credits)
+SELF_PAY_JOB=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $SELF_PAY_GUEST" -H "X-User-Authorization: Bearer $CLONER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"share-self-pay-ok","kind":"image","model":"mock-image","prompt":"协作者自费生成","params":{"count":1},"inputFileIds":[],"context":{"source":"canvas","projectId":"share-p1","nodeId":"share-job-self"},"billingProjectId":"share-p1","acceptSelfPay":true}' | jq -r .data.id)
+for _ in $(seq 1 30); do
+    [ "$(curl -s "$BASE/v1/jobs/$SELF_PAY_JOB" -H "Authorization: Bearer $SELF_PAY_GUEST" | jq -r .data.status)" = "succeeded" ] && break
+    sleep 1
+done
+check "确认后登录协作者生成成功" "$(curl -s "$BASE/v1/jobs/$SELF_PAY_JOB" -H "Authorization: Bearer $SELF_PAY_GUEST" | jq -r .data.status)" "succeeded"
+check "确认后扣协作者个人算力点" "$((CLONER_BEFORE_SELF_PAY - $(curl -s "$BASE/auth/me" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .data.credits)))" "1"
+check "协作者自费不会再扣房主" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)" "$OWNER_BEFORE_SELF_PAY"
+
 # 访客上传单独限流：配额只拦总量，拦不住「拿分享链接当图床」在几分钟内把所有者的空间刷满。
-RSHARE=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"editor","allowAnonymous":true,"allowClone":false}')
+RSHARE=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"editor","allowAnonymous":true,"allowClone":false,"ownerPays":true,"allowAnonymousEdit":true}')
 RGUEST=$(curl -s -X POST "$BASE/v1/shares/$(echo "$RSHARE" | jq -r .data.token)/session" | jq -r .data.token)
 RATE_LAST=0
 for _ in $(seq 1 21); do
@@ -645,6 +752,7 @@ check "访客流曾经建立成功" "$(grep -c '"type":"ready"' "$WORK/share-str
 check "撤销后长连接被主动断开" "$([ "$(($(date +%s) - REVOKE_AT))" -le 3 ] && echo yes || echo no)" "yes"
 check "撤销后旧 guest 令牌读画布返回 404" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST")" "404"
 check "撤销后旧 guest 令牌写入返回 404" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $EGUEST" -H 'Content-Type: application/json' -d '{"title":"x","data":{},"revision":9,"clientId":"share-editor-1"}')" "404"
+check "撤销后旧 guest 令牌不能再查询分享任务" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/jobs/$SHARE_JOB" -H "Authorization: Bearer $EGUEST")" "404"
 check "撤销后原始 token 也换不到令牌" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$ETOKEN/session")" "404"
 # 存量记录建于「只存哈希」的年代。它必须表现成「不可复制」并且不给出残缺链接，
 # 前端据 copyable 决定是给复制按钮还是给「旧链接只能看前缀」的说明，不能靠空串去猜。
@@ -678,6 +786,17 @@ curl -s -X PATCH "$BASE/v1/projects/share-p1/shares/$SHARE_ID" -H "Authorization
 check "停用后换不到令牌" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$TOKEN/session")" "404"
 EXPIRED=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"viewer","allowAnonymous":true,"allowClone":true,"expiresAt":"2020-01-01T00:00:00.000Z"}' | jq -r .data.token)
 check "已过期的链接换不到令牌" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$EXPIRED/session")" "404"
+# 自然过期不会经过 PATCH/DELETE 路由，已建立的 SSE 必须靠 expiresAt 计时器主动断开。
+AUTO_EXPIRES_AT=$(date -u -d '+4 seconds' '+%Y-%m-%dT%H:%M:%S.000Z')
+AUTO_EXPIRE_SHARE=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"viewer","allowAnonymous":true,"allowClone":false,"expiresAt":"'"$AUTO_EXPIRES_AT"'"}')
+AUTO_EXPIRE_TOKEN=$(echo "$AUTO_EXPIRE_SHARE" | jq -r .data.token)
+AUTO_EXPIRE_GUEST=$(curl -s -X POST "$BASE/v1/shares/$AUTO_EXPIRE_TOKEN/session" | jq -r .data.token)
+AUTO_EXPIRE_START=$(date +%s)
+curl -sN --max-time 8 "$BASE/v1/projects/share-p1/realtime?clientId=share-auto-expire&sinceRevision=99" -H "Authorization: Bearer $AUTO_EXPIRE_GUEST" >"$WORK/share-auto-expire.txt"
+AUTO_EXPIRE_ELAPSED=$(($(date +%s) - AUTO_EXPIRE_START))
+check "自然过期前实时流成功建立" "$(grep -c '"type":"ready"' "$WORK/share-auto-expire.txt")" "1"
+check "分享自然过期后长连接主动断开" "$([ "$AUTO_EXPIRE_ELAPSED" -le 6 ] && echo yes || echo no)" "yes"
+check "自然过期后旧 guest 令牌失效" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/share-p1" -H "Authorization: Bearer $AUTO_EXPIRE_GUEST")" "404"
 NOANON=$(curl -s -X POST "$BASE/v1/projects/share-p1/shares" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"role":"viewer","allowAnonymous":false,"allowClone":true}' | jq -r .data.token)
 check "不允许匿名时未登录换不到令牌" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/shares/$NOANON/session")" "404"
 check "不允许匿名时登录后可以换到令牌" "$(curl -s -X POST "$BASE/v1/shares/$NOANON/session" -H "Authorization: Bearer $CLONER_TOKEN" | jq -r .data.role)" "viewer"
@@ -1013,6 +1132,7 @@ check "断线期间的进度可用 sinceSeq 补齐" "$(echo "$RESUMED" | jq -r '
 check "断线期间的画布改动也已落库" "$(curl -s "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN" | jq -r '.data.data.nodes | length')" "2"
 
 # 生图工具复用现有任务队列，照常扣算力点、占云空间、落到用户文件里。
+IMAGE_CHARGES_BEFORE=$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="调用模型 mock-image")] | length')
 curl -s -X POST "$BASE/v1/agent/sessions/$SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-m3","content":"帮我生成图片"}' >/dev/null
 for _ in $(seq 1 60); do
     [ "$(curl -s "$BASE/v1/agent/sessions/$SESSION" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" = "idle" ] && break
@@ -1022,7 +1142,8 @@ IMAGE_NODE=$(curl -s "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USE
 check "生图工具在画布上建了图片节点" "$(echo "$IMAGE_NODE" | jq -r .type)" "image"
 check "图片节点引用服务端文件" "$(echo "$IMAGE_NODE" | jq -r '.metadata.storageKey | startswith("server:")')" "true"
 check "生图走的是现有任务队列" "$(curl -s "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" | jq -r '[.data.items[] | select(.context.source=="agent" and .status=="succeeded")] | length')" "1"
-check "生图照常计费" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="调用模型 mock-image")] | length')" "3"
+IMAGE_CHARGES_AFTER=$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="调用模型 mock-image")] | length')
+check "生图照常计费" "$((IMAGE_CHARGES_AFTER - IMAGE_CHARGES_BEFORE))" "1"
 
 # 换 Gemini 格式的渠道，同一套工具循环要照样跑通。
 agent_settings "$SEARCH_EMPTY" '"mock-gemini-text"'
@@ -1858,6 +1979,55 @@ check "重启后 awaiting 会话不再挂着" "$(echo "$RESTARTED" | jq -r .data
 check "重启后待确认请求已被清掉" "$(echo "$RESTARTED" | jq -r '.data.pendingAction // "none"')" "none"
 check "重启后给出可读的中文原因" "$(echo "$RESTARTED" | jq -r .data.error)" "服务已重启，待确认的请求已失效，请重新发送消息"
 check "重启后不能再答复这个请求" "$(agent_resolve "$RESTART_SESSION" true | jq -r .msg)" "当前没有待确认的请求"
+
+echo "生成任务晚取消"
+LATE_CANCEL_CREDITS_BEFORE=$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)
+LATE_CANCEL_REFUNDS_BEFORE=$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.type=="ai_refund" and (.extra | fromjson | .path)=="/jobs/image")] | length')
+LATE_CANCEL_JOB=$(curl -s -X POST "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientJobId":"late-cancel-image","kind":"image","model":"mock-image","prompt":"晚取消保留产物","params":{"count":1},"inputFileIds":[]}' | jq -r .data.id)
+for _ in $(seq 1 40); do
+    [ "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_latecancelhits" | jq -r .count)" -ge 1 ] && break
+    sleep 0.1
+done
+check "晚取消发生在产物下载阶段" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_latecancelhits" | jq -r .count)" "1"
+curl -s -X POST "$BASE/v1/jobs/$LATE_CANCEL_JOB/cancel" -H "Authorization: Bearer $USER_TOKEN" >/dev/null
+for _ in $(seq 1 40); do
+    LATE_CANCEL_VIEW=$(curl -s "$BASE/v1/jobs/$LATE_CANCEL_JOB" -H "Authorization: Bearer $USER_TOKEN")
+    [ "$(echo "$LATE_CANCEL_VIEW" | jq -r '.data.status + ":" + ((.data.outputs | length) | tostring)')" = "canceled:1" ] && break
+    sleep 0.1
+done
+LATE_CANCEL_ADMIN=$(curl -s "$BASE/admin/jobs/$LATE_CANCEL_JOB" -H "Authorization: Bearer $ADMIN_TOKEN")
+check "晚取消最终保持 canceled" "$(echo "$LATE_CANCEL_VIEW" | jq -r .data.status)" "canceled"
+check "晚取消保留已经落下的产物" "$(echo "$LATE_CANCEL_VIEW" | jq -r '.data.outputs | length')" "1"
+check "晚取消无需重启立即退款" "$(curl -s "$BASE/auth/me" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.credits)" "$LATE_CANCEL_CREDITS_BEFORE"
+check "晚取消结清任务扣费回执" "$(echo "$LATE_CANCEL_ADMIN" | jq -r .data.credits)" "0"
+check "晚取消写入退款流水" "$(($(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.type=="ai_refund" and (.extra | fromjson | .path)=="/jobs/image")] | length') - LATE_CANCEL_REFUNDS_BEFORE))" "1"
+
+echo "并发生成任务幂等"
+CONCURRENT_COUNT=12
+CONCURRENT_KEY="concurrent-job-key"
+CONCURRENT_CREDITS_BEFORE=$(credits_now)
+CONCURRENT_CONSUMES_BEFORE=$(curl -s "$BASE/admin/credit-logs?keyword=ai_consume" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total)
+CONCURRENT_UPSTREAM_BEFORE=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_imagecount" | jq -r .count)
+CONCURRENT_PIDS=""
+for index in $(seq 1 "$CONCURRENT_COUNT"); do
+    curl -s -o "$WORK/concurrent-job-$index.json" -w '%{http_code}' -X POST "$BASE/v1/jobs" \
+        -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' \
+        -d '{"clientJobId":"'"$CONCURRENT_KEY"'","kind":"image","model":"mock-image","prompt":"并发幂等生图","params":{"count":1},"inputFileIds":[]}' \
+        >"$WORK/concurrent-job-$index.status" &
+    CONCURRENT_PIDS="$CONCURRENT_PIDS $!"
+done
+for pid in $CONCURRENT_PIDS; do wait "$pid"; done
+check "并发重试全部成功" "$(grep -h '^200$' "$WORK"/concurrent-job-*.status | wc -l | tr -d ' ')" "$CONCURRENT_COUNT"
+check "并发重试全部返回同一任务" "$(jq -rs '[.[].data.id] | unique | length' "$WORK"/concurrent-job-*.json)" "1"
+CONCURRENT_JOB=$(jq -r .data.id "$WORK/concurrent-job-1.json")
+for _ in $(seq 1 30); do
+    [ "$(curl -s "$BASE/v1/jobs/$CONCURRENT_JOB" -H "Authorization: Bearer $USER_TOKEN" | jq -r .data.status)" = "succeeded" ] && break
+    sleep 1
+done
+check "并发幂等只落一条任务" "$(curl -s "$BASE/v1/jobs" -H "Authorization: Bearer $USER_TOKEN" | jq -r --arg key "$CONCURRENT_KEY" '[.data.items[] | select(.clientJobId==$key)] | length')" "1"
+check "并发幂等只扣一次算力点" "$((CONCURRENT_CREDITS_BEFORE - $(credits_now)))" "1"
+check "并发幂等只写一条扣费流水" "$(($(curl -s "$BASE/admin/credit-logs?keyword=ai_consume" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .data.total) - CONCURRENT_CONSUMES_BEFORE))" "1"
+check "并发幂等只调用一次上游" "$(($(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_imagecount" | jq -r .count) - CONCURRENT_UPSTREAM_BEFORE))" "1"
 
 echo
 printf '通过 %d 项，失败 %d 项\n' "$PASS" "$FAIL"

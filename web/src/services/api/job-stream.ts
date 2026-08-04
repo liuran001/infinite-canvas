@@ -133,7 +133,11 @@ function onEvent(event: ServerJobEvent) {
 async function reconcile(waiter: Waiter) {
     const job = await serverApi.job(waiter.jobId).catch(() => null);
     if (!job) return startFallback();
-    if (waiters.has(waiter)) applyJob(waiter, job);
+    if (!waiters.has(waiter)) return;
+    applyJob(waiter, job);
+    // 写入当前账号画布的分享任务可由房主账号通道查询，但不混入账号事件流的 seq 作用域。
+    // 它仍在进行且本轮补齐没带到时，改用低频查询收敛，否则恢复出的 loading 节点会永久等待。
+    if (waiters.has(waiter)) startFallback();
 }
 
 function startStream() {

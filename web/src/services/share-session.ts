@@ -10,6 +10,7 @@ import { useShareStore } from "@/stores/use-share-store";
  */
 
 const STORAGE_PREFIX = "infinite-canvas:share_session:";
+let sessionRequestSeq = 0;
 
 type StoredSession = { token: string; expiresAt: string };
 
@@ -38,6 +39,11 @@ function writeStored(token: string, session: ShareSession) {
     }
 }
 
+function isCurrentSessionRequest(requestId: number, token: string) {
+    if (requestId !== sessionRequestSeq) return false;
+    return useShareStore.getState().token === token;
+}
+
 export function clearStoredSession(token: string) {
     try {
         sessionStorage.removeItem(storageKey(token));
@@ -49,13 +55,16 @@ export function clearStoredSession(token: string) {
 /** 换取访客会话并写入 store。失效（404）时进入终态，不重试也不影响账号登录态。 */
 export async function openShareSession(token: string) {
     const store = useShareStore.getState();
+    const requestId = ++sessionRequestSeq;
     store.begin(token);
     try {
         const session = await shareApi.createSession(token, readStored(token)?.token || "");
+        if (!isCurrentSessionRequest(requestId, token)) return null;
         writeStored(token, session);
         useShareStore.getState().applySession(session);
         return session;
     } catch (error) {
+        if (!isCurrentSessionRequest(requestId, token)) return null;
         clearStoredSession(token);
         if (isShareGone(error)) {
             useShareStore.getState().markGone("链接不存在或已失效");
@@ -70,12 +79,32 @@ export async function openShareSession(token: string) {
 export async function refreshShareSession() {
     const { token } = useShareStore.getState();
     if (!token) return null;
+    const requestId = ++sessionRequestSeq;
     try {
         const session = await shareApi.createSession(token, readStored(token)?.token || "");
+        if (!isCurrentSessionRequest(requestId, token)) return null;
+        const downgraded = session.role !== "editor" || !session.fullCanvas;
+        const sync = downgraded ? await import("@/services/share-sync") : null;
+        if (!isCurrentSessionRequest(requestId, token)) return null;
+        if (sync) sync.cancelSharePendingWrites();
         writeStored(token, session);
-        useShareStore.setState({ guestToken: session.token, role: session.role, allowClone: session.allowClone });
+        useShareStore.setState({
+            guestToken: session.token,
+            role: session.role,
+            allowClone: session.allowClone,
+            shareId: session.shareId,
+            anonymous: session.anonymous,
+            fullCanvas: session.fullCanvas,
+            ownerPays: session.ownerPays,
+            selfPayRequired: session.selfPayRequired,
+            allowAnonymousEdit: session.allowAnonymousEdit,
+            actorId: session.actorId,
+            displayName: session.displayName,
+        });
+        if (sync) await sync.loadShareProject(session.project.id);
         return session;
     } catch (error) {
+        if (!isCurrentSessionRequest(requestId, token)) return null;
         if (isShareGone(error)) {
             clearStoredSession(token);
             useShareStore.getState().markGone("链接已失效");

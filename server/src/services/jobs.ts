@@ -4,6 +4,7 @@ import { In, MoreThan, Not } from "typeorm";
 import { config } from "../config";
 import { repo } from "../db/data-source";
 import { Job, StoredFile, type JobKind, type JobStatus } from "../db/entities";
+import { isUniqueViolation } from "../lib/db-errors";
 import { fail, newId, now, SafeError } from "../lib/errors";
 import { charge, payerOfJob, payerOfProject, receiptOfJob, refund } from "./billing";
 import { listFiles, publicFileUrl, saveFile, saveFileFromUrl } from "./files";
@@ -25,6 +26,9 @@ export type JobInput = {
      * 而且填进来之后仍要按 userId 回库查一次画布并校验团队成员资格，伪造一个别人的画布 id 也串不了账。
      */
     billingProjectId?: string;
+    storageUserId?: string;
+    payerUserId?: string;
+    shareId?: string;
 };
 
 export type JobView = {
@@ -67,20 +71,37 @@ const CATCH_UP_LIMIT = 200;
 const runningJobs = new Map<string, AbortController>();
 /** 正在生成的文本任务的最新累积内容。内存里的这份比库里新，订阅时优先用它，避免刚订上就少一段。 */
 const runningTexts = new Map<string, string>();
-/** 按用户分发的任务事件。没人订阅时事件直接丢弃也不影响正确性：任务本身照常跑完并落库。 */
+/** 账号任务按用户、分享任务按分享链接分发。没人订阅时事件丢弃也不影响正确性：任务本身照常落库。 */
 const jobBus = new EventEmitter();
 jobBus.setMaxListeners(0);
-/** 每个用户已分配到的最大 seq。存 Promise 而不是数字：同一用户的并发任务同时申请时只会去库里取一次基准值，不会各取各的取出重号。 */
+/** 每个账号/分享作用域已分配到的最大 seq。存 Promise，避免并发申请时各自读出同一个基准值。 */
 const jobSeqs = new Map<string, Promise<number>>();
 let ticking = false;
 
 const jobs = () => repo(Job);
 
-function nextJobSeq(userId: string) {
+function jobScopeKey(userId: string, shareId = "") {
+    return shareId ? `share:${shareId}` : `user:${userId}`;
+}
+
+function jobScopeWhere(userId: string, shareId = "") {
+    return shareId ? { shareId } : { userId, shareId: "" };
+}
+
+/**
+ * 账号任务列表除了本人直接发起的任务，也要带上写入本人画布的分享任务。
+ * 后者的发起者可能已经离开分享页；所有者仍要能恢复 loading 节点并在异常时止损。
+ */
+function accountJobScopes(userId: string) {
+    return [{ userId, shareId: "" }, { storageUserId: userId, shareId: Not("") }];
+}
+
+function nextJobSeq(userId: string, shareId = "") {
+    const key = jobScopeKey(userId, shareId);
     // 进程重启后内存计数没了，从库里已分配的最大值续上，保证序号只增不减，老游标不会突然「跑到未来」。
-    const base = jobSeqs.get(userId) ?? jobs().findOne({ where: { userId }, order: { seq: "DESC" } }).then((row) => row?.seq || 0, () => 0);
+    const base = jobSeqs.get(key) ?? jobs().findOne({ where: jobScopeWhere(userId, shareId), order: { seq: "DESC" } }).then((row) => row?.seq || 0, () => 0);
     const next = base.then((value) => value + 1);
-    jobSeqs.set(userId, next);
+    jobSeqs.set(key, next);
     return next;
 }
 
@@ -108,13 +129,23 @@ export async function toJobView(job: Job): Promise<JobView> {
 }
 
 /**
+ * 按客户端幂等键查任务。分享任务仍绑定最初发起者：同一分享里的其他协作者可以按任务 ID 查看，
+ * 但不能拿别人的 clientJobId 冒充一次重试。路由会在应用当前分享策略之前先查这一层，
+ * 这样任务创建后即使房主切换了代付策略，原请求的网络重试仍只会命中旧任务，不会被当成新扣费。
+ */
+export function findJobByClientId(userId: string, clientJobId: string, shareId = "") {
+    const key = clientJobId.trim();
+    return key ? jobs().findOneBy({ userId, shareId, clientJobId: key }) : Promise.resolve(null);
+}
+
+/**
  * clientJobId 是幂等键：同一用户重复提交同一个键只会命中已有任务。
  * 客户端断网重试、页面刷新后重发都不会造成重复生成或重复扣费。
  */
 export async function createJob(userId: string, input: JobInput) {
     const clientJobId = input.clientJobId.trim();
     if (!clientJobId) throw fail("缺少任务幂等键");
-    const existing = await jobs().findOneBy({ userId, clientJobId });
+    const existing = await findJobByClientId(userId, clientJobId, input.shareId || "");
     if (existing) return existing;
 
     const model = input.model.trim();
@@ -124,62 +155,91 @@ export async function createJob(userId: string, input: JobInput) {
 
     // 付费方在创建时解析一次并固化到任务行上：任务可能跑几分钟，期间用户可能被移出团队，
     // 而退款必须回到当初扣钱的那个池子。解析只认按 userId 查得到的自己的画布，查不到就是个人。
-    const payer = input.billingProjectId ? await payerOfProject(userId, input.billingProjectId) : ({ kind: "user", userId } as const);
+    const payer = input.shareId
+        ? ({ kind: "user", userId: input.payerUserId || userId } as const)
+        : input.billingProjectId
+          ? await payerOfProject(userId, input.billingProjectId)
+          : ({ kind: "user", userId } as const);
     // 产出文件的云空间归属单独解析并单独固化：它跟画布走，不跟着付费方回落。
-    const storageTeamId = await storageTeamOfProject(userId, input.billingProjectId || "");
+    const storageTeamId = await storageTeamOfProject(input.storageUserId || userId, input.billingProjectId || "");
 
-    const job = await jobs().save({
-        id: newId("job"),
-        userId,
-        clientJobId,
-        kind: input.kind,
-        status: "pending",
-        model,
-        prompt: input.prompt || "",
-        params: JSON.stringify(input.params || {}),
-        inputFileIds: input.inputFileIds || [],
-        outputFileIds: [],
-        text: "",
-        context: input.context || {},
-        error: "",
-        credits: 0,
-        progress: 0,
-        seq: await nextJobSeq(userId),
-        upstreamTaskId: "",
-        payerKind: payer.kind,
-        payerTeamId: payer.kind === "team" ? payer.teamId : "",
-        payerLogId: "",
-        storageTeamId,
-        createdAt: now(),
-        updatedAt: now(),
-        finishedAt: "",
-    } as Job);
+    let job: Job;
+    try {
+        job = await jobs().save({
+            id: newId("job"),
+            userId,
+            storageUserId: input.storageUserId || userId,
+            payerUserId: input.payerUserId || userId,
+            shareId: input.shareId || "",
+            clientJobId,
+            kind: input.kind,
+            status: "pending",
+            model,
+            prompt: input.prompt || "",
+            params: JSON.stringify(input.params || {}),
+            inputFileIds: input.inputFileIds || [],
+            outputFileIds: [],
+            text: "",
+            context: input.context || {},
+            error: "",
+            credits: 0,
+            progress: 0,
+            seq: await nextJobSeq(userId, input.shareId || ""),
+            upstreamTaskId: "",
+            payerKind: payer.kind,
+            payerTeamId: payer.kind === "team" ? payer.teamId : "",
+            payerLogId: "",
+            storageTeamId,
+            createdAt: now(),
+            updatedAt: now(),
+            finishedAt: "",
+        } as Job);
+    } catch (error) {
+        // 并发重试会同时通过上面的预查，最终由唯一索引裁掉一笔。输家回读赢家即可；
+        // 若撞的是主键等其它唯一约束，按幂等键查不到记录，就把原始故障继续抛出。
+        if (!isUniqueViolation(error)) throw error;
+        const raced = await findJobByClientId(userId, clientJobId, input.shareId || "");
+        if (!raced) throw error;
+        return raced;
+    }
     // 新任务本身也是一次变化，先广播再排队：已经挂着流的页面能立刻看到「pending」，不用等第一次状态变更。
-    jobBus.emit(job.userId, { type: "job", seq: job.seq, job: await toJobView(job) } satisfies JobEvent);
+    const event = { type: "job", seq: job.seq, job: await toJobView(job) } satisfies JobEvent;
+    jobBus.emit(jobScopeKey(job.userId, job.shareId), event);
     void tick();
     return job;
 }
 
-export async function getJob(userId: string, id: string) {
-    const job = await jobs().findOneBy({ id, userId });
+export async function getJob(userId: string, id: string, shareId = "") {
+    const job = await jobs().findOne({
+        where: shareId ? { id, shareId } : [{ id, userId, shareId: "" }, { id, storageUserId: userId, shareId: Not("") }],
+    });
     if (!job) throw fail("任务不存在");
     return job;
 }
 
-export async function listJobs(userId: string, statuses: JobStatus[], since: string) {
+export async function listJobs(userId: string, statuses: JobStatus[], since: string, shareId = "") {
+    const scopes = shareId ? [jobScopeWhere(userId, shareId)] : accountJobScopes(userId);
     return jobs().find({
-        where: statuses.length ? statuses.map((status) => ({ userId, status })) : { userId },
+        where: statuses.length ? scopes.flatMap((scope) => statuses.map((status) => ({ ...scope, status }))) : scopes,
         order: { updatedAt: "DESC" },
         take: 200,
     }).then((items) => (since ? items.filter((item) => item.updatedAt > since) : items));
 }
 
-export async function cancelJob(userId: string, id: string) {
-    const job = await getJob(userId, id);
-    if (job.status === "succeeded" || job.status === "failed") return job;
+export async function cancelJob(userId: string, id: string, shareId = "") {
+    // 分享内仍只允许最初发起者取消；账号通道额外允许画布所有者停止写入自己画布的分享任务。
+    const job = await jobs().findOne({
+        where: shareId ? { id, userId, shareId } : [{ id, userId, shareId: "" }, { id, storageUserId: userId, shareId: Not("") }],
+    });
+    if (!job) throw fail("任务不存在");
     runningJobs.get(job.id)?.abort();
-    // 取消时把已经流出来的半截文本一并留下：用户不用为这次生成付费，但已经生成的部分不该被抹掉。
-    return patchJob(job, { status: "canceled", text: currentJobText(job), finishedAt: now() });
+    // 状态转换必须带旧状态：成功与取消可能同时落库，谁先把 running 改成终态谁赢，
+    // 后到的一方只能读回结果，不能再把 succeeded 改成 canceled 或把 canceled 改回成功。
+    while (job.status === "pending" || job.status === "running") {
+        // 取消时把已经流出来的半截文本一并留下：用户不用为这次生成付费，但已经生成的部分不该被抹掉。
+        if (await patchJobStatus(job, job.status, { status: "canceled", text: currentJobText(job), finishedAt: now() })) return job;
+    }
+    return job;
 }
 
 /** 文本任务已经生成出来的内容。内存里那份比库里新，正在跑的任务优先取它。 */
@@ -192,9 +252,10 @@ function currentJobText(job: Job) {
  * 只开一条按用户订阅的流而不是每个任务一条：浏览器对同源只给 6 个并发连接，
  * 同时跑几个生成就会把连接池占满，页面其它请求都会被卡住。
  */
-export function subscribeJobs(userId: string, listener: (event: JobEvent) => void) {
-    jobBus.on(userId, listener);
-    return () => void jobBus.off(userId, listener);
+export function subscribeJobs(userId: string, listener: (event: JobEvent) => void, shareId = "") {
+    const key = jobScopeKey(userId, shareId);
+    jobBus.on(key, listener);
+    return () => void jobBus.off(key, listener);
 }
 
 /**
@@ -202,10 +263,11 @@ export function subscribeJobs(userId: string, listener: (event: JobEvent) => voi
  * 后一半不能省——文本任务边写内容边推增量并不改 seq，只按 seq 过滤会把「一直在跑、只是内容在长」的任务漏掉。
  * 未结束的任务数量受并发与队列限制，始终是个小集合，无条件带上不会把这次补齐撑爆。
  */
-export function listJobsSince(userId: string, sinceSeq: number) {
-    const active = { userId, status: In(["pending", "running"] satisfies JobStatus[]) };
+export function listJobsSince(userId: string, sinceSeq: number, shareId = "") {
+    const scope = jobScopeWhere(userId, shareId);
+    const active = { ...scope, status: In(["pending", "running"] satisfies JobStatus[]) };
     return jobs().find({
-        where: sinceSeq > 0 ? [{ userId, seq: MoreThan(sinceSeq) }, active] : [active],
+        where: sinceSeq > 0 ? [{ ...scope, seq: MoreThan(sinceSeq) }, active] : [active],
         order: { seq: "ASC" },
         take: CATCH_UP_LIMIT,
     });
@@ -217,15 +279,28 @@ export function listJobsSince(userId: string, sinceSeq: number) {
  * 取消发生在扣费之后时，取消那条路径手里的 job 快照还是扣费之前的，
  * 一次 save 就会把 payerLogId 与 credits 抹成空，那笔已经扣掉的钱从此没人退得了。
  */
-async function patchJob(job: Job, patch: Partial<Job>) {
-    const seq = await nextJobSeq(job.userId);
+async function patchJobWhere(job: Job, where: Partial<Pick<Job, "status">>, patch: Partial<Job>) {
+    const seq = await nextJobSeq(job.userId, job.shareId);
     const next = { ...patch, updatedAt: now(), seq };
-    await jobs().update({ id: job.id }, next as never);
+    const result = await jobs().update({ id: job.id, ...where }, next as never);
     // 读回库里的真实行：并发路径改过的列也要带进内存，之后的判断才不会基于陈旧值。
-    Object.assign(job, (await jobs().findOneBy({ id: job.id })) || next);
+    const latest = await jobs().findOneBy({ id: job.id });
+    if (latest) Object.assign(job, latest);
+    if (!result.affected) return false;
     // 先落库再广播：订阅方收到的快照一定已经能从库里读到，断线重连按 seq 补齐时不会出现「推过但库里没有」的空档。
-    jobBus.emit(job.userId, { type: "job", seq: job.seq, job: await toJobView(job) } satisfies JobEvent);
+    const event = { type: "job", seq: job.seq, job: await toJobView(job) } satisfies JobEvent;
+    jobBus.emit(jobScopeKey(job.userId, job.shareId), event);
+    return true;
+}
+
+async function patchJob(job: Job, patch: Partial<Job>) {
+    await patchJobWhere(job, {}, patch);
     return job;
+}
+
+/** 任务状态机的 CAS：只有仍处于 expected 时才允许写入下一状态或终态附加数据。 */
+function patchJobStatus(job: Job, expected: JobStatus, patch: Partial<Job>) {
+    return patchJobWhere(job, { status: expected }, patch);
 }
 
 function delay(ms: number, signal: AbortSignal) {
@@ -258,11 +333,11 @@ async function runImageJob(job: Job, signal: AbortSignal) {
     const channel = await selectModelChannel(job.model);
     const settings = await publicSettings();
     const params = JSON.parse(job.params || "{}") as GenerationParams;
-    const references = await groupReferences(job.userId, job.inputFileIds || []);
+    const references = await groupReferences(job.storageUserId || job.userId, job.inputFileIds || []);
     const images = await generateImages(channel, job.model, settings.modelChannel.systemPrompt, job.prompt, params, references.images, signal);
     await patchJob(job, { progress: 80 });
     const files = [];
-    for (const image of images) files.push(await saveFileFromUrl(job.userId, image, undefined, job.storageTeamId || ""));
+    for (const image of images) files.push(await saveFileFromUrl(job.storageUserId || job.userId, image, undefined, job.storageTeamId || ""));
     return files.map((file) => file.id);
 }
 
@@ -272,7 +347,7 @@ async function runVideoJob(job: Job, signal: AbortSignal) {
     const params = JSON.parse(job.params || "{}") as GenerationParams;
     let taskId = job.upstreamTaskId;
     if (!taskId) {
-        const references = await groupReferences(job.userId, job.inputFileIds || []);
+        const references = await groupReferences(job.storageUserId || job.userId, job.inputFileIds || []);
         const prompt = settings.modelChannel.systemPrompt.trim() ? `${settings.modelChannel.systemPrompt.trim()}\n\n${job.prompt}` : job.prompt;
         taskId = await createVideoTask(channel, job.model, prompt, params, references, referenceUrlResolver(), signal);
         await patchJob(job, { upstreamTaskId: taskId, progress: 20 });
@@ -282,7 +357,7 @@ async function runVideoJob(job: Job, signal: AbortSignal) {
         const state = await pollVideoTask(channel, job.model, taskId, signal);
         if (state.status === "failed") throw fail(state.error);
         if (state.status === "completed") {
-            const file = state.body ? await saveFile(job.userId, state.body, state.mimeType || "video/mp4", {}, job.storageTeamId || "") : await saveFileFromUrl(job.userId, state.url || "", undefined, job.storageTeamId || "");
+            const file = state.body ? await saveFile(job.storageUserId || job.userId, state.body, state.mimeType || "video/mp4", {}, job.storageTeamId || "") : await saveFileFromUrl(job.storageUserId || job.userId, state.url || "", undefined, job.storageTeamId || "");
             return [file.id];
         }
         if (attempt % 6 === 5) await patchJob(job, { progress: Math.min(90, 20 + Math.floor((attempt / VIDEO_POLL_LIMIT) * 70)) });
@@ -294,7 +369,7 @@ async function runAudioJob(job: Job, signal: AbortSignal) {
     const channel = await selectModelChannel(job.model);
     const params = JSON.parse(job.params || "{}") as GenerationParams;
     const result = await generateAudio(channel, job.model, job.prompt, params, signal);
-    const file = await saveFile(job.userId, result.body, result.mimeType, {}, job.storageTeamId || "");
+    const file = await saveFile(job.storageUserId || job.userId, result.body, result.mimeType, {}, job.storageTeamId || "");
     return [file.id];
 }
 
@@ -306,7 +381,7 @@ async function runTextJob(job: Job, signal: AbortSignal) {
     const channel = await selectModelChannel(job.model);
     const settings = await publicSettings();
     const params = JSON.parse(job.params || "{}") as GenerationParams;
-    const references = await groupReferences(job.userId, job.inputFileIds || []);
+    const references = await groupReferences(job.storageUserId || job.userId, job.inputFileIds || []);
     let text = "";
     let flushedAt = Date.now();
     let flushedLength = 0;
@@ -315,7 +390,7 @@ async function runTextJob(job: Job, signal: AbortSignal) {
     const onDelta = (delta: string) => {
         text += delta;
         runningTexts.set(job.id, text);
-        jobBus.emit(job.userId, { type: "text", id: job.id, text } satisfies JobEvent);
+        jobBus.emit(jobScopeKey(job.userId, job.shareId), { type: "text", id: job.id, text } satisfies JobEvent);
         if (Date.now() - flushedAt < TEXT_FLUSH_INTERVAL_MS && text.length - flushedLength < TEXT_FLUSH_CHARS) return;
         flushedAt = Date.now();
         flushedLength = text.length;
@@ -352,7 +427,8 @@ async function runJob(job: Job) {
     const params = JSON.parse(job.params || "{}") as GenerationParams;
     const credits = (await modelCost(job.model, params.quality)) * Math.max(1, params.count || 1);
     try {
-        await patchJob(job, { status: "running", progress: 10, text: "" });
+        // tick 读到 pending 后，用户可能已经取消。CAS 失败就说明这份快照过期，不能继续扣费或调用上游。
+        if (!(await patchJobStatus(job, "pending", { status: "running", progress: 10, text: "" }))) return;
         // 扣点在实际调用上游之前，失败路径统一返还，避免任务重试重复扣费。
         // 回执由 charge 在扣费成功的同一个事务里写回任务行：分两步做的话，进程崩在中间就是钱扣了、
         // 任务行上却查不到那笔流水，重启后既退不掉也没人认领。
@@ -372,12 +448,24 @@ async function runJob(job: Job) {
         }
         const text = job.kind === "text" ? await runTextJob(job, controller.signal) : "";
         const outputs = job.kind === "text" ? [] : job.kind === "video" ? await runVideoJob(job, controller.signal) : job.kind === "audio" ? await runAudioJob(job, controller.signal) : await runImageJob(job, controller.signal);
-        const latest = await jobs().findOneBy({ id: job.id });
-        // 取消已经把终态写进库了，这里不能再改回成功；把最新状态贴回内存，finally 才会广播正确的终态。
-        if (latest?.status === "canceled") return void Object.assign(job, latest);
-        await patchJob(job, { status: "succeeded", progress: 100, outputFileIds: outputs, text, finishedAt: now(), error: "" });
+        if (await patchJobStatus(job, "running", { status: "succeeded", progress: 100, outputFileIds: outputs, text, finishedAt: now(), error: "" })) return;
+        // 产物已经保存后才收到取消：状态保持 canceled，但文件不能变成没人引用的孤儿，
+        // 已扣的点也必须在本次进程里结清，不能拖到下次重启扫描。
+        if (job.status === "canceled") {
+            const settled = await settleRefund(job);
+            await patchJobStatus(job, "canceled", {
+                progress: 100,
+                outputFileIds: outputs,
+                text,
+                ...(settled ? { credits: 0, payerLogId: "" } : {}),
+                error: settled ? "任务已取消" : "任务已取消（算力点返还失败，稍后会自动重试）",
+                finishedAt: job.finishedAt || now(),
+            });
+        }
     } catch (error) {
-        const canceled = controller.signal.aborted;
+        // charge 的回执可能刚由事务写回，取消路径手里的对象也可能更旧；退款前先读真实行。
+        Object.assign(job, (await jobs().findOneBy({ id: job.id })) || job);
+        const canceled = controller.signal.aborted || job.status === "canceled";
         // 失败与取消都全额返还：让用户「既没拿到完整内容又被扣了钱」是最不能接受的结果，
         // 已经流出来的半截文本照常保留在任务里，用户不花钱也能留住它。
         // 退款按任务行上固化的 payer 走，不重新解析：用户可能已经被移出团队，
@@ -387,13 +475,29 @@ async function runJob(job: Job) {
         if (!canceled) console.error(`job ${job.id} failed:`, error);
         // 退款没退成时绝不清回执：清了就再没有任何地方记得这笔钱，谁都退不了了。
         // 保留下来，下次启动的扫描会照着它再退一次（退款本身幂等，不会退成两笔）。
-        await patchJob(job, {
-            status: canceled ? "canceled" : "failed",
+        const terminalPatch: Partial<Job> = {
             ...(settled ? { credits: 0, payerLogId: "" } : {}),
             text: runningTexts.get(job.id) ?? job.text ?? "",
             error: canceled ? "任务已取消" : settled ? message : `${message}（算力点返还失败，稍后会自动重试）`,
             finishedAt: now(),
-        });
+        };
+        if (canceled) {
+            if (job.status === "canceled") await patchJobStatus(job, "canceled", terminalPatch);
+            else if (!(await patchJobStatus(job, "running", { status: "canceled", ...terminalPatch }))) {
+                const latest = await jobs().findOneBy({ id: job.id });
+                if (latest?.status === "canceled") {
+                    Object.assign(job, latest);
+                    await patchJobStatus(job, "canceled", terminalPatch);
+                }
+            }
+        } else if (!(await patchJobStatus(job, "running", { status: "failed", ...terminalPatch }))) {
+            const latest = await jobs().findOneBy({ id: job.id });
+            if (latest?.status === "canceled") {
+                Object.assign(job, latest);
+                // 失败与取消同时发生时取消先赢；退款已经完成，只把结算字段补到 canceled 行上。
+                await patchJobStatus(job, "canceled", { ...terminalPatch, error: settled ? "任务已取消" : "任务已取消（算力点返还失败，稍后会自动重试）" });
+            }
+        }
     } finally {
         // 终态由上面的 patchJob 广播（快照里带着最终文本），这里只清内存；
         // 清在广播之后，之后新来的订阅直接读库里的最终内容。

@@ -7,7 +7,10 @@ import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { ConnectionPath } from "@/components/canvas/canvas-connections";
 import { CanvasNode } from "@/components/canvas/canvas-node";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
+import { AgentPanel } from "@/components/agent/agent-panel";
 import { useNoIndexMeta } from "@/hooks/use-noindex-meta";
+import { InfiniteCanvasPage } from "@/pages/canvas/project";
+import { useShareBillingConsentPrompt } from "@/pages/share/use-share-billing-consent";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { hydrateCanvasImages } from "@/lib/canvas/canvas-generation-helpers";
 import { imageMetadata } from "@/lib/canvas/canvas-node-factory";
@@ -27,9 +30,8 @@ import { CanvasNodeType, type CanvasNodeData, type ViewportTransform } from "@/t
 /**
  * 独立的分享画布页 `/s/:token`。
  *
- * 刻意不复用 `/canvas/:id`：项目页假定存在账号会话、项目列表、Agent 面板与生成入口，
- * 在分享态下逐个条件隐藏会留下大量易错分支。这里只挂画布本体、Presence 与（editor 时的）保存，
- * 底层复用同一套画布组件与三方合并逻辑。
+ * viewer 继续使用轻量只读页；服务端明确下发 fullCanvas 时复用项目页的完整工作区，
+ * 但数据始终留在 share store，保存、Presence 与上传也只走 guest 通道，不进入账号画布或本地缓存。
  *
  * 路由挂在 UserLayout 与 LoginGuard 之外——分享页本来就允许匿名访问，
  * 放在守卫里会被直接踢回首页。
@@ -44,6 +46,7 @@ export default function ShareCanvasPage() {
     const status = useShareStore((state) => state.status);
     const error = useShareStore((state) => state.error);
     const role = useShareStore((state) => state.role);
+    const fullCanvas = useShareStore((state) => state.fullCanvas);
     const allowClone = useShareStore((state) => state.allowClone);
     const project = useShareStore((state) => state.project);
     const members = useShareStore((state) => state.members);
@@ -51,7 +54,7 @@ export default function ShareCanvasPage() {
     const cloning = useShareStore((state) => state.cloning);
     const userToken = useServerStore((state) => state.token);
 
-    const editable = role === "editor" && status === "ready";
+    const editable = !fullCanvas && role === "editor" && status === "ready";
 
     const containerRef = useRef<HTMLDivElement>(null);
     const [viewport, setViewport] = useState<ViewportTransform>({ x: 0, y: 0, k: 1 });
@@ -71,6 +74,7 @@ export default function ShareCanvasPage() {
 
     // 分享页三重 noindex 的运行时那一层：进页面注入 robots meta，离开时移除。
     useNoIndexMeta();
+    useShareBillingConsentPrompt();
 
     useEffect(() => {
         nodesRef.current = nodes;
@@ -98,12 +102,11 @@ export default function ShareCanvasPage() {
         void (async () => {
             const session = await openShareSession(token);
             if (cancelled || !session) return;
-            const loaded = await loadShareProject(session.project.id);
-            if (cancelled || !loaded) return;
-            setNodes(await hydrateCanvasImages(loaded.nodes, { allowUpload: false }));
+            await loadShareProject(session.project.id);
         })();
         return () => {
             cancelled = true;
+            void flushShareProject();
             resetShareSync();
             useShareStore.getState().reset();
         };
@@ -116,16 +119,22 @@ export default function ShareCanvasPage() {
         return () => window.clearInterval(timer);
     }, [status]);
 
+    /** 登录或退出会改变分享里的真实身份，不能继续沿用最多十分钟的旧 guest 权限。 */
+    useEffect(() => {
+        if (status !== "ready") return;
+        void refreshShareSession();
+    }, [status, userToken]);
+
     /** SSE 与 Presence：与账号侧同一套语义，撤销后服务端断流，这里判定失效并停止重试。 */
     useEffect(() => {
-        if (status !== "ready" || !project) return;
+        if (fullCanvas || status !== "ready" || !project) return;
         const controller = new AbortController();
         const reporter = createSharePresenceReporter(project.id);
         presenceRef.current = reporter;
         watchShareProject(
             project.id,
             {
-                onProject: (next) => void hydrateCanvasImages(next.nodes, { allowUpload: false }).then(setNodes),
+                onProject: () => undefined,
                 onDeleted: () => useShareStore.getState().markGone("画布已被删除"),
             },
             controller.signal,
@@ -135,7 +144,18 @@ export default function ShareCanvasPage() {
             reporter.dispose();
             presenceRef.current = null;
         };
-    }, [project?.id, status]);
+    }, [fullCanvas, project?.id, status]);
+
+    useEffect(() => {
+        if (fullCanvas || !project) return;
+        let cancelled = false;
+        void hydrateCanvasImages(project.nodes, { allowUpload: false }).then((next) => {
+            if (!cancelled) setNodes(next);
+        });
+        return () => {
+            cancelled = true;
+        };
+    }, [fullCanvas, project?.id, project?.revision]);
 
     useEffect(() => {
         if (status !== "ready") return;
@@ -359,6 +379,15 @@ export default function ShareCanvasPage() {
 
     if (status === "gone" || status === "error") return <ShareNotice tone={status === "gone" ? "gone" : "error"} title={status === "gone" ? "链接不存在或已失效" : "打开分享画布失败"} detail={error} />;
     if (status !== "ready" || !project) return <ShareNotice tone="loading" title="正在打开分享画布" detail="" />;
+    if (fullCanvas)
+        return (
+            <div className="flex h-dvh overflow-hidden" style={{ background: theme.canvas.background, color: theme.node.text }}>
+                <div className="min-w-0 flex-1 overflow-hidden">
+                    <InfiniteCanvasPage shared />
+                </div>
+                <AgentPanel forceLocal />
+            </div>
+        );
 
     return (
         <main className="relative flex h-dvh w-full flex-col overflow-hidden" style={{ background: theme.canvas.background, color: theme.node.text }}>

@@ -1,4 +1,4 @@
-import { memo, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { App, Empty, Input, Popconfirm, Select, Spin, Tag } from "antd";
 import { useQuery } from "@tanstack/react-query";
 import { BookOpen, Check, ChevronRight, Download, Eye, FileText, Image as ImageIcon, ListChecks, Music2, Plus, Search, Settings2, Square, Trash2, Type, Video } from "lucide-react";
@@ -33,6 +33,7 @@ type Props = {
     onFocusNode: (nodeId: string) => void;
     onPreviewNode: (nodeId: string) => void;
     onInsertAsset: (payload: InsertAssetPayload) => void;
+    showAssets?: boolean;
 };
 
 const NODE_TYPE_ICON: Record<string, typeof Square> = {
@@ -51,7 +52,7 @@ const STATUS_COLOR: Record<string, string> = {
     idle: "transparent",
 };
 
-export function CanvasSidePanel({ nodes, selectedNodeIds, onFocusNode, onPreviewNode, onInsertAsset }: Props) {
+export function CanvasSidePanel({ nodes, selectedNodeIds, onFocusNode, onPreviewNode, onInsertAsset, showAssets = true }: Props) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const [tab, setTab] = useState<PanelTab>("canvas");
     const width = useCanvasSidePanelStore((state) => state.width);
@@ -60,6 +61,10 @@ export function CanvasSidePanel({ nodes, selectedNodeIds, onFocusNode, onPreview
     const panelClosing = useCanvasSidePanelStore((state) => state.panelClosing);
     const setWidth = useCanvasSidePanelStore((state) => state.setWidth);
     const [resizing, setResizing] = useState(false);
+
+    useEffect(() => {
+        if (!showAssets && tab === "assets") setTab("canvas");
+    }, [showAssets, tab]);
 
     const startResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
         event.preventDefault();
@@ -101,13 +106,13 @@ export function CanvasSidePanel({ nodes, selectedNodeIds, onFocusNode, onPreview
             >
                 <div className="flex items-center gap-5 px-4 pt-3.5">
                     <TabButton label="画布" active={tab === "canvas"} theme={theme} onClick={() => setTab("canvas")} />
-                    <TabButton label="资产" active={tab === "assets"} theme={theme} onClick={() => setTab("assets")} />
+                    {showAssets ? <TabButton label="资产" active={tab === "assets"} theme={theme} onClick={() => setTab("assets")} /> : null}
                     <TabButton label="提示词库" active={tab === "prompts"} theme={theme} onClick={() => setTab("prompts")} />
                 </div>
                 <div className="mt-2 min-h-0 flex-1 overflow-hidden">
                     {tab === "canvas" ? (
                         <CanvasNodesTab nodes={nodes} selectedNodeIds={selectedNodeIds} onFocusNode={onFocusNode} onPreviewNode={onPreviewNode} theme={theme} />
-                    ) : tab === "assets" ? (
+                    ) : tab === "assets" && showAssets ? (
                         <CanvasAssetsTab onInsert={onInsertAsset} theme={theme} />
                     ) : (
                         <CanvasPromptsTab onInsert={onInsertAsset} theme={theme} />

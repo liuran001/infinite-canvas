@@ -15,7 +15,7 @@ async function main() {
     const { check, rejects, finish } = createChecker();
     const { initDatabase, repo } = await import("./src/db/data-source");
     const { PhysicalBlob, Project, ProjectAccessLog, ProjectShare, StoredFile, User } = await import("./src/db/entities");
-    const { createShare, findShareByToken, guestSessionOf, listShares, logShareAccess, ownerShareView, resetShareRuntimeState, shareRevokesAccess, shareTokenHash, shareView, signGuestToken, updateShare, verifyGuestToken, assertShareUploadAllowed } = await import("./src/services/project-share");
+    const { createShare, findShareByToken, guestSessionOf, listShares, logShareAccess, ownerShareView, resetShareRuntimeState, scheduleShareExpiry, shareRevokesAccess, shareTokenHash, shareView, signGuestToken, updateShare, verifyGuestToken, assertShareUploadAllowed } = await import("./src/services/project-share");
     const { resolveProjectAccess } = await import("./src/services/project-access");
     const { disconnectShare, listProjectPresence, subscribeProject, updateProjectPresence } = await import("./src/services/project-realtime");
     const { cloneSharedProject } = await import("./src/services/project-clone");
@@ -68,7 +68,8 @@ async function main() {
     await saveProject("owner-1", { id: "p1", title: "分享画布", data: canvas, revision: 0, clientId: "verify-owner" });
 
     console.log("token 生成与存储");
-    const viewer = await createShare("owner-1", "p1", { role: "viewer", allowAnonymous: true, allowClone: true, expiresAt: "" });
+    const viewer = await createShare("owner-1", "p1", { role: "viewer", allowAnonymous: true, allowClone: true, expiresAt: "", ownerPays: false, allowAnonymousEdit: true });
+    check("viewer 分享归一化关闭匿名编辑", viewer.share.allowAnonymousEdit, false);
     check("明文 token 至少 128 bit", Buffer.from(viewer.token, "base64url").length >= 16, true);
     check("库里存的是哈希而不是明文", viewer.share.tokenHash !== viewer.token, true);
     check("哈希与明文可复算对上", viewer.share.tokenHash, shareTokenHash(viewer.token));
@@ -150,7 +151,8 @@ async function main() {
 
     console.log("唯一授权入口");
     const viewerCtx = { user: null, guest: verifyGuestToken(signGuestToken(anonymousSession)) };
-    const editor = await createShare("owner-1", "p1", { role: "editor", allowAnonymous: true, allowClone: false, expiresAt: "" });
+    const editor = await createShare("owner-1", "p1", { role: "editor", allowAnonymous: true, allowClone: false, expiresAt: "", ownerPays: true, allowAnonymousEdit: true });
+    check("editor ownerPays 开启匿名编辑", editor.share.allowAnonymousEdit, true);
     const editorSession = guestSessionOf(editor.share, { accountId: "", actorId: "", displayName: "", avatarUrl: "" });
     const editorCtx = { user: null, guest: editorSession };
     check("所有者可读", (await resolveProjectAccess(ownerCtx, "p1", "read")).role, "owner");
@@ -165,6 +167,13 @@ async function main() {
     check("可编辑分享写入的目标是所有者", editorAccess.ownerId, "owner-1");
     check("可编辑分享的 actorId 不是所有者", editorAccess.actorId !== "owner-1", true);
     check("访客访问带出分享本体", editorAccess.share?.id, editor.share.id);
+
+    const anonymousEditorNoPay = await createShare("owner-1", "p1", { role: "editor", allowAnonymous: true, allowClone: false, expiresAt: "", ownerPays: false, allowAnonymousEdit: true });
+    const anonymousEditorNoPayCtx = { user: null, guest: guestSessionOf(anonymousEditorNoPay.share, { accountId: "", actorId: "", displayName: "", avatarUrl: "" }) };
+    check("未开启 ownerPays 的匿名 editor 有效角色降为 viewer", (await resolveProjectAccess(anonymousEditorNoPayCtx, "p1", "read")).role, "viewer");
+    check("未开启 ownerPays 的匿名 editor 禁止写入", await status(() => resolveProjectAccess(anonymousEditorNoPayCtx, "p1", "write")), 403);
+    await shares.update({ id: anonymousEditorNoPay.share.id }, { allowAnonymousEdit: true });
+    check("数据库异常组合也不能绕过 ownerPays 匿名编辑约束", (await resolveProjectAccess(anonymousEditorNoPayCtx, "p1", "read")).role, "viewer");
 
     await shares.update({ id: editor.share.id }, { role: "viewer" });
     check("链接被降级后旧令牌立刻只能读", await status(() => resolveProjectAccess(editorCtx, "p1", "write")), 403);
@@ -217,6 +226,7 @@ async function main() {
     console.log("画布 SSE 时序");
     resetShareRuntimeState();
     const { syncRouter } = await import("./src/routes/sync");
+    const { openRealtimeChannel } = await import("./src/services/realtime-channels");
     const { publishProjectSaved } = await import("./src/services/project-realtime");
     type Layer = { route?: { path: string; stack: { handle: (req: unknown, res: unknown, next: (error?: unknown) => void) => void }[] } };
     const realtime = (syncRouter.stack as unknown as Layer[]).find((layer) => layer.route?.path === "/v1/projects/:id/realtime")?.route;
@@ -299,6 +309,42 @@ async function main() {
     await settle();
     check("断开后的事件不会再写进这条连接", frames(goneRes).length, 0);
 
+    // 分享自然到期时不会再经过 PATCH 路由，必须由已经建立的长连接自己按 expiresAt 收权。
+    // SSE 与 WebSocket 都要主动清理订阅；只等 guest token 过期会让不断线的客户端继续收到画布更新。
+    let immediateExpiryCalled = false;
+    const cancelImmediateExpiry = scheduleShareExpiry(new Date(Date.now() - 1000).toISOString(), () => { immediateExpiryCalled = true; });
+    check("已到期分享不会在响应构建栈内同步收权", immediateExpiryCalled, false);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    check("已到期分享会在下一事件循环收权", immediateExpiryCalled, true);
+    cancelImmediateExpiry();
+    const expiring = await createShare("owner-1", "p1", {
+        role: "editor",
+        allowAnonymous: true,
+        allowClone: false,
+        ownerPays: true,
+        allowAnonymousEdit: true,
+        expiresAt: new Date(Date.now() + 1000).toISOString(),
+    });
+    const expiringSession = guestSessionOf(expiring.share, { accountId: "", actorId: "", displayName: "", avatarUrl: "" });
+    const websocketFrames: Array<{ type: string; payload?: { reason?: string } }> = [];
+    let websocketClosed = false;
+    await openRealtimeChannel({
+        identity: { userId: "", displayName: "", avatarUrl: "", guest: expiringSession },
+        id: "expiring-project",
+        channel: "project:p1",
+        payload: { clientId: "ws-expiring-client", sinceRevision: 0 },
+        send: (frame) => websocketFrames.push(frame as { type: string; payload?: { reason?: string } }),
+        onClosed: () => { websocketClosed = true; },
+    });
+    const expiringRes = makeRes();
+    const expiringReq = makeReq("sse-expiring-client", expiringSession);
+    handler(expiringReq, expiringRes, () => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    check("分享自然过期后 WebSocket 频道主动关闭", websocketClosed, true);
+    check("分享自然过期后 WebSocket 发出撤销帧", websocketFrames.some((frame) => frame.type === "unsubscribed" && frame.payload?.reason === "REVOKED"), true);
+    check("分享自然过期后 SSE 主动结束", expiringRes.writableEnded, true);
+    check("分享自然过期后实时订阅已清理", disconnectShare("owner-1", "p1", expiring.share.id), 0);
+
     console.log("哪些改动会收权");
     // 断流条件此前散在路由里没法直接测，导致「关掉匿名不断流」漏到了合并之后。
     const revokeBase = await shares.findOneByOrFail({ id: viewerShare.id });
@@ -308,8 +354,11 @@ async function main() {
     check("关掉匿名要断流", shareRevokesAccess({ ...revokeBase, allowAnonymous: true }, withPatch({ allowAnonymous: false })), true);
     check("改成已过期要断流", shareRevokesAccess(revokeBase, withPatch({ expiresAt: new Date(Date.now() - 1000).toISOString() })), true);
     check("放开匿名不必断流", shareRevokesAccess({ ...revokeBase, allowAnonymous: false }, withPatch({ allowAnonymous: true })), false);
-    check("升级为可编辑不必断流", shareRevokesAccess({ ...revokeBase, role: "viewer" }, withPatch({ role: "editor" })), false);
-    check("延长有效期不必断流", shareRevokesAccess(revokeBase, withPatch({ expiresAt: new Date(Date.now() + 600_000).toISOString() })), false);
+    check("升级为可编辑要断流并立即重换权限", shareRevokesAccess({ ...revokeBase, role: "viewer" }, withPatch({ role: "editor" })), true);
+    check("开启房主代扣要断流并刷新计费策略", shareRevokesAccess({ ...revokeBase, ownerPays: false }, withPatch({ ownerPays: true })), true);
+    check("关闭房主代扣要断流并刷新计费策略", shareRevokesAccess({ ...revokeBase, ownerPays: true }, withPatch({ ownerPays: false })), true);
+    check("开启匿名编辑要断流并立即提权", shareRevokesAccess({ ...revokeBase, allowAnonymousEdit: false }, withPatch({ allowAnonymousEdit: true })), true);
+    check("修改有效期要断流并重建到期计时器", shareRevokesAccess(revokeBase, withPatch({ expiresAt: new Date(Date.now() + 600_000).toISOString() })), true);
     check("只改允许克隆不必断流", shareRevokesAccess(revokeBase, withPatch({ allowClone: !revokeBase.allowClone })), false);
 
     console.log("访问日志节流");

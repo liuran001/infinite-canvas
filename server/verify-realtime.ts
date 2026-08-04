@@ -94,7 +94,7 @@ async function main() {
     await users.insert({ id: "owner-1", username: "owner-1", password: "", email: "", displayName: "画布主", avatarUrl: "", role: "user", credits: 0, storageQuota: 1 << 20, affCode: "owner-1", affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
     const { token: accountToken } = await newSession(await users.findOneByOrFail({ id: "owner-1" }));
     await repo(Project).insert({ userId: "owner-1", projectId: "p1", title: "画布", data: "{}", revision: 1, deleted: false, createdAt: now(), updatedAt: now() });
-    const { share } = await createShare("owner-1", "p1", { role: "editor", allowAnonymous: true, allowClone: false, expiresAt: "" });
+    const { share } = await createShare("owner-1", "p1", { role: "editor", allowAnonymous: true, allowClone: false, ownerPays: true, allowAnonymousEdit: true, expiresAt: "" });
     const guestToken = signGuestToken(guestSessionOf(await repo(ProjectShare).findOneByOrFail({ id: share.id }), { accountId: "", actorId: "", displayName: "", avatarUrl: "" }));
     const postTicket = async (headers: Record<string, string>) => {
         const res = await fetch(`http://127.0.0.1:${port}/api/v1/realtime/tickets`, { method: "POST", headers });

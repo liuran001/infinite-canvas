@@ -43,6 +43,23 @@ export function watchProject(projectId: string, handlers: { onProject?: (revisio
 
     const presence = useProjectPresenceStore.getState();
     let lastRevision = syncedRevisionOf(projectId);
+    let pendingPullRevision = lastRevision;
+    let pullInFlight: Promise<void> | null = null;
+    const pullReadyRevision = (revision: number) => {
+        pendingPullRevision = Math.max(pendingPullRevision, revision);
+        if (signal.aborted || pendingPullRevision <= lastRevision || pullInFlight) return;
+        pullInFlight = pullProject(projectId)
+            .then((project) => {
+                if (!project || (project.revision || 0) < pendingPullRevision) return;
+                lastRevision = Math.max(lastRevision, project.revision || 0);
+                handlers.onProject?.(project.revision || revision);
+            })
+            .catch(() => undefined)
+            .finally(() => {
+                pullInFlight = null;
+                if (!signal.aborted && pendingPullRevision > lastRevision) window.setTimeout(() => pullReadyRevision(pendingPullRevision), RETRIES[0]);
+            });
+    };
     let fallback: AbortController | null = null;
     const stopFallback = () => {
         fallback?.abort();
@@ -63,9 +80,11 @@ export function watchProject(projectId: string, handlers: { onProject?: (revisio
         if (event.type === "project.deleted") return handlers.onDeleted?.();
         if (event.type === "ready") return;
         if (event.revision <= lastRevision) return;
-        lastRevision = event.revision;
-        if (event.writerClientId === clientId) return;
-        void pullProject(projectId).then(() => handlers.onProject?.(event.revision));
+        if (event.writerClientId === clientId) {
+            lastRevision = event.revision;
+            return;
+        }
+        pullReadyRevision(event.revision);
     };
 
     const subscribe = () => {
@@ -74,7 +93,7 @@ export function watchProject(projectId: string, handlers: { onProject?: (revisio
             payload: () => ({ clientId, sinceRevision: lastRevision }),
             onReady: (payload) => {
                 const ready = (payload || {}) as { revision?: number; members?: ServerProjectPresence[] };
-                lastRevision = Math.max(lastRevision, Number(ready.revision) || 0);
+                pullReadyRevision(Number(ready.revision) || 0);
                 presence.setMembers((ready.members || []).filter((item) => item.clientId !== clientId));
                 presence.setStatus("ready");
                 stopFallback();
@@ -135,9 +154,27 @@ function watchProjectViaSse(projectId: string, handlers: { onProject?: (revision
     const clientId = getProjectClientId();
     void (async () => {
         let failure = 0;
+        let lastRevision = syncedRevisionOf(projectId);
+        let pendingPullRevision = lastRevision;
+        let pullInFlight: Promise<void> | null = null;
+        const pullReadyRevision = (revision: number) => {
+            pendingPullRevision = Math.max(pendingPullRevision, revision);
+            if (signal.aborted || pendingPullRevision <= lastRevision || pullInFlight) return;
+            pullInFlight = pullProject(projectId)
+                .then((project) => {
+                    if (!project || (project.revision || 0) < pendingPullRevision) return;
+                    lastRevision = Math.max(lastRevision, project.revision || 0);
+                    handlers.onProject?.(project.revision || revision);
+                })
+                .catch(() => undefined)
+                .finally(() => {
+                    pullInFlight = null;
+                    if (!signal.aborted && pendingPullRevision > lastRevision) window.setTimeout(() => pullReadyRevision(pendingPullRevision), RETRIES[0]);
+                });
+        };
         while (!signal.aborted) {
             const project = useCanvasStore.getState().projects.find((item) => item.id === projectId);
-            let lastRevision = project?.revision || 0;
+            lastRevision = Math.max(lastRevision, project?.revision || 0);
             useProjectPresenceStore.getState().setStatus(failure ? "reconnecting" : "connecting");
             try {
                 await serverProjectStream(
@@ -146,7 +183,7 @@ function watchProjectViaSse(projectId: string, handlers: { onProject?: (revision
                     lastRevision,
                     (event: ServerProjectEvent) => {
                         if (event.type === "ready") {
-                            lastRevision = Math.max(lastRevision, event.revision);
+                            pullReadyRevision(event.revision);
                             useProjectPresenceStore.getState().setMembers(event.members.filter((item) => item.clientId !== clientId));
                             useProjectPresenceStore.getState().setStatus("ready");
                             failure = 0;
@@ -155,9 +192,11 @@ function watchProjectViaSse(projectId: string, handlers: { onProject?: (revision
                         } else if (event.type === "project.deleted") {
                             handlers.onDeleted?.();
                         } else if (event.revision > lastRevision) {
-                            lastRevision = event.revision;
-                            if (event.writerClientId === clientId) return;
-                            void pullProject(projectId).then(() => handlers.onProject?.(event.revision));
+                            if (event.writerClientId === clientId) {
+                                lastRevision = event.revision;
+                                return;
+                            }
+                            pullReadyRevision(event.revision);
                         }
                     },
                     signal,

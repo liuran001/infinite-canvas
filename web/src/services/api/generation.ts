@@ -11,12 +11,15 @@ import { serverModelFormat, useServerStore, type ServerCapability } from "@/stor
 import { normalizeBackground, normalizeQuality, resolveRequestSize } from "./image";
 import { waitJobFinished } from "./job-stream";
 import { serverApi, serverFileUrl, type ServerFile, type ServerJobKind } from "./server";
+import { ShareApiError, shareApi } from "./share";
+import { useShareStore } from "@/stores/use-share-store";
+import { ensureShareBillingConsent } from "@/services/share-billing-consent";
 import { normalizeVideoResolution, normalizeVideoSeconds, normalizeVideoSize } from "./video";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
 /** clientJobId 由调用方持有，重发同一个键服务端只会生成一次，也不会重复扣算力点。 */
-export type GenerationOptions = { signal?: AbortSignal; clientJobId?: string; onProgress?: (progress: number) => void; context?: JobContext };
+export type GenerationOptions = { signal?: AbortSignal; clientJobId?: string; onProgress?: (progress: number) => void; context?: JobContext; acceptSelfPay?: boolean };
 export type ImageGenerationOptions = GenerationOptions & { mask?: ReferenceImage };
 
 /** 生成结果都落在服务端，转存时直接登记引用，不重复上传。 */
@@ -24,6 +27,19 @@ export type GeneratedImage = { id: string; dataUrl: string; file: ServerFile };
 
 export type VideoTask = { id: string; model: string; clientJobId: string };
 export type VideoTaskState = { status: "completed"; file: ServerFile } | { status: "failed"; error: string };
+
+const SHARE_JOB_RETRY_DELAYS = [1000, 2000, 4000, 8000, 12000];
+
+function waitDelay(ms: number, signal?: AbortSignal) {
+    return new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
+        const timer = window.setTimeout(resolve, ms);
+        signal?.addEventListener("abort", () => {
+            window.clearTimeout(timer);
+            reject(new DOMException("Aborted", "AbortError"));
+        }, { once: true });
+    });
+}
 
 function serverSettings() {
     return useServerStore.getState().settings;
@@ -45,25 +61,61 @@ export function isGenerationReady() {
     return Boolean(serverSettings()?.modelChannel.models.length);
 }
 
-async function imageFileId(image: ReferenceImage) {
+async function imageFileId(image: ReferenceImage, context?: JobContext) {
     const existing = serverFileIdOf(image.storageKey);
     if (existing) return existing;
     const dataUrl = await imageToDataUrl(image);
     if (!dataUrl) throw new Error("参考图读取失败，请重新上传");
-    return (await serverApi.uploadFile(await (await fetch(dataUrl)).blob(), { filename: image.name })).id;
+    const share = shareGenerationContext(context);
+    const blob = await (await fetch(dataUrl)).blob();
+    return (await (share ? shareApi.uploadFile(share.project!.id, share.guestToken, blob, { filename: image.name }) : serverApi.uploadFile(blob, { filename: image.name }))).id;
 }
 
-async function mediaFileId(media: { name?: string; url?: string; storageKey?: string; durationMs?: number }) {
+function shareGenerationContext(context?: JobContext) {
+    const share = useShareStore.getState();
+    if (!share.fullCanvas || !share.guestToken || !share.project?.id) return null;
+    return context?.source === "canvas" && context.projectId === share.project.id ? share : null;
+}
+
+/** 分享任务查询的临时网络故障不能被当成生成失败；每次重试都现取续期后的 guest token。 */
+async function pollShareJob(jobId: string, context: JobContext | undefined, signal?: AbortSignal) {
+    let failures = 0;
+    for (;;) {
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        const share = shareGenerationContext(context);
+        if (!share) throw new Error("分享画布权限已变更，请刷新后重试");
+        try {
+            return await shareApi.job(share.guestToken, jobId);
+        } catch (error) {
+            const retryable = error instanceof ShareApiError && (error.status === 0 || error.status === 401 || error.status === 429 || error.status >= 500);
+            if (!retryable) throw error;
+            await waitDelay(SHARE_JOB_RETRY_DELAYS[Math.min(failures++, SHARE_JOB_RETRY_DELAYS.length - 1)], signal);
+        }
+    }
+}
+
+async function mediaFileId(media: { name?: string; url?: string; storageKey?: string; durationMs?: number }, context?: JobContext) {
     const existing = serverFileIdOf(media.storageKey);
     if (existing) return existing;
     const blob = (media.storageKey ? await getMediaBlob(media.storageKey) : null) || (media.url ? await (await fetch(media.url)).blob() : null);
     if (!blob) throw new Error("参考素材读取失败，请重新上传");
-    return (await serverApi.uploadFile(blob, { filename: media.name, durationMs: media.durationMs })).id;
+    const share = shareGenerationContext(context);
+    return (await (share ? shareApi.uploadFile(share.project!.id, share.guestToken, blob, { filename: media.name, durationMs: media.durationMs }) : serverApi.uploadFile(blob, { filename: media.name, durationMs: media.durationMs }))).id;
+}
+
+/** 分享协作者在画布进入任何生成态之前先完成扣点确认，取消时不会留下 loading 占位节点。 */
+export async function ensureGenerationBillingConsent(context?: JobContext) {
+    const share = shareGenerationContext(context);
+    return share ? ensureShareBillingConsent({ shareId: share.shareId, selfPayRequired: share.selfPayRequired, userId: useServerStore.getState().user?.id, anonymous: share.anonymous, ownerPays: share.ownerPays }) : false;
 }
 
 /** 提交任务：clientJobId 交给服务端做幂等去重，同一个键只会生成一次。 */
-async function submitJob(kind: ServerJobKind, model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], clientJobId: string, context?: JobContext) {
-    const job = await serverApi.createJob({ clientJobId, kind, model, prompt, params, inputFileIds, context });
+async function submitJob(kind: ServerJobKind, model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], clientJobId: string, context?: JobContext, acceptedSelfPay?: boolean) {
+    const share = shareGenerationContext(context);
+    const acceptSelfPay = share ? acceptedSelfPay ?? (await ensureGenerationBillingConsent(context)) : false;
+    const job = share
+        ? await shareApi.createJob(share.guestToken, { clientJobId, kind, model, prompt, params, inputFileIds, context, billingProjectId: share.project!.id, acceptSelfPay })
+        : await serverApi.createJob({ clientJobId, kind, model, prompt, params, inputFileIds, context });
     useJobStore.getState().trackJob(clientJobId, job, context);
     return job;
 }
@@ -75,6 +127,21 @@ async function submitJob(kind: ServerJobKind, model: string, prompt: string, par
 async function waitJob(jobId: string, clientJobId: string, options?: GenerationOptions) {
     const store = useJobStore.getState();
     try {
+        const share = shareGenerationContext(options?.context);
+        if (share) {
+            for (;;) {
+                if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+                const item = await pollShareJob(jobId, options?.context, options?.signal);
+                store.trackJob(clientJobId, item, options?.context);
+                options?.onProgress?.(item.progress);
+                if (["succeeded", "failed", "canceled"].includes(item.status)) {
+                    if (item.status === "failed") throw new Error(item.error || "生成失败");
+                    if (item.status === "canceled") throw new DOMException("Aborted", "AbortError");
+                    return item.outputs;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+        }
         const job = await waitJobFinished(jobId, {
             signal: options?.signal,
             onJob: (item) => {
@@ -86,7 +153,10 @@ async function waitJob(jobId: string, clientJobId: string, options?: GenerationO
         if (job.status === "canceled") throw new DOMException("Aborted", "AbortError");
         return job.outputs;
     } catch (error) {
-        if (options?.signal?.aborted) void serverApi.cancelJob(jobId).catch(() => undefined);
+        if (options?.signal?.aborted) {
+            const share = shareGenerationContext(options.context);
+            void (share ? shareApi.cancelJob(share.guestToken, jobId) : serverApi.cancelJob(jobId)).catch(() => undefined);
+        }
         throw error;
     } finally {
         store.untrackJob(clientJobId);
@@ -101,7 +171,7 @@ function withUserSystemPrompt(config: AiConfig, prompt: string) {
 
 async function runJob(kind: ServerJobKind, model: string, prompt: string, params: Record<string, unknown>, inputFileIds: string[], options?: GenerationOptions) {
     const clientJobId = options?.clientJobId || nanoid();
-    const job = await submitJob(kind, model, prompt, params, inputFileIds, clientJobId, options?.context);
+    const job = await submitJob(kind, model, prompt, params, inputFileIds, clientJobId, options?.context, options?.acceptSelfPay);
     return waitJob(job.id, clientJobId, options);
 }
 
@@ -170,7 +240,7 @@ export async function generateImages(config: AiConfig, prompt: string, reference
     if (options?.mask) throw new Error("服务端生成暂不支持蒙版编辑");
     const model = serverModel(config, "image");
     const count = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
-    const inputFileIds = await Promise.all(references.map(imageFileId));
+    const inputFileIds = await Promise.all(references.map((image) => imageFileId(image, options?.context)));
     const outputs = await runJob("image", model, withUserSystemPrompt(config, buildImageReferencePromptText(prompt, references)), imageParams(config, count), inputFileIds, options);
     if (!outputs.length) throw new Error("接口没有返回图片");
     return toGeneratedImages(outputs);
@@ -185,36 +255,27 @@ export function storeGeneratedImage(image: GeneratedImage): UploadedImage {
 export async function createVideoTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: GenerationOptions): Promise<VideoTask> {
     const model = serverModel(config, "video");
     const clientJobId = options?.clientJobId || nanoid();
-    const inputFileIds = [...(await Promise.all(references.map(imageFileId))), ...(await Promise.all([...videoReferences, ...audioReferences].map(mediaFileId)))];
+    const inputFileIds = [...(await Promise.all(references.map((image) => imageFileId(image, options?.context)))), ...(await Promise.all([...videoReferences, ...audioReferences].map((media) => mediaFileId(media, options?.context))))];
     const requestPrompt = isServerSeedanceModel(model) ? buildSeedancePromptText(prompt, references, videoReferences, audioReferences) : prompt;
-    const job = await submitJob("video", model, requestPrompt, videoParams(config, model), inputFileIds, clientJobId);
+    const job = await submitJob("video", model, requestPrompt, videoParams(config, model), inputFileIds, clientJobId, options?.context, options?.acceptSelfPay);
     return { id: job.id, model, clientJobId };
 }
 
 /** 等一个已存在的视频任务跑完。事件流推状态，不再轮询；超时判定由服务端负责。 */
 export async function awaitVideoTask(task: VideoTask, options?: GenerationOptions): Promise<VideoTaskState> {
-    const store = useJobStore.getState();
     try {
-        const job = await waitJobFinished(task.id, {
-            signal: options?.signal,
-            onJob: (item) => {
-                store.trackJob(task.clientJobId, item);
-                options?.onProgress?.(item.progress);
-            },
-        });
-        if (job.status === "failed") return { status: "failed", error: job.error || "生成失败" };
-        if (job.status === "canceled") return { status: "failed", error: "任务已取消" };
-        const file = job.outputs[0];
+        const file = (await waitJob(task.id, task.clientJobId, options))[0];
         return file ? { status: "completed", file } : { status: "failed", error: "任务成功但没有返回视频" };
-    } finally {
-        store.untrackJob(task.clientJobId);
+    } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return { status: "failed", error: "任务已取消" };
+        return { status: "failed", error: error instanceof Error ? error.message : "生成失败" };
     }
 }
 
 /** 生成视频（创建 + 轮询一次做完），画布与插件用这个入口。 */
 export async function generateVideo(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: GenerationOptions): Promise<UploadedFile> {
     const model = serverModel(config, "video");
-    const inputFileIds = [...(await Promise.all(references.map(imageFileId))), ...(await Promise.all([...videoReferences, ...audioReferences].map(mediaFileId)))];
+    const inputFileIds = [...(await Promise.all(references.map((image) => imageFileId(image, options?.context)))), ...(await Promise.all([...videoReferences, ...audioReferences].map((media) => mediaFileId(media, options?.context))))];
     const requestPrompt = isServerSeedanceModel(model) ? buildSeedancePromptText(prompt, references, videoReferences, audioReferences) : prompt;
     const outputs = await runJob("video", model, requestPrompt, videoParams(config, model), inputFileIds, options);
     if (!outputs[0]) throw new Error("任务成功但没有返回视频");
@@ -237,6 +298,23 @@ export async function generateAudio(config: AiConfig, prompt: string, options?: 
 async function streamJobText(jobId: string, clientJobId: string, onDelta: (text: string) => void, options?: GenerationOptions): Promise<string> {
     let text = "";
     try {
+        const share = shareGenerationContext(options?.context);
+        if (share) {
+            for (;;) {
+                if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+                const item = await pollShareJob(jobId, options?.context, options?.signal);
+                useJobStore.getState().trackJob(clientJobId, item, options?.context);
+                const next = item.text || "";
+                if (next !== text) { text = next; onDelta(text); }
+                options?.onProgress?.(item.progress);
+                if (["succeeded", "failed", "canceled"].includes(item.status)) {
+                    if (item.status === "canceled") throw new DOMException("Aborted", "AbortError");
+                    if (item.status !== "succeeded") throw new Error(item.error || "生成失败");
+                    return text;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+        }
         const job = await waitJobFinished(jobId, {
             signal: options?.signal,
             onJob: (item) => useJobStore.getState().trackJob(clientJobId, item),
@@ -249,7 +327,10 @@ async function streamJobText(jobId: string, clientJobId: string, onDelta: (text:
         if (job.status !== "succeeded") throw new Error(job.error || "生成失败");
         return text;
     } catch (error) {
-        if (options?.signal?.aborted) void serverApi.cancelJob(jobId).catch(() => undefined);
+        if (options?.signal?.aborted) {
+            const share = shareGenerationContext(options?.context);
+            void (share ? shareApi.cancelJob(share.guestToken, jobId) : serverApi.cancelJob(jobId)).catch(() => undefined);
+        }
         throw error;
     } finally {
         useJobStore.getState().untrackJob(clientJobId);
@@ -259,9 +340,9 @@ async function streamJobText(jobId: string, clientJobId: string, onDelta: (text:
 /** 生成文本：提交服务端任务并订阅增量，刷新或断网后可凭任务恢复已经生成出来的内容。 */
 export async function generateText(config: AiConfig, prompt: string, references: ReferenceImage[] = [], onDelta: (text: string) => void, options?: GenerationOptions): Promise<string> {
     const model = serverModel(config, "text");
-    const inputFileIds = await Promise.all(references.map(imageFileId));
+    const inputFileIds = await Promise.all(references.map((image) => imageFileId(image, options?.context)));
     const clientJobId = options?.clientJobId || nanoid();
-    const job = await submitJob("text", model, withUserSystemPrompt(config, prompt), textParams(config), inputFileIds, clientJobId, options?.context);
+    const job = await submitJob("text", model, withUserSystemPrompt(config, prompt), textParams(config), inputFileIds, clientJobId, options?.context, options?.acceptSelfPay);
     return streamJobText(job.id, clientJobId, onDelta, options);
 }
 

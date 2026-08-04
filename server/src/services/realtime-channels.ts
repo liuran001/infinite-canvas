@@ -20,6 +20,7 @@ import { getAgentSession, listAgentMessages, subscribeAgentSession, type AgentEv
 import { listJobsSince, subscribeJobs, toJobView, type JobEvent } from "./jobs";
 import { resolveProjectAccess, type AccessContext } from "./project-access";
 import { listProjectPresence, removeProjectPresence, subscribeProject, updateProjectPresence, type ProjectActivity } from "./project-realtime";
+import { scheduleShareExpiry } from "./project-share";
 import { storageOfTeam } from "./quota";
 import type { RealtimeIdentity } from "./realtime-tickets";
 import { serverFrame, type ServerFrame } from "../lib/realtime-protocol";
@@ -140,10 +141,12 @@ async function openProject(options: OpenChannelOptions, projectId: string): Prom
     const stream = buffered((frame) => send(frame));
     // 这条频道自己的 presence 来源标记：关闭时只删仍属于自己的那条记录。
     const source = `ws:${(presenceSourceSeq += 1)}`;
+    let cancelExpiry: () => void = () => undefined;
     let released = false;
     const release = () => {
         if (released) return;
         released = true;
+        cancelExpiry();
         stream.stop();
         unsubscribe();
         removeProjectPresence(ownerId, projectId, clientId, source);
@@ -170,6 +173,7 @@ async function openProject(options: OpenChannelOptions, projectId: string): Prom
         release();
         throw error;
     }
+    if (access.share?.expiresAt) cancelExpiry = scheduleShareExpiry(access.share.expiresAt, revoke);
 
     if (access.project.revision > sinceRevision) {
         stream.push(serverFrame("event", id, channel, { type: "project.saved", projectId, revision: access.project.revision, writerClientId: "" }));

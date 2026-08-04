@@ -27,8 +27,9 @@ const UPLOAD_WINDOW_MS = 10 * 60_000;
 const UPLOAD_MAX_FILES = 20;
 const UPLOAD_MAX_BYTES = 100 << 20;
 const ANONYMOUS_ACTOR = /^guest:[\w-]{1,64}:[A-Za-z0-9_-]{8,64}$/;
+const MAX_TIMER_MS = 0x7fffffff;
 
-export type ShareInput = { role: ShareRole; allowAnonymous: boolean; allowClone: boolean; expiresAt: string };
+export type ShareInput = { role: ShareRole; allowAnonymous: boolean; allowClone: boolean; expiresAt: string; ownerPays?: boolean; allowAnonymousEdit?: boolean };
 export type GuestSession = {
     kind: "guest";
     shareId: string;
@@ -43,6 +44,37 @@ export type GuestSession = {
     /** 通过分享进入的已登录账号 id。刻意不叫 userId，避免被账号鉴权当成用户令牌。 */
     accountId: string;
 };
+
+/**
+ * 在分享的绝对过期时间主动收回长连接。Node 的 setTimeout 超过约 24.8 天会被压成 1ms，
+ * 所以远期日期要分段重挂；返回的清理函数供连接正常关闭或被改策略时取消计时器。
+ */
+export function scheduleShareExpiry(expiresAt: string, expire: () => void): () => void {
+    const deadline = Date.parse(expiresAt);
+    if (!Number.isFinite(deadline)) return () => undefined;
+    let timer: NodeJS.Timeout | undefined;
+    let cancelled = false;
+    const arm = () => {
+        if (cancelled) return;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+            // 始终异步收权：SSE 可能刚完成权限校验、还没来得及设置响应头，
+            // 同步 end() 后继续 setHeader() 会触发 ERR_HTTP_HEADERS_SENT。
+            timer = setTimeout(() => {
+                if (!cancelled) expire();
+            }, 0);
+            timer.unref();
+            return;
+        }
+        timer = setTimeout(arm, Math.min(remaining, MAX_TIMER_MS));
+        timer.unref();
+    };
+    arm();
+    return () => {
+        cancelled = true;
+        if (timer) clearTimeout(timer);
+    };
+}
 
 const accessLogAt = new Map<string, number>();
 const uploadWindows = new Map<string, { since: number; files: number; bytes: number }>();
@@ -83,6 +115,8 @@ export function shareView(share: ProjectShare) {
         // 恒为 false：这个视图本来就不带明文，调用方不必再自己判断身份。
         copyable: false,
         allowAnonymous: share.allowAnonymous,
+        ownerPays: share.ownerPays,
+        allowAnonymousEdit: share.allowAnonymousEdit,
         allowClone: share.allowClone,
         enabled: share.enabled,
         expiresAt: share.expiresAt,
@@ -114,6 +148,8 @@ export async function createShare(ownerId: string, projectId: string, input: Sha
         tokenPrefix: token.slice(0, TOKEN_PREFIX_LENGTH),
         role: input.role,
         allowAnonymous: input.allowAnonymous,
+        ownerPays: input.ownerPays === true,
+        allowAnonymousEdit: input.role === "editor" && input.allowAnonymous === true && input.ownerPays === true && input.allowAnonymousEdit === true,
         allowClone: input.allowClone,
         enabled: true,
         expiresAt: input.expiresAt,
@@ -139,6 +175,8 @@ export async function updateShare(share: ProjectShare, patch: Partial<ShareInput
     const next = {
         role: patch.role || share.role,
         allowAnonymous: patch.allowAnonymous ?? share.allowAnonymous,
+        ownerPays: patch.ownerPays ?? share.ownerPays,
+        allowAnonymousEdit: (patch.role || share.role) === "editor" && (patch.allowAnonymous ?? share.allowAnonymous) === true && (patch.ownerPays ?? share.ownerPays) === true && (patch.allowAnonymousEdit ?? share.allowAnonymousEdit) === true,
         allowClone: patch.allowClone ?? share.allowClone,
         enabled: patch.enabled ?? share.enabled,
         // 前端清空过期时间发的是 null，语义是「改为永不过期」，只有整个字段缺席才算没改。
@@ -151,14 +189,18 @@ export async function updateShare(share: ProjectShare, patch: Partial<ShareInput
 
 /** 按哈希等值查找。不存在、已撤销、已过期一律回 null，调用方统一按 404 处理，不给 token 探测留信号。 */
 /**
- * 改动是否必须把在线连接踢下线。已建立的 SSE 不会重新鉴权，凡是收权的改动都得当场断，
- * 否则访客能靠一条老连接继续读到撤销后的内容。放权（启用、升级、延长、放开匿名）不必断。
+ * 改动是否必须把在线连接踢下线。已建立的 SSE 不会重新鉴权；角色、匿名编辑与付款策略
+ * 无论放权还是收权都要当场重换 session，否则界面会在旧策略上停到令牌自然续期。
  */
 export function shareRevokesAccess(before: ProjectShare, after: ProjectShare, at = Date.now()) {
     if (!after.enabled) return true;
-    // 只有降级才收权：升级成可编辑不必打断正在编辑的人，客户端下次 ready 自然会拿到新角色。
-    if (before.role === "editor" && after.role !== "editor") return true;
+    // 角色与计费策略都会改变客户端可见能力，统一断开让它立即重换 session；
+    // 否则升级、开启代扣或关闭代扣都要等到短期令牌自然续期才生效。
+    if (before.role !== after.role) return true;
     if (before.allowAnonymous && !after.allowAnonymous) return true;
+    if (before.ownerPays !== after.ownerPays) return true;
+    if (before.allowAnonymousEdit !== after.allowAnonymousEdit) return true;
+    if (before.expiresAt !== after.expiresAt) return true;
     return Boolean(after.expiresAt) && Date.parse(after.expiresAt) <= at;
 }
 

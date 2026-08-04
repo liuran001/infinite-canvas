@@ -289,11 +289,14 @@ export class Passkey {
  * 同一用户重复提交同一个 clientJobId 只会命中已有任务，
  * 因此客户端断网重试不会造成重复生成或重复扣费。
  */
-@Index(["userId", "clientJobId"], { unique: true })
+@Index(["userId", "shareId", "clientJobId"], { unique: true })
 @Entity("jobs")
 export class Job {
     @PrimaryColumn(id) id!: string;
     @Index() @Column(short) userId!: string;
+    @Column(short) storageUserId!: string;
+    @Column(short) payerUserId!: string;
+    @Column(short) shareId!: string;
     @Column(short) clientJobId!: string;
     @Column({ type: "varchar", length: 32, default: "image" }) kind!: JobKind;
     @Index() @Column({ type: "varchar", length: 32, default: "pending" }) status!: JobStatus;
@@ -313,7 +316,7 @@ export class Job {
     @Column({ type: "int", default: 0 }) credits!: number;
     @Column({ type: "int", default: 0 }) progress!: number;
     /**
-     * 用户内单调递增的变更序号，每次任务状态变化都会重新分配一个。
+     * 账号任务按用户、分享任务按分享链接单调递增的变更序号，每次状态变化都会重新分配一个。
      * 订阅方断线重连时带上最后收到的序号，服务端据此把断线期间变化过的任务补回来。
      * 用序号而不是 updatedAt：同一毫秒内落多次变更时，时间戳游标会漏掉其中几条。
      */
@@ -442,6 +445,8 @@ export class ProjectShare {
     @Column({ type: "varchar", length: 16, default: "" }) tokenPrefix!: string;
     @Column({ type: "varchar", length: 16, default: "viewer" }) role!: ShareRole;
     @Column({ type: "boolean", default: true }) allowAnonymous!: boolean;
+    @Column({ type: "boolean", default: false }) ownerPays!: boolean;
+    @Column({ type: "boolean", default: false }) allowAnonymousEdit!: boolean;
     @Column({ type: "boolean", default: true }) allowClone!: boolean;
     /** 撤销开关。撤销是软删除语义：访问日志还要能查回「这条链接当初被谁看过」。 */
     @Column({ type: "boolean", default: true }) enabled!: boolean;

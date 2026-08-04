@@ -16,6 +16,12 @@ type ShareStore = {
     guestToken: string;
     role: ShareRole;
     allowClone: boolean;
+    shareId: string;
+    anonymous: boolean;
+    fullCanvas: boolean;
+    ownerPays: boolean;
+    selfPayRequired: boolean;
+    allowAnonymousEdit: boolean;
     /** 服务端分配的访客身份，前端只做展示。 */
     actorId: string;
     displayName: string;
@@ -52,6 +58,12 @@ const initial = {
     guestToken: "",
     role: "viewer" as ShareRole,
     allowClone: false,
+    shareId: "",
+    anonymous: true,
+    fullCanvas: false,
+    ownerPays: false,
+    selfPayRequired: true,
+    allowAnonymousEdit: false,
     actorId: "",
     displayName: "",
     status: "idle" as ShareStatus,
@@ -73,6 +85,12 @@ export const useShareStore = create<ShareStore>()((set) => ({
             guestToken: session.token,
             role: session.role,
             allowClone: session.allowClone,
+            shareId: session.shareId,
+            anonymous: session.anonymous,
+            fullCanvas: session.fullCanvas,
+            ownerPays: session.ownerPays,
+            selfPayRequired: session.selfPayRequired,
+            allowAnonymousEdit: session.allowAnonymousEdit,
             actorId: session.actorId,
             displayName: session.displayName,
             revision: session.project.revision,

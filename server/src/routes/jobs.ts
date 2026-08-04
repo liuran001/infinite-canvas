@@ -2,13 +2,21 @@ import { Router } from "express";
 
 import type { JobKind, JobStatus } from "../db/entities";
 import { handle, ok } from "../lib/response";
-import { requireUser, userAuth } from "../middleware/auth";
-import { cancelJob, createJob, getJob, listJobs, listJobsSince, subscribeJobs, toJobView, type JobEvent } from "../services/jobs";
+import { accessContext, projectAuth } from "../middleware/auth";
+import { resolveProjectAccess } from "../services/project-access";
+import { fail } from "../lib/errors";
+import { cancelJob, createJob, findJobByClientId, getJob, listJobs, listJobsSince, subscribeJobs, toJobView, type JobEvent } from "../services/jobs";
 
 const JOB_STATUSES: JobStatus[] = ["pending", "running", "succeeded", "failed", "canceled"];
 const JOB_KINDS: JobKind[] = ["image", "video", "audio", "text"];
 
 export const jobRouter = Router();
+
+async function jobActor(req: Parameters<typeof accessContext>[0], permission: "read" | "write" = "read") {
+    if (req.guest) return (await resolveProjectAccess(accessContext(req), req.guest.projectId, permission)).actorId;
+    if (req.user) return req.user.id;
+    throw fail("未登录或权限不足", 401);
+}
 
 // 鉴权逐个路由挂：router 级中间件会拦下同层挂载在它之后的每一个接口，分享的匿名入口首当其冲。
 
@@ -18,11 +26,28 @@ export const jobRouter = Router();
  */
 jobRouter.post(
     "/v1/jobs",
-    userAuth,
+    projectAuth,
     handle(async (req, res) => {
         const body = req.body || {};
-        const job = await createJob(requireUser(req).id, {
-            clientJobId: String(body.clientJobId || ""),
+        const clientJobId = String(body.clientJobId || "").trim();
+        const projectId = String(body.billingProjectId || req.guest?.projectId || "").trim();
+        // 分享任务先按读权限解析并查幂等键：任务已经创建后，房主切换代付策略或把链接降为只读，
+        // 原请求的网络重试仍应只命中旧任务，而不是套用新策略后误报需要确认或重复扣费。
+        let access = projectId ? await resolveProjectAccess(accessContext(req), projectId, req.guest ? "read" : "write") : null;
+        const actorId = access?.actorId || req.user?.id || "";
+        if (!actorId) throw fail("未登录或权限不足", 401);
+        const existing = await findJobByClientId(actorId, clientJobId, access?.share?.id || "");
+        if (existing) return ok(res, await toJobView(existing));
+        if (access?.share) access = await resolveProjectAccess(accessContext(req), projectId, "write");
+        const ownerUsesOwnCredits = Boolean(access?.share && req.user?.id === access.ownerId);
+        if (access?.share && !access.share.ownerPays && !ownerUsesOwnCredits) {
+            if (access.anonymous || !req.user || req.user.id !== access.actorId) throw fail("请先登录后再使用个人算力点", 401, "SELF_PAY_LOGIN_REQUIRED");
+            if (body.acceptSelfPay !== true) throw fail("请先确认由本人支付", 403, "SELF_PAY_CONFIRM_REQUIRED");
+        }
+        const ownerId = access?.ownerId || actorId;
+        const payerUserId = access?.share ? (access.share.ownerPays ? ownerId : req.user!.id) : actorId;
+        const job = await createJob(actorId, {
+            clientJobId,
             kind: JOB_KINDS.includes(body.kind as JobKind) ? (body.kind as JobKind) : "image",
             model: String(body.model || ""),
             prompt: String(body.prompt || ""),
@@ -31,7 +56,10 @@ jobRouter.post(
             context: body.context && typeof body.context === "object" ? body.context : {},
             // 计费归属只认这个显式字段，而且服务端还要按当前用户回库核对画布与团队成员资格；
             // context 里的 projectId 是客户端自定义的展示信息，伪造它改不了付费方。
-            billingProjectId: String(body.billingProjectId || ""),
+            billingProjectId: projectId,
+            storageUserId: access?.ownerId || actorId,
+            payerUserId,
+            shareId: access?.share?.id || "",
         });
         ok(res, await toJobView(job));
     }),
@@ -40,13 +68,14 @@ jobRouter.post(
 /** 客户端重连后拉取未完成任务，据此恢复进度而不是重新发起生成。 */
 jobRouter.get(
     "/v1/jobs",
-    userAuth,
+    projectAuth,
     handle(async (req, res) => {
         const requested = String(req.query.status || "")
             .split(",")
             .map((item) => item.trim())
             .filter((item): item is JobStatus => JOB_STATUSES.includes(item as JobStatus));
-        const items = await listJobs(requireUser(req).id, requested, String(req.query.since || ""));
+        const actor = await jobActor(req);
+        const items = await listJobs(actor, requested, String(req.query.since || ""), req.guest?.shareId || "");
         ok(res, { items: await Promise.all(items.map(toJobView)) });
     }),
 );
@@ -62,9 +91,13 @@ jobRouter.get(
  */
 jobRouter.get(
     "/v1/jobs/stream",
-    userAuth,
+    projectAuth,
     handle(async (req, res) => {
-        const userId = requireUser(req).id;
+        // 分享画布当前明确走带 guest 令牌的低频查询。若允许 guest 保持这条长连接，
+        // 链接被撤销后已经建立的订阅不会再次鉴权，仍可能收到同一分享后续任务事件。
+        if (req.guest) throw fail("分享任务请使用任务查询接口", 403, "SHARE_JOB_STREAM_UNAVAILABLE");
+        const userId = await jobActor(req);
+        const shareId = "";
         const sinceSeq = Math.max(0, Number.parseInt(String(req.query.sinceSeq || "0"), 10) || 0);
 
         res.status(200).set({ "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", Connection: "keep-alive", "X-Accel-Buffering": "no" });
@@ -101,7 +134,7 @@ jobRouter.get(
             if (closed) return;
             if (replaying) buffered.push(event);
             else deliver(event);
-        });
+        }, shareId);
         req.on("close", () => {
             closed = true;
             clearInterval(keepAlive);
@@ -111,7 +144,7 @@ jobRouter.get(
         // 补齐的是任务的最新快照：状态「最新值即真相」，中间的进度值补不补都不影响结果。
         const replayed = new Map<string, number>();
         let maxSeq = sinceSeq;
-        for (const row of await listJobsSince(userId, sinceSeq)) {
+        for (const row of await listJobsSince(userId, sinceSeq, shareId)) {
             replayed.set(row.id, row.seq);
             maxSeq = Math.max(maxSeq, row.seq);
             deliver({ type: "job", seq: row.seq, job: await toJobView(row) });
@@ -128,6 +161,7 @@ jobRouter.get(
     }),
 );
 
-jobRouter.get("/v1/jobs/:id", userAuth, handle(async (req, res) => ok(res, await toJobView(await getJob(requireUser(req).id, String(req.params.id))))));
+jobRouter.get("/v1/jobs/:id", projectAuth, handle(async (req, res) => ok(res, await toJobView(await getJob(await jobActor(req), String(req.params.id), req.guest?.shareId || "")))));
 
-jobRouter.post("/v1/jobs/:id/cancel", userAuth, handle(async (req, res) => ok(res, await toJobView(await cancelJob(requireUser(req).id, String(req.params.id))))));
+// 降级为只读只禁止继续修改画布，不应把发起者已经在跑的任务变成无法止损；取消按读权限确认仍属于该分享。
+jobRouter.post("/v1/jobs/:id/cancel", projectAuth, handle(async (req, res) => ok(res, await toJobView(await cancelJob(await jobActor(req, "read"), String(req.params.id), req.guest?.shareId || "")))));

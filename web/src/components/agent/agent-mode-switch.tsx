@@ -14,8 +14,8 @@ const MODES: Array<{ value: AgentPanelMode; label: string; description: string; 
  * 面板标题位置的模式切换。管理员关掉系统 Agent 时不展示「系统模型」这一项，
  * 只剩本地一种模式就退回原来的纯标题，不给用户一个点了没用的下拉。
  */
-export function AgentModeSwitch({ theme }: { theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {
-    const cloudEnabled = useServerStore((state) => Boolean(state.settings?.agent.enabled));
+export function AgentModeSwitch({ theme, forceLocal = false }: { theme: (typeof canvasThemes)[keyof typeof canvasThemes]; forceLocal?: boolean }) {
+    const cloudEnabled = useServerStore((state) => !forceLocal && Boolean(state.settings?.agent.enabled));
     const panelMode = useAgentStore((state) => state.panelMode);
     const setPanelMode = useAgentStore((state) => state.setPanelMode);
     const mode = cloudEnabled ? panelMode : "local";

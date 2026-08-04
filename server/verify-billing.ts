@@ -193,12 +193,95 @@ async function main() {
     check("随机操作中余额从未为负", ordered.every((row) => row.balance >= 0), true);
 
     await teamBilling({ check, rejects });
+    await shareJobIsolation({ check, rejects });
     await legacyCompatibility({ check, rejects });
     await crashWindows({ check });
     await refundConflictShapes({ check });
     await insufficientThroughCallers({ check, rejects });
 
     finish(env.root);
+}
+
+/** 分享任务按 shareId 共同可见；画布所有者也能从账号通道恢复和止损，普通协作者仍不能越权取消。 */
+async function shareJobIsolation({ check, rejects }: { check: (name: string, actual: unknown, expected: unknown) => void; rejects: (name: string, work: () => Promise<unknown>) => Promise<void> }) {
+    const { repo } = await import("./src/db/data-source");
+    const { Job } = await import("./src/db/entities");
+    const { cancelJob, findJobByClientId, getJob, listJobs, subscribeJobs } = await import("./src/services/jobs");
+    const { newId, now } = await import("./src/lib/errors");
+
+    console.log("分享任务按链接隔离");
+    const jobs = repo(Job);
+    const row = (id: string, shareId: string, userId = "shared-actor") => ({
+        id,
+        userId,
+        storageUserId: "canvas-owner",
+        payerUserId: "shared-actor",
+        shareId,
+        clientJobId: "same-client-job",
+        kind: "image" as const,
+        status: "pending" as const,
+        model: "verify-model",
+        prompt: "",
+        params: "{}",
+        inputFileIds: [],
+        outputFileIds: [],
+        text: "",
+        context: {},
+        error: "",
+        credits: 0,
+        progress: 0,
+        seq: 1,
+        upstreamTaskId: "",
+        payerKind: "user" as const,
+        payerTeamId: "",
+        payerLogId: "",
+        storageTeamId: "",
+        createdAt: now(),
+        updatedAt: now(),
+        finishedAt: "",
+    });
+    const accountId = newId("job");
+    const firstId = newId("job");
+    const collaboratorId = newId("job");
+    const secondId = newId("job");
+    await jobs.insert(row(accountId, ""));
+    await jobs.insert(row(firstId, "share-a"));
+    await jobs.insert(row(collaboratorId, "share-a", "other-actor"));
+    await jobs.insert(row(secondId, "share-b"));
+    check("同 actor 同幂等键可在账号与不同分享各建一条任务", await jobs.countBy({ userId: "shared-actor", clientJobId: "same-client-job" }), 3);
+    check("账号幂等重试只命中账号任务", (await findJobByClientId("shared-actor", "same-client-job"))?.id, accountId);
+    check("分享幂等重试只命中原 actor 在该分享的任务", (await findJobByClientId("shared-actor", "same-client-job", "share-a"))?.id, firstId);
+    check("其他协作者不能用同一 clientJobId 冒充原任务重试", await findJobByClientId("third-actor", "same-client-job", "share-a"), null);
+    check("账号任务列表不会混入分享任务", (await listJobs("shared-actor", [], "")).map((item) => item.id), [accountId]);
+    check("分享 A 列表返回同一分享的全部协作者任务", (await listJobs("shared-actor", [], "", "share-a")).map((item) => item.id).sort(), [firstId, collaboratorId].sort());
+    check("另一协作者刷新也能看到同一分享任务", (await listJobs("other-actor", [], "", "share-a")).map((item) => item.id).sort(), [firstId, collaboratorId].sort());
+    check("分享 B 列表只返回分享 B", (await listJobs("shared-actor", [], "", "share-b")).map((item) => item.id), [secondId]);
+    check("画布所有者账号列表能恢复全部分享任务", (await listJobs("canvas-owner", [], "")).map((item) => item.id).sort(), [firstId, collaboratorId, secondId].sort());
+    check("画布所有者账号通道能续查分享任务", (await getJob("canvas-owner", firstId)).id, firstId);
+    await rejects("发起者的普通账号通道不能绕过分享读取任务", () => getJob("shared-actor", firstId));
+    await rejects("无关账号不能读取画布分享任务", () => getJob("stranger", firstId));
+    await rejects("分享 A 不能读取分享 B 的任务", () => getJob("shared-actor", secondId, "share-a"));
+    check("同一分享的协作者可以续查任务", (await getJob("other-actor", firstId, "share-a")).id, firstId);
+    await rejects("同一分享的协作者不能取消他人任务", () => cancelJob("other-actor", firstId, "share-a"));
+    await rejects("分享 A 不能取消分享 B 的任务", () => cancelJob("shared-actor", secondId, "share-a"));
+    check("画布所有者可取消协作者发起的分享任务", (await cancelJob("canvas-owner", collaboratorId)).status, "canceled");
+    const accountEvents: unknown[] = [];
+    const shareAEvents: unknown[] = [];
+    const collaboratorEvents: unknown[] = [];
+    const shareBEvents: unknown[] = [];
+    const unsubscribe = [
+        subscribeJobs("shared-actor", (event) => accountEvents.push(event)),
+        subscribeJobs("shared-actor", (event) => shareAEvents.push(event), "share-a"),
+        subscribeJobs("other-actor", (event) => collaboratorEvents.push(event), "share-a"),
+        subscribeJobs("shared-actor", (event) => shareBEvents.push(event), "share-b"),
+    ];
+    await cancelJob("shared-actor", firstId, "share-a");
+    unsubscribe.forEach((stop) => stop());
+    check("分享 A 事件不会进入账号任务流", accountEvents.length, 0);
+    check("分享 A 事件只进入分享 A 任务流", shareAEvents.length, 1);
+    check("分享 A 事件同步给同一分享的其他协作者", collaboratorEvents.length, 1);
+    check("分享 A 事件不会进入分享 B 任务流", shareBEvents.length, 0);
+    check("取消分享 A 不影响分享 B", (await jobs.findOneByOrFail({ id: secondId })).status, "pending");
 }
 
 /**

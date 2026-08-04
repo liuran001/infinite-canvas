@@ -1,5 +1,5 @@
 import { serverApiUrl } from "@/services/api/server";
-import type { ServerFile, ServerProject, ServerProjectEvent, ServerProjectPresence } from "@/services/api/server";
+import type { ServerFile, ServerJob, ServerJobStatus, ServerProject, ServerProjectEvent, ServerProjectPresence } from "@/services/api/server";
 import { useServerStore } from "@/stores/use-server-store";
 
 /**
@@ -27,6 +27,8 @@ export type ShareRecord = {
     role: ShareRole;
     allowAnonymous: boolean;
     allowClone: boolean;
+    ownerPays: boolean;
+    allowAnonymousEdit: boolean;
     enabled: boolean;
     tokenPrefix: string;
     /** 服务端手里还有没有这条链接的明文。存量记录建于「只存哈希」的年代，永远是 false。 */
@@ -56,6 +58,8 @@ export type ShareCreateInput = {
     role: ShareRole;
     allowAnonymous: boolean;
     allowClone: boolean;
+    ownerPays: boolean;
+    allowAnonymousEdit: boolean;
     /** ISO 时间串，留空表示永不过期。 */
     expiresAt?: string | null;
 };
@@ -67,9 +71,15 @@ export type ShareUpdateInput = Partial<ShareCreateInput> & { enabled?: boolean }
  * 前端不自报身份，只把上一次拿到的 guest 令牌回传，让服务端决定要不要沿用同一个访客 id。
  */
 export type ShareSession = {
+    shareId: string;
     token: string;
     role: ShareRole;
     allowClone: boolean;
+    anonymous: boolean;
+    fullCanvas: boolean;
+    ownerPays: boolean;
+    selfPayRequired: boolean;
+    allowAnonymousEdit: boolean;
     /** 服务端分配的访客标识，匿名时形如 guest:<shareId>:<随机>。 */
     actorId: string;
     /** 服务端给的展示名，匿名访客通常是「访客-XXXX」。 */
@@ -169,6 +179,11 @@ export const shareApi = {
         if (meta?.durationMs) form.append("durationMs", String(meta.durationMs));
         return shareRequest<ServerFile>("/v1/files", { method: "POST", body: form }, "上传文件失败", guestToken);
     },
+    createJob: (guestToken: string, input: Record<string, unknown> & { billingProjectId: string; acceptSelfPay: boolean }) =>
+        shareRequest<ServerJob>("/v1/jobs", { method: "POST", ...jsonBody(input), headers: userToken() ? { "X-User-Authorization": `Bearer ${userToken()}` } : {} }, "提交分享生成任务失败", guestToken),
+    job: (guestToken: string, id: string) => shareRequest<ServerJob>(`/v1/jobs/${encodeURIComponent(id)}`, {}, "查询分享生成任务失败", guestToken),
+    jobs: (guestToken: string, statuses: ServerJobStatus[] = []) => shareRequest<{ items: ServerJob[] }>(`/v1/jobs${statuses.length ? `?status=${encodeURIComponent(statuses.join(","))}` : ""}`, {}, "查询分享生成任务失败", guestToken),
+    cancelJob: (guestToken: string, id: string) => shareRequest<ServerJob>(`/v1/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", ...jsonBody({ acceptSelfPay: true }) }, "取消分享生成任务失败", guestToken),
 
     /** 以下是分享态下的画布读写，走的仍是现有项目接口，只是换成 guest 令牌。 */
     project: (projectId: string, guestToken: string) => shareRequest<ServerProject>(`/v1/projects/${encodeURIComponent(projectId)}`, {}, "读取分享画布失败", guestToken),

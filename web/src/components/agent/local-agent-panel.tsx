@@ -10,10 +10,12 @@ import { fitNodeSize } from "@/lib/canvas/canvas-node-size";
 import { readImageMeta } from "@/lib/image-utils";
 import { randomId } from "@/lib/utils";
 import { uploadImage } from "@/services/image-storage";
+import { uploadShareImage } from "@/services/share-upload";
 import { bindPendingAgentUserMessage, deleteAgentThreadMessages, deletePendingAgentUserMessage, moveAgentUserMessage, readAgentUserMessages, savePendingAgentUserMessage } from "@/services/agent-chat-storage";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { useShallow } from "zustand/react/shallow";
 import { useAgentStore, type AgentCanvasContext, type AgentChatItem, type AgentModel, type AgentPendingApproval, type AgentPendingToolCall, type AgentPermissionMode, type AgentReasoningEffort, type AgentThreadSummary } from "@/stores/use-agent-store";
+import { useShareStore } from "@/stores/use-share-store";
 import { type CanvasAgentOp, type CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { isSiteTool, runSiteTool } from "@/lib/agent/agent-site-tools";
 import { acknowledgeCodexHistory, activateAgentClient, discoverAgentConfig, fetchAgentJson, postCodexApproval, postState, postToolResult } from "./agent-api";
@@ -87,7 +89,7 @@ function authoritativeHistoryTurnKeys(threadId: string, settledTurnIds: string[]
     return new Set(settledTurnIds.map((turnId) => `${threadId}\0${turnId}`));
 }
 
-export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?: boolean; headless?: boolean; autoConnect?: boolean }) {
+export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = false }: { embedded?: boolean; headless?: boolean; autoConnect?: boolean; forceLocal?: boolean }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { message, modal } = App.useApp();
     const [searchParams] = useSearchParams();
@@ -136,6 +138,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     const confirmToolsRef = useRef(confirmTools);
     const pendingToolRef = useRef<AgentPendingToolCall | null>(null);
     const autoConnectRef = useRef(false);
+    /** 分享页不能继承其它页面的 enabled；只有本次挂载内手动点击后才允许建立连接。 */
+    const manualConnectionRef = useRef(!forceLocal);
     const connectedRef = useRef(false);
     const errorLoggedRef = useRef(false);
     const attachmentUrlsRef = useRef(new Set<string>());
@@ -148,7 +152,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     const threadOperationRef = useRef(0);
     const threadOperationSequenceRef = useRef(0);
     const endpoint = useMemo(() => url.trim().replace(/\/$/, ""), [url]);
-    const urlAgentAutoConnect = searchParams.has("agentUrl") && searchParams.has("agentToken");
+    const urlAgentAutoConnect = !forceLocal && searchParams.has("agentUrl") && searchParams.has("agentToken");
     useEffect(() => {
         let disposed = false;
         void acquireAgentClientId().then((clientId) => {
@@ -282,7 +286,23 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     useEffect(() => () => attachmentUrlsRef.current.forEach((url) => URL.revokeObjectURL(url)), []);
 
     useEffect(() => {
-        if (!clientReady || !enabled || !token.trim()) return;
+        if (!forceLocal) {
+            manualConnectionRef.current = true;
+            return;
+        }
+        manualConnectionRef.current = false;
+        connectedRef.current = false;
+        setAgentState({ enabled: false, connected: false, silentConnect: false, activity: "离线", connectError: "" });
+        return () => {
+            manualConnectionRef.current = false;
+            connectedRef.current = false;
+            const state = useAgentStore.getState();
+            if (state.enabled || state.connected) setAgentState({ enabled: false, connected: false, silentConnect: false, activity: "离线" });
+        };
+    }, [forceLocal, setAgentState]);
+
+    useEffect(() => {
+        if (!clientReady || !enabled || !token.trim() || (forceLocal && !manualConnectionRef.current)) return;
         localStorage.setItem("canvas-agent-url", endpoint);
         localStorage.setItem("canvas-agent-token", token);
         const clientId = clientIdRef.current;
@@ -533,7 +553,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             connectedRef.current = false;
             loadThreadsSequenceRef.current += 1;
         };
-    }, [applyWorkspaceChange, clientReady, enabled, endpoint, loadThreads, message, setAgentState, token]);
+    }, [applyWorkspaceChange, clientReady, enabled, endpoint, forceLocal, loadThreads, message, setAgentState, token]);
 
     useEffect(() => {
         if (connected) void loadThreads();
@@ -715,6 +735,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     };
 
     const runToolCall = async (endpoint: string, token: string, payload: AgentPendingToolCall) => {
+        if (forceLocal && (isSiteTool(payload.name) || payload.name === "site_navigate")) {
+            const error = "分享画布仅允许 Agent 操作当前画布，不能使用账号级工具或跳转页面";
+            await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, error });
+            addEventLog(`${toolName(payload.name)}已拒绝`, { error }, payload);
+            return;
+        }
         if (isSiteTool(payload.name)) {
             try {
                 addEventLog(toolName(payload.name), payload, payload);
@@ -816,11 +842,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
 
     const toggleAgentConnection = async ({ silent = false }: { silent?: boolean } = {}) => {
         if (enabled) {
+            if (forceLocal) manualConnectionRef.current = false;
             clearAgentSession({ enabled: false, connected: false, activity: "离线", connectError: "" });
             return;
         }
-        const urlToken = searchParams.get("agentToken") || "";
-        const urlEndpoint = searchParams.get("agentUrl") || "";
+        const urlToken = forceLocal ? "" : searchParams.get("agentToken") || "";
+        const urlEndpoint = forceLocal ? "" : searchParams.get("agentUrl") || "";
         const discovered = urlToken ? null : await discoverAgentConfig(endpoint || DEFAULT_AGENT_URL);
         const nextEndpoint = (urlEndpoint || discovered?.url || endpoint || DEFAULT_AGENT_URL).trim().replace(/\/$/, "");
         const nextToken = (urlToken || token.trim() || discovered?.token || "").trim();
@@ -852,6 +879,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             return;
         }
         errorLoggedRef.current = false;
+        if (forceLocal) manualConnectionRef.current = true;
         setAgentState({ url: nextEndpoint, token: nextToken, enabled: true, connected: false, silentConnect: silent, activity: "连接中", connectError: "", activeTab: "setup" });
     };
 
@@ -860,10 +888,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     }, [confirmTools, setAgentState, urlAgentAutoConnect]);
 
     useEffect(() => {
-        if ((!autoConnect && !urlAgentAutoConnect) || autoConnectRef.current || enabled || connected) return;
+        if (forceLocal || (!autoConnect && !urlAgentAutoConnect) || autoConnectRef.current || enabled || connected) return;
         autoConnectRef.current = true;
         void toggleAgentConnection({ silent: true });
-    }, [autoConnect, connected, enabled, urlAgentAutoConnect]);
+    }, [autoConnect, connected, enabled, forceLocal, urlAgentAutoConnect]);
 
     function clearAgentSession(patch: Parameters<typeof setAgentState>[0] = {}) {
         loadThreadsSequenceRef.current += 1;
@@ -1205,7 +1233,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             <AgentPanelTabs
                 value={activeTab}
                 theme={theme}
-                leading={<AgentModeSwitch theme={theme} />}
+                leading={<AgentModeSwitch theme={theme} forceLocal={forceLocal} />}
                 items={[
                     { value: "setup", label: "连接", icon: <PlugZap className="size-3.5" /> },
                     { value: "chat", label: "对话", icon: <MessageSquare className="size-3.5" /> },
@@ -1395,7 +1423,7 @@ async function attachmentNodeOps(endpoint: string, token: string, clientId: stri
                 const body = (await res.json().catch(() => null)) as { error?: string } | null;
                 throw new Error(body?.error || "读取图片附件失败");
             }
-            const image = await uploadImage(await res.blob());
+            const image = await uploadCanvasAgentImage(await res.blob());
             const size = fitNodeSize(image.width, image.height);
             const position = item.position && typeof item.position === "object" ? (item.position as { x?: unknown; y?: unknown }) : {};
             return {
@@ -1429,12 +1457,17 @@ async function importGeneratedImages(endpoint: string, token: string, item: Agen
                 : await fetch(`${endpoint}/agent/local-image?token=${encodeURIComponent(token)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: source }) });
             if (!response.ok) throw new Error("读取 Codex 生成图片失败");
             const blob = await response.blob();
-            const upload = await uploadImage(blob);
+            const upload = await uploadCanvasAgentImage(blob);
             const dataUrl = await readDataUrl(blob);
             const name = source.startsWith("/") ? source.split("/").at(-1) || `生成图片 ${index + 1}` : `生成图片 ${index + 1}`;
             return { upload, name, attachment: { id: createId(), name, type: blob.type || upload.mimeType, size: blob.size, width: upload.width, height: upload.height, url: upload.url, dataUrl } };
         }),
     );
+}
+
+async function uploadCanvasAgentImage(input: string | Blob) {
+    const share = useShareStore.getState();
+    return share.fullCanvas && share.status === "ready" && share.role === "editor" ? uploadShareImage(input) : uploadImage(input);
 }
 
 function generatedImageSources(value: unknown, result = new Set<string>()) {

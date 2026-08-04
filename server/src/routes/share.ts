@@ -27,7 +27,7 @@ function readShareInput(body: Record<string, unknown>): ShareInput {
     const role = body.role === "editor" ? "editor" : "viewer";
     const expiresAt = String(body.expiresAt || "").trim();
     if (expiresAt && Number.isNaN(Date.parse(expiresAt))) throw fail("过期时间格式不正确", 400, "INVALID_EXPIRES_AT");
-    return { role, allowAnonymous: body.allowAnonymous !== false, allowClone: body.allowClone !== false, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : "" };
+    return { role, allowAnonymous: body.allowAnonymous !== false, allowClone: body.allowClone !== false, ownerPays: body.ownerPays === true, allowAnonymousEdit: body.allowAnonymousEdit === true, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : "" };
 }
 
 /** 分享管理一律要求账号身份且必须是画布所有者，guest 令牌在中间件那层就被挡成 403。 */
@@ -72,12 +72,14 @@ shareRouter.patch(
                 role: body.role || share.role,
                 allowAnonymous: body.allowAnonymous ?? share.allowAnonymous,
                 allowClone: body.allowClone ?? share.allowClone,
+                ownerPays: body.ownerPays ?? share.ownerPays,
+                allowAnonymousEdit: body.allowAnonymousEdit ?? share.allowAnonymousEdit,
                 expiresAt: "expiresAt" in body ? body.expiresAt : share.expiresAt,
             }),
             enabled: body.enabled === undefined ? share.enabled : body.enabled !== false,
         };
         const updated = await updateShare(share, patch);
-        // 撤销、降级、关掉匿名或过期之后还挂着的 SSE 不会重新鉴权，必须当场把它们踢下线。
+        // 角色、匿名编辑与付款策略变化后，在线客户端必须立刻重换 session；旧 SSE 自己不会重新鉴权。
         if (shareRevokesAccess(share, updated)) disconnectShare(access.ownerId, projectId, share.id);
         ok(res, withShareUrl(req, ownerShareView(updated)));
     }),
@@ -133,12 +135,17 @@ shareRouter.post(
             expiresIn: guestTokenTtl(),
             expiresAt: new Date(Date.now() + guestTokenTtl() * 1000).toISOString(),
             // role 与 permission 同值：前者对齐设计文档，后者是前端已经在用的字段名。
-            role: share.role,
-            permission: share.role,
+            role: access.role,
+            permission: access.role,
             allowClone: share.allowClone,
+            shareId: share.id,
+            anonymous: session.anonymous,
+            fullCanvas: access.role === "editor",
+            ownerPays: share.ownerPays,
+            selfPayRequired: !session.anonymous && access.role === "editor" && !share.ownerPays && req.user?.id !== share.ownerId,
+            allowAnonymousEdit: share.allowAnonymousEdit,
             actorId: session.actorId,
             displayName: session.displayName,
-            anonymous: session.anonymous,
             project: { id: share.projectId, title: access.project.title, revision: access.project.revision },
         });
     }),
