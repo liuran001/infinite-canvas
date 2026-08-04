@@ -4,7 +4,7 @@ import { MoreThan, Not } from "typeorm";
 import { repo } from "../db/data-source";
 import { AgentMessage, AgentSession, type AgentMessageRole, type AgentPendingAction, type AgentSessionStatus } from "../db/entities";
 import { fail, newId, NOT_FOUND, now, SafeError } from "../lib/errors";
-import { upstreamJson } from "../lib/upstream";
+import { readUpstreamSse, upstreamJson, upstreamStream } from "../lib/upstream";
 import { fileIdOfStorageKey, listAgentTools, runAgentTool, storageKeyOf, type AgentTool, type AgentToolAccess, type ToolState } from "./agent-tools";
 import { charge, payerOfProject, payerOfSession, refund, type ChargeReceipt } from "./billing";
 import { listFiles } from "./files";
@@ -336,21 +336,60 @@ function toOpenAiMessages(system: string, history: AgentMessage[], images: Map<s
 
 type OpenAiPayload = { choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ function?: { name?: string; arguments?: string } }> } }> };
 
+/**
+ * 流式返回的增量块。tool_calls 按 index 分槽下发：name 通常只在第一块出现，
+ * arguments 是一串 JSON 片段，必须按槽拼回去才能得到完整参数。
+ */
+type OpenAiChunk = {
+    choices?: Array<{ delta?: { content?: string | null; tool_calls?: Array<{ index?: number; function?: { name?: string; arguments?: string } }> }; finish_reason?: string | null }>;
+    error?: { message?: string };
+};
+
+/**
+ * 一律走流式，哪怕这里并不需要逐字输出。
+ *
+ * 原因是非流式那条路在真实网关上并不可靠：实测某中转的 gpt-5.6 系列在收到 tools 之后，
+ * 非流式响应回的是 `{"role":"assistant","content":""}`——没有 tool_calls，可 usage 里明明记着
+ * 32 个输出 token，也就是模型确实生成了工具调用，是网关在转换非流式响应时把它丢了。
+ * 同一个请求加上 stream:true 就能完整拿到 tool_calls。这类网关很常见，而症状是 Agent
+ * 转一会儿就毫无动静，最难查。流式是 OpenAI 的标准能力，没有理由为了省几行聚合代码去踩它。
+ */
 async function callOpenAi(channel: ModelChannel, model: string, system: string, history: AgentMessage[], images: Map<string, ContextImage>, tools: AgentTool[], signal: AbortSignal): Promise<ModelReply> {
-    const payload = await upstreamJson<OpenAiPayload>(
+    const body = await upstreamStream(
         buildChannelUrl(channel, "/chat/completions"),
         {
             method: "POST",
-            headers: { Authorization: `Bearer ${channel.apiKey}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ model, messages: toOpenAiMessages(system, history, images), ...(tools.length ? { tools: tools.map((tool) => ({ type: "function", function: tool })) } : {}) }),
+            headers: { Authorization: `Bearer ${channel.apiKey}`, "Content-Type": "application/json", Accept: "text/event-stream" },
+            body: JSON.stringify({ model, messages: toOpenAiMessages(system, history, images), stream: true, ...(tools.length ? { tools: tools.map((tool) => ({ type: "function", function: tool })) } : {}) }),
             signal,
         },
         "Agent 模型调用失败",
     );
-    const message = payload.choices?.[0]?.message;
+
+    let content = "";
+    // 用 Map 而不是数组：index 不保证从 0 连续，缺一个就会把两个工具调用的参数拼到一起。
+    const calls = new Map<number, { name: string; args: string }>();
+    await readUpstreamSse(body, (data) => {
+        const chunk = JSON.parse(data) as OpenAiChunk;
+        if (chunk.error?.message) throw fail(chunk.error.message);
+        const delta = chunk.choices?.[0]?.delta;
+        if (!delta) return;
+        if (typeof delta.content === "string") content += delta.content;
+        for (const call of delta.tool_calls || []) {
+            const index = typeof call.index === "number" ? call.index : 0;
+            const slot = calls.get(index) || { name: "", args: "" };
+            if (call.function?.name) slot.name = call.function.name;
+            if (call.function?.arguments) slot.args += call.function.arguments;
+            calls.set(index, slot);
+        }
+    });
+
     return {
-        content: (message?.content || "").trim(),
-        toolCalls: (message?.tool_calls || []).map((call) => ({ name: (call.function?.name || "").trim(), args: parseArgs(call.function?.arguments || "") })).filter((call) => call.name),
+        content: content.trim(),
+        toolCalls: [...calls.entries()]
+            .sort(([a], [b]) => a - b)
+            .map(([, call]) => ({ name: call.name.trim(), args: parseArgs(call.args) }))
+            .filter((call) => call.name),
     };
 }
 
@@ -479,7 +518,13 @@ async function runLoop(session: AgentSession, signal: AbortSignal) {
         const images = await loadContextImages(session.userId, history, access.vision);
         const reply = await callModel(channel, session.model, system, history, images, tools, signal);
         if (reply.content) await appendMessage(session, "assistant", { content: reply.content });
-        if (!reply.toolCalls.length) return false;
+        if (!reply.toolCalls.length) {
+            // 一句话没说、一个工具没调，这不是「做完了」，是这一轮什么都没发生。
+            // 静默收工的话，用户看到的就是转一会儿然后一切如常：没有结果，没有报错，也没有任何线索，
+            // 而真正的原因（模型不支持工具调用、网关把响应转坏了、上游把内容吞了）恰恰是他排查得动的。
+            if (!reply.content) throw fail(`模型「${session.model}」这一轮什么都没有返回：既没有回复内容，也没有调用工具。可能是它不支持工具调用，或者上游网关没有把响应正确转回来；换一个模型再试，或联系管理员检查该模型的渠道配置。`);
+            return false;
+        }
 
         for (const call of reply.toolCalls) {
             const args = JSON.stringify(call.args);

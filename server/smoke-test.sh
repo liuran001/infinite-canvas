@@ -397,15 +397,54 @@ require("http").createServer((req, res) => {
             const messages = body.messages || [];
             // 起标题是一次独立的短请求，不带工具也不该被当成 agent 的一轮：直接回一个标题字符串。
             // 标题里回带用户原话的前三个字，冒烟脚本据此分得出「标题是第几条消息生成的」，才验得了「只生成一次」。
+            // 它和正文走同一个 callModel，所以流式与非流式两种回法都要有。
             if (messageText(messages[0] || {}).includes("起一个标题")) {
-                return res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: `「冒烟-${lastUserText(messages).slice(0, 3)}」` } }] }));
+                const title = `「冒烟-${lastUserText(messages).slice(0, 3)}」`;
+                if (body.stream) {
+                    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+                    res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: title }, finish_reason: "stop" }] })}\n\n`);
+                    res.write("data: [DONE]\n\n");
+                    return res.end();
+                }
+                return res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: title } }] }));
             }
             lastChat = body;
+            // 模型一句话不说、一个工具不调时，Agent 必须报错而不是安静地收工——
+            // 静默收工的话，用户看到的就是「转了一会儿什么都没发生」，连该去查什么都不知道。
+            if (lastUserText(messages).includes("空响应冒烟")) {
+                if (body.stream) {
+                    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+                    res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "stop" }] })}\n\n`);
+                    res.write("data: [DONE]\n\n");
+                    return res.end();
+                }
+                return res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "" }, finish_reason: "stop" }] }));
+            }
             const done = messages[messages.length - 1].role === "tool" && !keepsGoing(messages);
             const call = toolCall(messages);
             const message = done
                 ? { role: "assistant", content: "已经按你的要求改好画布了。" }
                 : { role: "assistant", content: null, tool_calls: [{ id: "call_x", type: "function", function: { name: call.name, arguments: JSON.stringify(call.args) } }] };
+            // Agent 走的是流式：非流式响应在真实网关上会丢 tool_calls（实测某中转的 gpt-5.6 就是如此），
+            // 所以这里必须按 SSE 回，而且要把 arguments 拆成多块——一次性给全的话，
+            // 客户端那段「按 index 分槽、逐块拼参数」的聚合逻辑等于没被测到。
+            if (body.stream) {
+                res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+                const chunk = (delta) => res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
+                return setTimeout(() => {
+                    if (message.content) {
+                        // 内容也切两半，验证 content 增量同样是累加而不是覆盖。
+                        chunk({ role: "assistant", content: message.content.slice(0, 4) });
+                        chunk({ content: message.content.slice(4) });
+                    } else {
+                        const args = message.tool_calls[0].function.arguments;
+                        chunk({ role: "assistant", tool_calls: [{ index: 0, id: "call_x", type: "function", function: { name: call.name, arguments: "" } }] });
+                        for (let at = 0; at < args.length; at += 7) chunk({ tool_calls: [{ index: 0, function: { arguments: args.slice(at, at + 7) } }] });
+                    }
+                    res.write("data: [DONE]\n\n");
+                    res.end();
+                }, AGENT_DELAY_MS);
+            }
             return setTimeout(() => res.end(JSON.stringify({ choices: [{ message }] })), AGENT_DELAY_MS);
         }
 
@@ -922,6 +961,12 @@ check "工具调用被真正执行" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[
 check "工具结果落库" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[] | select(.role=="tool")][0].toolResult | fromjson | .ok')" "true"
 check "模型最终回复落库" "$(echo "$AGENT_MSGS" | jq -r '[.data.items[] | select(.role=="assistant")][-1].content')" "已经按你的要求改好画布了。"
 check "工具列表里没有 web_search" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="web_search")] | length')" "0"
+
+# 上面这一整轮的工具调用是按 SSE 分块拿回来的（假上游把 arguments 切成 7 字一段），
+# 能跑到这里就说明流式聚合把参数拼对了。Agent 必须走流式：实测某中转的 gpt-5.6 在非流式下
+# 回的是 content:"" 且没有 tool_calls，而 usage 里记着几十个输出 token——工具调用在转换时被丢了。
+check "Agent 用流式调模型" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_last" | jq -r '.stream // false')" "true"
+
 check "工具列表里没有 read_webpage" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_webpage")] | length')" "0"
 check "工具列表里没有 import_image" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="import_image")] | length')" "0"
 check "工具列表里有画布读写工具" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_canvas" or .=="create_node" or .=="connect_nodes")] | length')" "3"
@@ -932,6 +977,16 @@ check "工具真的改到了服务端画布" "$(echo "$AGENT_PROJECT" | jq -r '.
 check "画布 revision 递增可被前端拉到" "$([ "$(echo "$AGENT_PROJECT" | jq -r .data.revision)" -gt 1 ] && echo yes || echo no)" "yes"
 check "节点结构与前端约定一致" "$(echo "$AGENT_PROJECT" | jq -r '.data.data.nodes[0] | "\(.type)/\(.title)/\(.position.x)/\(.width)/\(.metadata.content)"')" "text/冒烟节点/80/340/由 agent 创建"
 check "一条消息只扣一次算力点" "$(curl -s "$BASE/admin/credit-logs" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '[.data.items[] | select(.remark=="调用模型 mock-text")] | length')" "1"
+
+# 模型一句话不说、一个工具不调时必须判定为失败。静默收工的话，用户看到的就是
+# 「转了一会儿什么都没发生」：没有结果、没有报错、也没有任何能拿去排查的线索。
+EMPTY_SESSION=$(new_agent_session '{"projectId":"agent-p1","title":"空响应会话"}')
+curl -s -X POST "$BASE/v1/agent/sessions/$EMPTY_SESSION/messages" -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d '{"clientMessageId":"agent-empty","content":"空响应冒烟"}' >/dev/null
+wait_agent_idle "$EMPTY_SESSION"
+check "模型什么都没返回时判定为失败" "$(agent_status "$EMPTY_SESSION")" "failed"
+check "失败原因说清楚是模型没返回内容" "$(agent_session "$EMPTY_SESSION" | jq -r '.data.error | test("什么都没有返回")')" "true"
+check "失败原因点名是哪个模型" "$(agent_session "$EMPTY_SESSION" | jq -r '.data.error | test("mock-text")')" "true"
+
 
 # 断线增量拉取：带上最后看到的 seq 只返回后续消息。
 LAST_SEQ=$(echo "$AGENT_MSGS" | jq -r '.data.items[-1].seq')

@@ -59,6 +59,31 @@ export async function upstreamStream(url: string, init: RequestInit, fallback: s
     return response.body;
 }
 
+/**
+ * 逐块读 SSE，把每个事件的 data 交给回调。生成任务与 Agent 共用一份：
+ * 两边都要按 \n\n 切事件、拼多行 data、并跳过 [DONE]，各写一份迟早有一边漏掉某个细节。
+ */
+export async function readUpstreamSse(body: ReadableStream<Uint8Array>, onData: (data: string) => void) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+        const { done, value } = await reader.read();
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        for (let match = /\r?\n\r?\n/.exec(buffer); match; match = /\r?\n\r?\n/.exec(buffer)) {
+            const block = buffer.slice(0, match.index);
+            buffer = buffer.slice(match.index + match[0].length);
+            const data = block
+                .split(/\r?\n/)
+                .filter((line) => line.startsWith("data:"))
+                .map((line) => line.slice(5).trim())
+                .join("");
+            if (data && data !== "[DONE]") onData(data);
+        }
+        if (done) return;
+    }
+}
+
 export async function upstreamBinary(url: string, init: RequestInit, fallback: string) {
     const response = await fetch(url, { ...init, signal: init.signal || AbortSignal.timeout(600000) }).catch((error: Error) => {
         throw fail(error.name === "TimeoutError" ? `${fallback}：上游接口超时` : `${fallback}：上游接口无响应或网络不可达`);

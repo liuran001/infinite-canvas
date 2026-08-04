@@ -1,6 +1,6 @@
 import type { StoredFile } from "../db/entities";
 import { fail } from "../lib/errors";
-import { upstreamBinary, upstreamJson, upstreamMessage, upstreamStream } from "../lib/upstream";
+import { readUpstreamSse, upstreamBinary, upstreamJson, upstreamMessage, upstreamStream } from "../lib/upstream";
 import { storedObjectOf } from "./files";
 import { getObject } from "./storage";
 import { buildChannelUrl, isArkPlanChannel, isSeedanceModel, type ModelChannel } from "./settings";
@@ -175,27 +175,6 @@ export async function generateImages(channel: ModelChannel, model: string, syste
 }
 
 /** 逐块读上游 SSE：按空行切块，把 data 行拼起来交给解析函数。上游一有内容就回调，不等整段读完。 */
-async function readUpstreamSse(body: ReadableStream<Uint8Array>, onData: (data: string) => void) {
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    for (;;) {
-        const { done, value } = await reader.read();
-        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
-        for (let match = /\r?\n\r?\n/.exec(buffer); match; match = /\r?\n\r?\n/.exec(buffer)) {
-            const block = buffer.slice(0, match.index);
-            buffer = buffer.slice(match.index + match[0].length);
-            const data = block
-                .split(/\r?\n/)
-                .filter((line) => line.startsWith("data:"))
-                .map((line) => line.slice(5).trim())
-                .join("");
-            if (data && data !== "[DONE]") onData(data);
-        }
-        if (done) return;
-    }
-}
-
 async function generateGeminiText(channel: ModelChannel, model: string, systemPrompt: string, prompt: string, references: StoredFile[], onDelta: (delta: string) => void, signal: AbortSignal) {
     const parts: GeminiPart[] = [{ text: prompt }];
     for (const file of references) parts.push({ inlineData: { mimeType: file.mimeType, data: (await readFileBuffer(file)).toString("base64") } });
