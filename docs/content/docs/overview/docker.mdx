@@ -53,6 +53,59 @@ docker compose -f docker-compose.local.yml up -d --build
 
 主应用镜像同时运行 nginx 与 Node 服务端。画布、我的素材、生成记录、上传文件与数据库都在 `/app/data`，已通过命名卷持久化；模型渠道与密钥只保存在服务端。
 
+## 实时协作与反向代理
+
+多端同步画布、团队状态、生成任务与 Agent 进度都走同一条 WebSocket（`/api/v1/realtime`）。镜像自带的 nginx 已经配好，直接用发布镜像不需要做任何事。
+
+这条连接建不起来时功能不会中断：四条频道会各自退回 SSE，SSE 也不行就退到轮询。代价是延迟变高、请求变多，而且**页面上看不出区别**——所以下面两种情况值得特意检查一遍。
+
+### 在镜像前面再套一层反向代理
+
+自己的 nginx 必须把 WebSocket 的升级头透传下去，否则请求到不了后端：
+
+```nginx
+# 放在 http 块里，不能写在 server 或 location 内
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ""      close;
+}
+
+location / {
+    proxy_pass http://127.0.0.1:8080;   # 换成你映射出来的端口
+    proxy_http_version 1.1;
+
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
+
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+}
+```
+
+`Connection` 一定要用 `map` 出来的变量。写成 `$http_connection` 是直接转发浏览器原本的值（通常是 `keep-alive`），握手不会发生；写成固定的 `upgrade` 则会给所有普通请求都带上升级头。
+
+用了 Cloudflare 一类的 CDN 时，确认它没有关闭 WebSocket、也没有对 `/api/*` 做缓存。
+
+### 前端与后端不同源
+
+如果你把前端单独部署在另一个域名下，必须把 `CORS_ORIGIN` 设成那个前端域名：
+
+```bash
+CORS_ORIGIN=https://canvas.example.com
+```
+
+`CORS_ORIGIN=*` 对普通接口有效，但**不会**放行 WebSocket——允许任意来源发起 WebSocket 等于把连接权交给任何一个页面。此时握手会返回 403，前端安静地退回 SSE，除了变慢没有别的迹象。同源部署（用发布镜像的默认形态）不受这条影响。
+
+### 怎么确认它真的生效了
+
+打开画布，在浏览器开发者工具的 Network → WS 里应该能看到一条 `/api/v1/realtime?ticket=...`，状态是 `101`。
+
+注意别拿 `/api/v1/projects/<id>/realtime` 来判断：那是 SSE 降级用的接口，它返回 `200` 和 `text/event-stream` 是正常的，永远不会变成 `101`。它出现就说明 WebSocket 没连上。
+
 ## 统计分析（可选）
 
 项目**默认不接入任何统计**：不设置下列环境变量时，页面不会加载任何统计脚本，也不会发送任何外部请求。你在自己的部署上想查看流量时，设置对应环境变量即可，无需修改代码或重新构建镜像——镜像启动时会据此生成运行期配置。
