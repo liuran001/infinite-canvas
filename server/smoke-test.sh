@@ -1533,9 +1533,11 @@ check "指定码的其余字段照常生效" "$(invite_row SMKEVP99 | jq -r '"\(
 # 撞码必须报错而不是覆盖：覆盖等于悄悄改掉一个已经发出去的码，持码人从此莫名其妙用不了。
 check "重复的指定码被拒" "$(new_invites '{"code":"SMKEVP99"}' | jq -r .code)" "INVITE_CODE_DUPLICATE"
 check "撞码后原码没被改" "$(invite_row SMKEVP99 | jq -r .credits)" "3"
-# 字母表去掉了 0/O/1/I/L：放行它们，用户照着纸条输错一个字符就只会看到「邀请码无效」。
-check "含形近字的指定码被拒" "$(new_invites '{"code":"SMKE0VP99"}' | jq -r .code)" "INVITE_CODE_INVALID"
-check "含分隔符的指定码被拒" "$(new_invites '{"code":"SMKE-VP99"}' | jq -r .code)" "INVITE_CODE_INVALID"
+# 形近字只对随机码有意义（那种码由机器挑、由人手抄）；管理员自己写的码是他自己定的，一律放行。
+check "含形近字的指定码放行" "$(new_invites '{"code":"SMKE0VP99"}' | jq -r '.data[0].code')" "SMKE0VP99"
+check "含分隔符的指定码放行" "$(new_invites '{"code":"SMKE-VP99"}' | jq -r '.data[0].code')" "SMKE-VP99"
+# 但会把注册链接从中间截断的字符仍然要挡住。
+check "含空格的指定码被拒" "$(new_invites '{"code":"SMKE VP99"}' | jq -r .code)" "INVITE_CODE_INVALID"
 check "过短的指定码被拒" "$(new_invites '{"code":"AB"}' | jq -r .code)" "INVITE_CODE_INVALID"
 # 「指定这串字符，来 5 个」自相矛盾，静默按 1 处理会让管理员以为发出去 5 个能用的码。
 check "指定码时 count 必须是 1" "$(new_invites '{"code":"SMKEBATCH","count":5}' | jq -r .code)" "INVITE_CODE_INVALID"
