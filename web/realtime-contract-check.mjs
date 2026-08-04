@@ -87,6 +87,8 @@ check("ready 之后通知恢复", /recoverEntry\(entry\)/.test(connection));
 check("降级按频道各算各的", /entry\.degraded/.test(connection) && /^let degraded/m.test(connection) === false);
 check("非终态订阅错误按频道退避重订", /scheduleEntryRetry\(pool, entry\)/.test(connection));
 check("realtimeAvailable 为假时仍然排重连", /realtimeAvailable\(pool\.scope\)\)\s*\{[\s\S]{0,400}?scheduleReconnect\(pool\)/.test(connection));
+// 同源部署的 base 地址本来就是空串，拿它当门禁会让这整类部署连票都不去取，永远停在 SSE 上。
+check("可用性不拿 base 地址当门禁", /export function realtimeAvailable[\s\S]{0,200}?\n\}/.exec(connection)?.[0].includes("serverBaseUrl") === false);
 // presence 上行被拒只说明这一次上报没被接受，按订阅失败处理会把整条画布频道打成未就绪。
 check("presence 错误与订阅错误分开", /scope === "presence"/.test(connection) && /scope: "presence"/.test(hub));
 check("presence 发送结果如实返回", /presence: \(payload: unknown\) => boolean/.test(connection));

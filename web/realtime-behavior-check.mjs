@@ -115,7 +115,7 @@ class FakeWebSocket {
 
 const stub = {
     "@/services/api/server": `
-        export function serverApiUrl(path) { return "http://server.test/api" + path; }
+        export function serverApiUrl(path) { return globalThis.__stub.baseUrl + "/api" + path; }
         export function serverBaseUrl() { return globalThis.__stub.baseUrl; }
     `,
     "@/stores/use-server-store": `
@@ -295,6 +295,23 @@ console.log("拿不到登录态时仍然继续重连");
     currentSocket().open();
     currentSocket().deliver({ v: 1, type: "ready", id: currentSocket().subscribes()[0].id, payload: {} });
     check("接回来之后通知恢复", calls.recover, 1);
+}
+
+console.log("同源部署（没配服务端地址）照样走 WebSocket");
+{
+    reset();
+    // 前后端同源部署时 baseUrl 恒为空串——HTTP 请求靠相对路径走同源，一切正常。
+    // 拿它当「有没有连服务端」的门禁，会把整类同源部署永远钉死在 SSE 降级上。
+    globalThis.__stub = { baseUrl: "", token: "t1" };
+    const { calls } = await connectOnce({ channel: "project:p1" });
+    check("同源部署真的建立了连接", FakeWebSocket.instances.length, 1);
+    check("同源部署不会直接降级", calls.degrade, 0);
+    check("取票走同源相对路径", tickets[0].url, "/api/v1/realtime/tickets");
+    const socket = currentSocket();
+    check("WebSocket 地址由当前站点推导", socket.url.startsWith("ws://app.test/api/v1/realtime?ticket="), true);
+    socket.open();
+    socket.deliver({ v: 1, type: "ready", id: socket.subscribes()[0].id, payload: { revision: 1 } });
+    check("同源部署照常 ready", calls.ready, 1);
 }
 
 console.log("断线重连用的是当下的游标");

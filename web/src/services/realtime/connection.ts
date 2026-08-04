@@ -27,7 +27,7 @@
  *      一次手抖的高频上报就能把整条画布频道打成未就绪，甚至按终态码直接终止掉。
  */
 
-import { serverApiUrl, serverBaseUrl } from "@/services/api/server";
+import { serverApiUrl } from "@/services/api/server";
 import { useServerStore } from "@/stores/use-server-store";
 
 import { clientFrame, isServerFrame, REALTIME_IDENTIFIER, type ServerFrame } from "./protocol";
@@ -180,9 +180,13 @@ function scopeToken(scope: RealtimeScope) {
     return scope.kind === "guest" ? scope.token() : useServerStore.getState().token;
 }
 
-/** 只有配了服务端地址、且这个身份此刻拿得到凭据的情况下才值得尝试 WebSocket。 */
+/**
+ * 拿得到凭据就值得尝试 WebSocket。
+ * 不能再拿 base 地址是否为空当门禁：前后端同源部署时它本来就是空串，HTTP 请求靠相对路径照常工作，
+ * 把这种部署判成「没连上服务端」会让它永远停在 SSE 降级上，连票都不会去取。凭据本身已经蕴含连上了。
+ */
 export function realtimeAvailable(scope: RealtimeScope = ACCOUNT) {
-    return typeof WebSocket !== "undefined" && Boolean(serverBaseUrl()) && Boolean(scopeToken(scope));
+    return typeof WebSocket !== "undefined" && Boolean(scopeToken(scope));
 }
 
 async function fetchTicket(scope: RealtimeScope): Promise<string> {
