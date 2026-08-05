@@ -9,10 +9,11 @@ import {
 } from "@simplewebauthn/server";
 import type { Request } from "express";
 
-import { repo } from "../db/data-source";
+import { repo, serialTransaction } from "../db/data-source";
 import { Passkey, User } from "../db/entities";
 import { fail, newAffCode, newId, now } from "../lib/errors";
-import { newSession, requestOrigin } from "./auth";
+import { finishAccountLogin, requestOrigin } from "./auth";
+import { requireActiveAccountForMembership } from "./account-deletion";
 
 const RP_NAME = "Infinite Canvas";
 /** challenge 只在一次握手内有效，放内存即可，不必落库。 */
@@ -81,15 +82,20 @@ export async function passkeyRegisterVerify(req: Request, userId: string, respon
     });
     if (!verification.verified) throw fail("Passkey 校验失败，请重试");
     const { credential } = verification.registrationInfo;
-    const saved = await repo(Passkey).save({
-        id: newId("passkey"),
-        credentialId: credential.id,
-        userId,
-        publicKey: Buffer.from(credential.publicKey).toString("base64"),
-        counter: credential.counter,
-        transports: credential.transports || [],
-        name: name.trim() || "我的 Passkey",
-        createdAt: now(),
+    const saved = await serialTransaction(async (manager) => {
+        await requireActiveAccountForMembership(manager, userId);
+        const item = manager.getRepository(Passkey).create({
+            id: newId("passkey"),
+            credentialId: credential.id,
+            userId,
+            publicKey: Buffer.from(credential.publicKey).toString("base64"),
+            counter: credential.counter,
+            transports: credential.transports || [],
+            name: name.trim() || "我的 Passkey",
+            createdAt: now(),
+        });
+        await manager.getRepository(Passkey).insert(item);
+        return item;
     });
     return publicPasskey(saved);
 }
@@ -141,12 +147,11 @@ export async function passkeyLoginVerify(req: Request, flowId: string, response:
     });
     if (!verification.verified) throw fail("Passkey 校验失败，请重试");
     // counter 单调递增，回写后重放旧签名会被认证器计数校验挡下。
-    credential.counter = verification.authenticationInfo.newCounter;
-    await passkeys.save(credential);
-    user.lastLoginAt = now();
-    user.updatedAt = now();
-    if (!user.affCode) user.affCode = newAffCode();
-    return newSession(await users.save(user));
+    const newCounter = verification.authenticationInfo.newCounter;
+    await passkeys.update({ id: credential.id, userId: credential.userId, counter: credential.counter }, { counter: newCounter });
+    const freshCredential = await passkeys.findOneBy({ id: credential.id, userId: credential.userId });
+    if (!freshCredential || freshCredential.counter !== newCounter) throw fail("Passkey 状态已变化，请重试");
+    return finishAccountLogin(user, { lastLoginAt: now(), affCode: user.affCode || newAffCode() });
 }
 
 export async function listPasskeys(userId: string) {
@@ -159,9 +164,13 @@ export async function renamePasskey(userId: string, id: string, name: string) {
     const item = await passkeys.findOneBy({ id, userId });
     if (!item) throw fail("Passkey 不存在");
     if (!name.trim()) throw fail("名称不能为空");
-    item.name = name.trim();
-    await passkeys.save(item);
-    return publicPasskey(item);
+    const next = name.trim();
+    await serialTransaction(async (manager) => {
+        await requireActiveAccountForMembership(manager, userId);
+        const changed = await manager.getRepository(Passkey).update({ id, userId }, { name: next });
+        if (!changed.affected) throw fail("Passkey 不存在");
+    });
+    return publicPasskey({ ...item, name: next });
 }
 
 /** 没有密码的账号删掉最后一个 Passkey 就再也登不进来，这里直接拦住。 */

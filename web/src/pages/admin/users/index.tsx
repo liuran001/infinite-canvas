@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { App, Button, Form, Input, InputNumber, Modal, Select, Table, Tag } from "antd";
 import dayjs from "dayjs";
-import { Coins, HardDrive, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Coins, HardDrive, Pencil, Plus, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { formatBytes } from "@/lib/image-utils";
@@ -34,6 +34,9 @@ export default function AdminUsersPage() {
     const [credits, setCredits] = useState(0);
     const [quotaTarget, setQuotaTarget] = useState<AdminUser | null>(null);
     const [quotaMb, setQuotaMb] = useState(0);
+    const [reactivateTarget, setReactivateTarget] = useState<AdminUser | null>(null);
+    const [reactivateUsername, setReactivateUsername] = useState("");
+    const [reactivatePassword, setReactivatePassword] = useState("");
     const { data, isFetching, refetch } = useQuery({ queryKey: ["admin-users", query], queryFn: () => adminApi.users(query) });
 
     useEffect(() => {
@@ -80,15 +83,29 @@ export default function AdminUsersPage() {
 
     const confirmDelete = (user: AdminUser) =>
         modal.confirm({
-            title: `删除用户「${user.username}」？`,
-            content: "该用户及其登录状态会被移除，操作不可恢复。",
-            okText: "删除",
+            title: `注销用户「${user.username}」？`,
+            content: "账号行会保留为已注销墓碑，但认证绑定、云空间与业务数据会被清理。用户仍在团队中时服务端会拒绝操作。",
+            okText: "确认注销",
             okButtonProps: { danger: true },
             cancelText: "取消",
             onOk: async () => {
                 if (await runAction(() => adminApi.deleteUser(user.id), "已删除")) await refetch();
             },
         });
+
+    const openReactivate = (user: AdminUser) => {
+        setReactivateTarget(user);
+        setReactivateUsername(user.deletedUsername || "");
+        setReactivatePassword("");
+    };
+
+    const submitReactivate = async () => {
+        if (!reactivateTarget) return;
+        if (await runAction(() => adminApi.reactivateUser(reactivateTarget.id, reactivateUsername, reactivatePassword), "账号已重新启用")) {
+            setReactivateTarget(null);
+            await refetch();
+        }
+    };
 
     return (
         <div>
@@ -136,7 +153,7 @@ export default function AdminUsersPage() {
                         dataIndex: "username",
                         render: (username: string, item) => (
                             <div className="min-w-0">
-                                <div className="truncate font-medium">{username}</div>
+                                <div className="truncate font-medium">{item.status === "deleted" ? item.deletedUsername || "已注销账号" : username}</div>
                                 <div className="mt-0.5 truncate text-xs text-stone-500">{item.displayName || item.email || item.id}</div>
                             </div>
                         ),
@@ -151,9 +168,9 @@ export default function AdminUsersPage() {
                         title: "状态",
                         dataIndex: "status",
                         width: 88,
-                        render: (status: string) => (
-                            <Tag className="m-0" color={status === "ban" ? "error" : "success"}>
-                                {status === "ban" ? "禁用" : "正常"}
+                        render: (status: AdminUser["status"]) => (
+                            <Tag className="m-0" color={status === "ban" ? "error" : status === "deleting" ? "warning" : status === "deleted" ? "default" : "success"}>
+                                {status === "ban" ? "禁用" : status === "deleting" ? "注销中" : status === "deleted" ? "已注销" : "正常"}
                             </Tag>
                         ),
                     },
@@ -195,10 +212,16 @@ export default function AdminUsersPage() {
                         align: "right",
                         render: (_, item) => (
                             <div className="flex justify-end gap-1">
-                                <Button size="small" type="text" title="调整算力点" icon={<Coins className="size-3.5" />} onClick={() => openCredits(item)} />
-                                <Button size="small" type="text" title="调整云空间配额" icon={<HardDrive className="size-3.5" />} onClick={() => openQuota(item)} />
-                                <Button size="small" type="text" title="编辑" icon={<Pencil className="size-3.5" />} onClick={() => setEditing(item)} />
-                                <Button size="small" type="text" danger title="删除" icon={<Trash2 className="size-3.5" />} onClick={() => confirmDelete(item)} />
+                                {item.status === "deleted" ? (
+                                    <Button size="small" type="text" title="重新启用" icon={<RotateCcw className="size-3.5" />} onClick={() => openReactivate(item)} />
+                                ) : (
+                                    <>
+                                        <Button size="small" type="text" title="调整算力点" icon={<Coins className="size-3.5" />} onClick={() => openCredits(item)} />
+                                        <Button size="small" type="text" title="调整云空间配额" icon={<HardDrive className="size-3.5" />} onClick={() => openQuota(item)} />
+                                        <Button size="small" type="text" title="编辑" icon={<Pencil className="size-3.5" />} onClick={() => setEditing(item)} />
+                                        <Button size="small" type="text" danger title="注销" icon={<Trash2 className="size-3.5" />} onClick={() => confirmDelete(item)} />
+                                    </>
+                                )}
                             </div>
                         ),
                     },
@@ -240,6 +263,22 @@ export default function AdminUsersPage() {
                     单位 MB，用户上传的图片与生成结果都计入用量。当前已用 {formatBytes(quotaTarget?.storageUsed || 0) || "0 B"}。
                 </div>
                 <InputNumber className="mt-3 w-full" min={0} precision={0} addonAfter="MB" value={quotaMb} onChange={(value) => setQuotaMb(value || 0)} />
+            </Modal>
+
+            <Modal
+                open={Boolean(reactivateTarget)}
+                title={`重新启用 · ${reactivateTarget?.deletedUsername || reactivateTarget?.id || ""}`}
+                okText="重新启用"
+                cancelText="取消"
+                okButtonProps={{ disabled: !reactivateUsername.trim() || reactivatePassword.length < 6 }}
+                onOk={() => void submitReactivate()}
+                onCancel={() => setReactivateTarget(null)}
+            >
+                <div className="mt-3 text-sm text-stone-500">旧密码、Passkey 与第三方绑定不会恢复，请设置新的用户名和初始密码。若原用户名已被别人注册，必须换一个用户名。</div>
+                <div className="mt-4 text-sm font-medium">用户名</div>
+                <Input className="mt-1" value={reactivateUsername} onChange={(event) => setReactivateUsername(event.target.value)} placeholder="新的登录用户名" />
+                <div className="mt-4 text-sm font-medium">初始密码</div>
+                <Input.Password className="mt-1" value={reactivatePassword} onChange={(event) => setReactivatePassword(event.target.value)} placeholder="至少 6 位" autoComplete="new-password" />
             </Modal>
         </div>
     );

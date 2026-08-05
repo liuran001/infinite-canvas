@@ -5,7 +5,7 @@ import { useServerStore, type ServerSettings, type ServerUser } from "@/stores/u
 export type ServerJobKind = "image" | "video" | "audio" | "text";
 export type ServerJobStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
 
-export type ServerFile = { id: string; kind: string; mimeType: string; bytes: number; width: number; height: number; durationMs: number };
+export type ServerFile = { id: string; kind: string; mimeType: string; bytes: number; width: number; height: number; durationMs: number; /** 生成历史仍在但媒体已清除。 */ cleared?: boolean };
 
 /** 云空间用量：used 由服务端按文件对象实时聚合，quota 是该账号的上限。 */
 export type ServerStorage = { used: number; quota: number };
@@ -78,6 +78,7 @@ export type ServerProjectEvent =
 export type ServerUserAsset = { id: string; kind: string; title: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerUserPlugin = { id: string; data: unknown; revision: number; deleted: boolean; createdAt: string; updatedAt: string };
 export type ServerPasskey = { id: string; name: string; createdAt: string };
+export type AccountDeletionPending = { requestedAt: string; deletesAt: string; resumeToken: string };
 
 type ApiEnvelope<T> = { code: string | number; data: T; msg: string };
 
@@ -111,10 +112,16 @@ function authHeaders(extra?: HeadersInit): HeadersInit {
     return { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extra };
 }
 
+export function expireAccountSession() {
+    const ownerId = useServerStore.getState().user?.id || "";
+    useServerStore.getState().clearSession();
+    if (ownerId) void import("@/services/account-local-data").then(({ clearCurrentAccountLocalData }) => clearCurrentAccountLocalData(ownerId));
+}
+
 async function readEnvelope<T>(response: Response, fallback: string): Promise<T> {
     // 401 只可能是登录态失效，直接清理本地会话让界面回到登录入口。
     if (response.status === 401) {
-        useServerStore.getState().clearSession();
+        expireAccountSession();
         useServerStore.getState().setLoginOpen(true);
         throw new Error("登录状态已失效，请重新登录");
     }
@@ -148,15 +155,21 @@ export const serverApi = {
     health: () => serverRequest<string>("/health", {}, "连接服务端失败"),
     settings: () => serverRequest<ServerSettings>("/settings", {}, "读取服务端配置失败"),
     me: () => serverRequest<ServerUser>("/auth/me", {}, "读取用户信息失败"),
-    login: (username: string, password: string) => serverRequest<{ token: string; user: ServerUser }>("/auth/login", { method: "POST", ...jsonBody({ username, password }) }, "登录失败"),
+    login: (username: string, password: string, captchaToken = "") => serverRequest<{ token: string; user: ServerUser }>("/auth/login", { method: "POST", ...jsonBody({ username, password, captchaToken }) }, "登录失败"),
     /** inviteCode 只在服务端开启「注册需要邀请码」时才有值，关闭时传空串，服务端照旧忽略。 */
-    register: (username: string, password: string, inviteCode = "") => serverRequest<{ token: string; user: ServerUser }>("/auth/register", { method: "POST", ...jsonBody({ username, password, inviteCode }) }, "注册失败"),
-    linuxDoAuthorizeUrl: (redirect: string) => `${serverApiUrl("/auth/linux-do/authorize")}?redirect=${encodeURIComponent(redirect)}`,
+    register: (username: string, password: string, inviteCode = "", captchaToken = "") => serverRequest<{ token: string; user: ServerUser }>("/auth/register", { method: "POST", ...jsonBody({ username, password, inviteCode, captchaToken }) }, "注册失败"),
+    linuxDoAuthorizeUrl: (redirect: string, captchaToken = "") => {
+        const params = new URLSearchParams({ redirect });
+        if (captchaToken) params.set("captchaToken", captchaToken);
+        return `${serverApiUrl("/auth/linux-do/authorize")}?${params}`;
+    },
     /**
      * 第三方登录的建号补全：新用户且服务端要求邀请码时，回调只带回 pendingToken 表示「身份已验证但还没建号」，
      * 必须再拿邀请码换一次才会有登录令牌。pendingToken 有有效期，过期后这里会返回中文原因。
      */
-    completeLinuxDo: (pendingToken: string, inviteCode: string) => serverRequest<{ token: string; user: ServerUser }>("/auth/linux-do/complete", { method: "POST", ...jsonBody({ pendingToken, inviteCode }) }, "完成注册失败"),
+    completeLinuxDo: (pendingToken: string, inviteCode: string, captchaToken = "") => serverRequest<{ token: string; user: ServerUser }>("/auth/linux-do/complete", { method: "POST", ...jsonBody({ pendingToken, inviteCode, captchaToken }) }, "完成注册失败"),
+    requestAccountDeletion: () => serverRequest<{ requestedAt: string; deletesAt: string }>("/auth/account-deletion/request", { method: "POST" }, "申请注销失败"),
+    cancelAccountDeletion: (resumeToken: string) => serverRequest<{ token: string; user: ServerUser }>("/auth/account-deletion/cancel", { method: "POST", ...jsonBody({ resumeToken }) }, "取消注销失败"),
     changePassword: (oldPassword: string, newPassword: string) => serverRequest<boolean>("/auth/password", { method: "POST", ...jsonBody({ oldPassword, newPassword }) }, "修改密码失败"),
     /**
      * 只改昵称，用户名不动：用户名是登录凭据、也是各处「@某人」的锚点，能自助改掉的话历史记录里的指向会全部对不上。
@@ -173,8 +186,8 @@ export const serverApi = {
     passkeyRegisterOptions: () => serverRequest<PublicKeyCredentialCreationOptionsJSON>("/auth/passkey/register/options", { method: "POST" }, "添加 Passkey 失败"),
     passkeyRegisterVerify: (response: RegistrationResponseJSON, name: string) =>
         serverRequest<ServerPasskey>("/auth/passkey/register/verify", { method: "POST", ...jsonBody({ response, name }) }, "添加 Passkey 失败"),
-    passkeyLoginOptions: (username = "") =>
-        serverRequest<{ flowId: string; options: PublicKeyCredentialRequestOptionsJSON }>("/auth/passkey/login/options", { method: "POST", ...jsonBody({ username }) }, "Passkey 登录失败"),
+    passkeyLoginOptions: (username = "", captchaToken = "") =>
+        serverRequest<{ flowId: string; options: PublicKeyCredentialRequestOptionsJSON }>("/auth/passkey/login/options", { method: "POST", ...jsonBody({ username, captchaToken }) }, "Passkey 登录失败"),
     passkeyLoginVerify: (flowId: string, response: AuthenticationResponseJSON) =>
         serverRequest<{ token: string; user: ServerUser }>("/auth/passkey/login/verify", { method: "POST", ...jsonBody({ flowId, response }) }, "Passkey 登录失败"),
     renamePasskey: (id: string, name: string) => serverRequest<ServerPasskey>(`/auth/passkeys/${id}`, { method: "PUT", ...jsonBody({ name }) }, "重命名 Passkey 失败"),
@@ -194,12 +207,14 @@ export const serverApi = {
 
     createJob: (input: ServerJobInput) => serverRequest<ServerJob>("/v1/jobs", { method: "POST", ...jsonBody(input) }, "提交生成任务失败"),
     job: (id: string) => serverRequest<ServerJob>(`/v1/jobs/${id}`, {}, "查询生成任务失败"),
-    jobs: (statuses: ServerJobStatus[] = [], since = "") => {
+    jobs: (statuses: ServerJobStatus[] = [], options: { before?: string; limit?: number } = {}) => {
         const params = new URLSearchParams();
         if (statuses.length) params.set("status", statuses.join(","));
-        if (since) params.set("since", since);
-        return serverRequest<{ items: ServerJob[] }>(`/v1/jobs${params.toString() ? `?${params}` : ""}`, {}, "查询生成任务失败");
+        if (options.before) params.set("before", options.before);
+        if (options.limit) params.set("limit", String(options.limit));
+        return serverRequest<{ items: ServerJob[]; nextBefore: string }>(`/v1/jobs${params.toString() ? `?${params}` : ""}`, {}, "查询生成任务失败");
     },
+    deleteJobHistory: (id: string) => serverRequest<boolean>(`/v1/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }, "删除生成记录失败"),
     cancelJob: (id: string) => serverRequest<ServerJob>(`/v1/jobs/${id}/cancel`, { method: "POST" }, "取消生成任务失败"),
 
     projects: (since = "") => serverRequest<{ items: ServerProject[] }>(`/v1/projects${since ? `?since=${encodeURIComponent(since)}` : ""}`, {}, "读取云端画布失败"),
@@ -232,13 +247,28 @@ export const serverApi = {
     resolveAgentSession: (id: string, approved: boolean) => serverRequest<ServerAgentSession>(`/v1/agent/sessions/${id}/resolve`, { method: "POST", ...jsonBody({ approved }) }, "回应 Agent 请求失败"),
 };
 
+/** 历史默认不限条数，按服务端稳定游标逐页拉完；重复游标直接报错，避免异常响应造成死循环。 */
+export async function listAllServerJobs(statuses: ServerJobStatus[]) {
+    const items: ServerJob[] = [];
+    const seen = new Set<string>();
+    let before = "";
+    for (;;) {
+        const page = await serverApi.jobs(statuses, { before, limit: 200 });
+        items.push(...page.items);
+        if (!page.nextBefore) return items;
+        if (seen.has(page.nextBefore)) throw new Error("生成历史分页游标重复");
+        seen.add(page.nextBefore);
+        before = page.nextBefore;
+    }
+}
+
 export async function serverProjectStream(projectId: string, clientId: string, sinceRevision: number, onEvent: (event: ServerProjectEvent) => void, signal: AbortSignal) {
     const params = new URLSearchParams({ clientId, sinceRevision: String(sinceRevision) });
     const response = await fetch(serverApiUrl(`/v1/projects/${encodeURIComponent(projectId)}/realtime?${params}`), { headers: authHeaders({ Accept: "text/event-stream" }), signal }).catch(() => {
         throw new Error("画布实时连接失败：无法连接服务端，请检查网络");
     });
     if (response.status === 401) {
-        useServerStore.getState().clearSession();
+        expireAccountSession();
         useServerStore.getState().setLoginOpen(true);
         throw new Error("登录状态已失效，请重新登录");
     }
@@ -255,7 +285,7 @@ export async function serverAgentStream(sessionId: string, sinceSeq: number, onE
         throw new Error("Agent 事件流连接失败：无法连接服务端，请检查网络");
     });
     if (response.status === 401) {
-        useServerStore.getState().clearSession();
+        expireAccountSession();
         useServerStore.getState().setLoginOpen(true);
         throw new Error("登录状态已失效，请重新登录");
     }
@@ -297,7 +327,7 @@ export async function serverJobStream(sinceSeq: number, onEvent: (event: ServerJ
         throw new Error("生成任务事件流连接失败：无法连接服务端，请检查网络");
     });
     if (response.status === 401) {
-        useServerStore.getState().clearSession();
+        expireAccountSession();
         useServerStore.getState().setLoginOpen(true);
         throw new Error("登录状态已失效，请重新登录");
     }
@@ -316,7 +346,7 @@ export async function serverAiStream(path: string, body: unknown, signal?: Abort
         throw new Error("请求失败：无法连接服务端，请检查服务器地址与网络");
     });
     if (response.status === 401) {
-        useServerStore.getState().clearSession();
+        expireAccountSession();
         useServerStore.getState().setLoginOpen(true);
         throw new Error("登录状态已失效，请重新登录");
     }

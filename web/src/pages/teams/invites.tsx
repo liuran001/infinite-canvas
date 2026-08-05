@@ -141,7 +141,7 @@ export default function TeamInvitesPage() {
                             </div>
                         ),
                     },
-                    { title: "创建时间", dataIndex: "createdAt", width: 160, render: (value: string) => <span className="text-xs text-stone-500">{value || "-"}</span> },
+                    { title: "创建时间", dataIndex: "createdAt", width: 180, render: (value: string) => <span className="text-xs text-stone-500">{value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "-"}</span> },
                     {
                         title: "操作",
                         width: 90,

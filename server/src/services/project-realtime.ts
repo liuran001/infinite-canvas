@@ -38,7 +38,7 @@ type PresenceEntry = ProjectPresence & { source: string };
 export const PRESENCE_SOURCE_HTTP = "http";
 const presence = new Map<string, Map<string, PresenceEntry>>();
 /** 每条长连接登记自己是从哪条分享进来的，撤销时才找得到该关谁。owner 直连的 shareId 为空。 */
-type ProjectConnection = { key: string; shareId: string; clientId: string; close: () => void };
+type ProjectConnection = { key: string; shareId: string; clientId: string; principalId: string; close: () => void };
 const connections = new Set<ProjectConnection>();
 const channel = (ownerId: string, projectId: string) => `${ownerId}:${projectId}`;
 
@@ -62,15 +62,33 @@ function publishPresence(ownerId: string, projectId: string) {
     publish(ownerId, projectId, { type: "presence.sync", projectId, members: members(ownerId, projectId) });
 }
 
-export function subscribeProject(ownerId: string, projectId: string, listener: (event: ProjectRealtimeEvent) => void, options: { shareId?: string; clientId?: string; close?: () => void } = {}) {
+export function subscribeProject(ownerId: string, projectId: string, listener: (event: ProjectRealtimeEvent) => void, options: { shareId?: string; clientId?: string; principalId?: string; close?: () => void } = {}) {
     const key = channel(ownerId, projectId);
     bus.on(key, listener);
-    const connection: ProjectConnection | null = options.close ? { key, shareId: options.shareId || "", clientId: options.clientId || "", close: options.close } : null;
+    const connection: ProjectConnection | null = options.close ? { key, shareId: options.shareId || "", clientId: options.clientId || "", principalId: options.principalId || "", close: options.close } : null;
     if (connection) connections.add(connection);
     return () => {
         bus.off(key, listener);
         if (connection) connections.delete(connection);
     };
+}
+
+/** 账号注销或被强制下线时，立即关闭它在所有画布上的 SSE 协作连接。 */
+export function disconnectProjectActor(principalId: string) {
+    let closed = 0;
+    for (const connection of [...connections]) {
+        if (connection.principalId !== principalId) continue;
+        connections.delete(connection);
+        closed += 1;
+        const split = connection.key.indexOf(":");
+        if (connection.clientId) removeProjectPresence(connection.key.slice(0, split), connection.key.slice(split + 1), connection.clientId);
+        try {
+            connection.close();
+        } catch (error) {
+            console.warn("关闭账号画布连接失败：", error);
+        }
+    }
+    return closed;
 }
 
 /**

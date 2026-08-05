@@ -89,11 +89,12 @@ function authoritativeHistoryTurnKeys(threadId: string, settledTurnIds: string[]
     return new Set(settledTurnIds.map((turnId) => `${threadId}\0${turnId}`));
 }
 
-export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = false }: { embedded?: boolean; headless?: boolean; autoConnect?: boolean; forceLocal?: boolean }) {
+export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = false, shareRestricted = false }: { embedded?: boolean; headless?: boolean; autoConnect?: boolean; forceLocal?: boolean; shareRestricted?: boolean }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { message, modal } = App.useApp();
     const [searchParams] = useSearchParams();
     const navigate = useNavigate();
+    const restricted = forceLocal || shareRestricted;
     // 逐字段 selector + useShallow：只有这些字段变化时才重渲染。
     // 注意：canvasContext 不在此订阅内 —— 它在拖拽/resize 时会被 project 每帧写入，
     // 但面板只在 ref 同步与防抖 postState 中用到它、渲染层从不读它。若把它放进订阅，
@@ -139,7 +140,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
     const pendingToolRef = useRef<AgentPendingToolCall | null>(null);
     const autoConnectRef = useRef(false);
     /** 分享页不能继承其它页面的 enabled；只有本次挂载内手动点击后才允许建立连接。 */
-    const manualConnectionRef = useRef(!forceLocal);
+    const manualConnectionRef = useRef(!restricted);
     const connectedRef = useRef(false);
     const errorLoggedRef = useRef(false);
     const attachmentUrlsRef = useRef(new Set<string>());
@@ -152,7 +153,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
     const threadOperationRef = useRef(0);
     const threadOperationSequenceRef = useRef(0);
     const endpoint = useMemo(() => url.trim().replace(/\/$/, ""), [url]);
-    const urlAgentAutoConnect = !forceLocal && searchParams.has("agentUrl") && searchParams.has("agentToken");
+    const urlAgentAutoConnect = !restricted && searchParams.has("agentUrl") && searchParams.has("agentToken");
     useEffect(() => {
         let disposed = false;
         void acquireAgentClientId().then((clientId) => {
@@ -286,7 +287,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
     useEffect(() => () => attachmentUrlsRef.current.forEach((url) => URL.revokeObjectURL(url)), []);
 
     useEffect(() => {
-        if (!forceLocal) {
+        if (!restricted) {
             manualConnectionRef.current = true;
             return;
         }
@@ -299,10 +300,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
             const state = useAgentStore.getState();
             if (state.enabled || state.connected) setAgentState({ enabled: false, connected: false, silentConnect: false, activity: "离线" });
         };
-    }, [forceLocal, setAgentState]);
+    }, [restricted, setAgentState]);
 
     useEffect(() => {
-        if (!clientReady || !enabled || !token.trim() || (forceLocal && !manualConnectionRef.current)) return;
+        if (!clientReady || !enabled || !token.trim() || (restricted && !manualConnectionRef.current)) return;
         localStorage.setItem("canvas-agent-url", endpoint);
         localStorage.setItem("canvas-agent-token", token);
         const clientId = clientIdRef.current;
@@ -553,7 +554,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
             connectedRef.current = false;
             loadThreadsSequenceRef.current += 1;
         };
-    }, [applyWorkspaceChange, clientReady, enabled, endpoint, forceLocal, loadThreads, message, setAgentState, token]);
+    }, [applyWorkspaceChange, clientReady, enabled, endpoint, loadThreads, message, restricted, setAgentState, token]);
 
     useEffect(() => {
         if (connected) void loadThreads();
@@ -735,7 +736,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
     };
 
     const runToolCall = async (endpoint: string, token: string, payload: AgentPendingToolCall) => {
-        if (forceLocal && (isSiteTool(payload.name) || payload.name === "site_navigate")) {
+        if (restricted && (isSiteTool(payload.name) || payload.name === "site_navigate")) {
             const error = "分享画布仅允许 Agent 操作当前画布，不能使用账号级工具或跳转页面";
             await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, error });
             addEventLog(`${toolName(payload.name)}已拒绝`, { error }, payload);
@@ -842,12 +843,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
 
     const toggleAgentConnection = async ({ silent = false }: { silent?: boolean } = {}) => {
         if (enabled) {
-            if (forceLocal) manualConnectionRef.current = false;
+            if (restricted) manualConnectionRef.current = false;
             clearAgentSession({ enabled: false, connected: false, activity: "离线", connectError: "" });
             return;
         }
-        const urlToken = forceLocal ? "" : searchParams.get("agentToken") || "";
-        const urlEndpoint = forceLocal ? "" : searchParams.get("agentUrl") || "";
+        const urlToken = restricted ? "" : searchParams.get("agentToken") || "";
+        const urlEndpoint = restricted ? "" : searchParams.get("agentUrl") || "";
         const discovered = urlToken ? null : await discoverAgentConfig(endpoint || DEFAULT_AGENT_URL);
         const nextEndpoint = (urlEndpoint || discovered?.url || endpoint || DEFAULT_AGENT_URL).trim().replace(/\/$/, "");
         const nextToken = (urlToken || token.trim() || discovered?.token || "").trim();
@@ -879,7 +880,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
             return;
         }
         errorLoggedRef.current = false;
-        if (forceLocal) manualConnectionRef.current = true;
+        if (restricted) manualConnectionRef.current = true;
         setAgentState({ url: nextEndpoint, token: nextToken, enabled: true, connected: false, silentConnect: silent, activity: "连接中", connectError: "", activeTab: "setup" });
     };
 
@@ -888,10 +889,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
     }, [confirmTools, setAgentState, urlAgentAutoConnect]);
 
     useEffect(() => {
-        if (forceLocal || (!autoConnect && !urlAgentAutoConnect) || autoConnectRef.current || enabled || connected) return;
+        if (restricted || (!autoConnect && !urlAgentAutoConnect) || autoConnectRef.current || enabled || connected) return;
         autoConnectRef.current = true;
         void toggleAgentConnection({ silent: true });
-    }, [autoConnect, connected, enabled, forceLocal, urlAgentAutoConnect]);
+    }, [autoConnect, connected, enabled, restricted, urlAgentAutoConnect]);
 
     function clearAgentSession(patch: Parameters<typeof setAgentState>[0] = {}) {
         loadThreadsSequenceRef.current += 1;

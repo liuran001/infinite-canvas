@@ -125,7 +125,7 @@ export default function TeamDetailPage() {
                     { key: "description", label: "团队简介", children: team.description || "-" },
                     { key: "memberLimit", label: "成员上限", children: team.memberLimit ? `${team.memberLimit} 人` : "不限" },
                     { key: "status", label: "状态", children: team.status === "active" ? "正常" : "已被平台停用" },
-                    { key: "createdAt", label: "创建时间", children: team.createdAt || "-" },
+                    { key: "createdAt", label: "创建时间", children: team.createdAt ? new Date(team.createdAt).toLocaleString("zh-CN", { hour12: false }) : "-" },
                 ]}
             />
 

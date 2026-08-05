@@ -2,7 +2,7 @@ import { serverRequest } from "@/services/api/server";
 import type { ServerApiFormat, ServerCapability, ServerRole, ServerSettings, ServerUser } from "@/stores/use-server-store";
 import type { CanvasNodeData } from "@/types/canvas";
 
-export type AdminUserStatus = "active" | "ban";
+export type AdminUserStatus = "active" | "ban" | "deleting" | "deleted";
 
 export type AdminUser = {
     id: string;
@@ -18,6 +18,9 @@ export type AdminUser = {
     affCount: number;
     linuxDoId: string;
     status: AdminUserStatus;
+    deleteRequestedAt: string;
+    deletedAt: string;
+    deletedUsername: string;
     lastLoginAt: string;
     createdAt: string;
     updatedAt: string;
@@ -74,9 +77,10 @@ export type AdminSettings = {
     private: {
         channels: AdminChannel[];
         promptSync: { enabled: boolean; cron: string };
-        auth: { linuxDo: { clientId: string; clientSecret: string } };
+        auth: { linuxDo: { clientId: string; clientSecret: string }; turnstile: { secretKey: string } };
         /** 联网搜索配置，services 里的 apiKey 与渠道密钥一样：读取时被服务端抹空，回传空串表示保持不变。 */
         search: { enabled: boolean; maxResults: number; services: AdminSearchService[] };
+        generationHistory: { totalLimit: number; imageRetentionDays: number; imageRetentionCount: number; imageRetentionStrategy: "min" | "max" };
     };
 };
 
@@ -154,7 +158,7 @@ export type AdminReviewQuery = AdminQuery & { userId?: string; status?: string; 
 
 export type AdminOwner = { userId: string; username: string; displayName: string };
 
-export type AdminFile = { id: string; kind: string; mimeType: string; bytes: number; width: number; height: number; durationMs: number; createdAt: string };
+export type AdminFile = { id: string; kind: string; mimeType: string; bytes: number; width: number; height: number; durationMs: number; createdAt?: string; cleared?: boolean };
 
 export type AdminJob = AdminOwner & {
     id: string;
@@ -220,6 +224,7 @@ export const adminApi = {
     setUserCredits: (id: string, credits: number) => serverRequest<AdminUser>(`/admin/users/${id}/credits`, post({ credits }), "调整算力点失败"),
     setUserQuota: (id: string, quota: number) => serverRequest<AdminUser>(`/admin/users/${id}/quota`, post({ quota }), "调整云空间配额失败"),
     deleteUser: (id: string) => serverRequest<boolean>(`/admin/users/${id}`, remove, "删除用户失败"),
+    reactivateUser: (id: string, username: string, password: string) => serverRequest<AdminUser>(`/admin/users/${id}/reactivate`, post({ username, password }), "重新启用用户失败"),
 
     creditLogs: (query: AdminQuery) => serverRequest<{ items: AdminCreditLog[]; total: number }>(`/admin/credit-logs${search(query)}`, {}, "读取算力点流水失败"),
     saveCreditLog: (log: Partial<AdminCreditLog>) => serverRequest<AdminCreditLog>("/admin/credit-logs", post(log), "保存算力点流水失败"),

@@ -16,9 +16,11 @@ import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { generateImages, isGenerationReady, resumeImages, storeGeneratedImage, type GeneratedImage as GeneratedImageResult } from "@/services/api/generation";
-import { deleteStoredImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { listAllServerJobs, serverApi, serverFileUrl, type ServerJob } from "@/services/api/server";
+import { isStoredMediaCleared, resolveImageUrl, serverFileIdOf, serverStorageKey, uploadImage } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useJobStore } from "@/stores/use-job-store";
+import { useServerStore } from "@/stores/use-server-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import type { ReferenceImage } from "@/types/image";
 
@@ -26,6 +28,7 @@ type GeneratedImage = {
     id: string;
     dataUrl: string;
     storageKey?: string;
+    cleared?: boolean;
     durationMs: number;
     width: number;
     height: number;
@@ -44,6 +47,11 @@ type GenerationResult = {
 
 type GenerationLog = {
     id: string;
+    /** 服务端任务 ID 是历史记录的稳定主键；localLogId 只用于清理本机参数补充。 */
+    serverJobId?: string;
+    localLogId?: string;
+    ownerId?: string;
+    clientJobIds?: string[];
     createdAt: number;
     title: string;
     prompt: string;
@@ -79,6 +87,7 @@ export default function ImagePage() {
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
+    const userId = useServerStore((state) => state.user?.id || "");
     const [prompt, setPrompt] = useState("");
     const [references, setReferences] = useState<ReferenceImage[]>([]);
     const [results, setResults] = useState<GenerationResult[]>([]);
@@ -114,8 +123,11 @@ export default function ImagePage() {
     }, [running, startedAt]);
 
     useEffect(() => {
-        void refreshLogs().then(restorePendingGeneration);
-    }, []);
+        setLogs([]);
+        setSelectedLogIds([]);
+        setPreviewLog(null);
+        if (userId) void refreshLogs().then(restorePendingGeneration);
+    }, [userId]);
 
     /** 刷新或断线重连后，把服务端仍在跑的生图任务接回结果区继续轮询，不重新发起生成。 */
     const restorePendingGeneration = async () => {
@@ -131,12 +143,12 @@ export default function ImagePage() {
         message.info(`正在恢复 ${pending.length} 个未完成的生成任务`);
         await finishBatch(
             pending.map((job, index) => runGenerationSlot(index, () => resumeImages(job))),
-            { prompt: restoredPrompt, config: effectiveConfig, references: [], count: pending.length, startedAt: restoredAt },
+            { prompt: restoredPrompt, config: effectiveConfig, references: [], count: pending.length, startedAt: restoredAt, clientJobIds: pending.map((job) => job.clientJobId) },
         );
     };
 
     /** 汇总一批生成结果：写生成日志并提示，成功与恢复两条路径共用。 */
-    const finishBatch = async (tasks: Promise<GeneratedImage>[], batch: { prompt: string; config: AiConfig; references: ReferenceImage[]; count: number; startedAt: number }, agentTaskId?: string) => {
+    const finishBatch = async (tasks: Promise<GeneratedImage>[], batch: { prompt: string; config: AiConfig; references: ReferenceImage[]; count: number; startedAt: number; clientJobIds: string[] }, agentTaskId?: string) => {
         const result = await Promise.allSettled(tasks);
         const successImages = result.filter((item): item is PromiseFulfilledResult<GeneratedImage> => item.status === "fulfilled").map((item) => item.value);
         const successCount = successImages.length;
@@ -156,6 +168,7 @@ export default function ImagePage() {
                     failCount,
                     status: successCount ? "成功" : "失败",
                     images: successImages,
+                    clientJobIds: batch.clientJobIds,
                 }),
             );
             successCount ? message.success("图片已生成") : message.error(error || "生成失败");
@@ -239,7 +252,7 @@ export default function ImagePage() {
 
         await finishBatch(
             slots.map((slot, index) => runGenerationSlot(index, () => generateImages(snapshot.config, snapshot.text, snapshot.references, { clientJobId: slot.clientJobId, context: { source: "image", prompt: snapshot.text } }))),
-            { prompt: text, config: snapshot.config, references: snapshot.references, count: generationCount, startedAt: batchStartedAt },
+            { prompt: text, config: snapshot.config, references: snapshot.references, count: generationCount, startedAt: batchStartedAt, clientJobIds: slots.map((slot) => slot.clientJobId) },
             agentTaskId,
         );
     };
@@ -267,6 +280,7 @@ export default function ImagePage() {
     }, [autoRunToken]);
 
     const downloadImage = (image: GeneratedImage, index: number) => {
+        if (image.cleared) return message.warning("图片已清除，无法下载");
         saveAs(image.dataUrl, `image-${index + 1}.png`);
     };
 
@@ -275,12 +289,14 @@ export default function ImagePage() {
         image.storageKey ? { url: image.dataUrl, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType || "image/png" } : uploadImage(image.dataUrl);
 
     const addResultToReferences = async (image: GeneratedImage, index: number) => {
+        if (image.cleared) return message.warning("图片已清除，无法加入参考图");
         const stored = await storedResultImage(image);
         setReferences((value) => [...value, { id: nanoid(), name: `result-${index + 1}.png`, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
         message.success("已加入参考图");
     };
 
     const saveResultToAssets = async (image: GeneratedImage, index: number) => {
+        if (image.cleared) return message.warning("图片已清除，无法加入资产");
         const stored = await storedResultImage(image);
         addAsset({
             kind: "image",
@@ -316,22 +332,44 @@ export default function ImagePage() {
         setPreviewLog(null);
     };
 
-    const deleteSelectedLogs = () => {
-        const imageKeys = logs.filter((log) => selectedLogIds.includes(log.id)).flatMap((log) => log.images.map((image) => image.storageKey).filter((key): key is string => Boolean(key)));
-        void Promise.all([deleteStoredImages(imageKeys), ...selectedLogIds.map((id) => logStore.removeItem(id))]).then(refreshLogs);
-        if (previewLog && selectedLogIds.includes(previewLog.id)) {
-            setPreviewLog(null);
-            setResults([]);
+    const deleteSelectedLogs = async () => {
+        const selected = logs.filter((log) => selectedLogIds.includes(log.id));
+        const selectedIds = new Set(selected.map((log) => log.id));
+        const localIds = [...new Set(selected.map((log) => log.localLogId).filter((id): id is string => Boolean(id)))].filter(
+            (localId) => !logs.some((log) => !selectedIds.has(log.id) && log.localLogId === localId),
+        );
+        try {
+            await Promise.all(selected.map((log) => serverApi.deleteJobHistory(log.serverJobId || log.id)));
+            await Promise.all(localIds.map((id) => logStore.removeItem(id)));
+            await refreshLogs();
+            if (previewLog && selectedLogIds.includes(previewLog.id)) {
+                setPreviewLog(null);
+                setResults([]);
+            }
+            setSelectedLogIds([]);
+            setDeleteConfirmOpen(false);
+        } catch (error) {
+            await refreshLogs();
+            message.error(error instanceof Error ? error.message : "删除生成记录失败");
         }
-        setSelectedLogIds([]);
-        setDeleteConfirmOpen(false);
     };
 
     const saveLog = (log: GenerationLog) => {
-        void logStore.setItem(log.id, serializeLog(log)).then(refreshLogs);
+        const next = { ...log, ownerId: useServerStore.getState().user?.id || "" };
+        void logStore.setItem(next.id, serializeLog(next)).then(refreshLogs);
     };
 
-    const refreshLogs = async () => setLogs(await readStoredLogs());
+    const refreshLogs = async () => {
+        const expectedUserId = useServerStore.getState().user?.id || "";
+        if (!expectedUserId) return [];
+        try {
+            const nextLogs = await readServerImageLogs(expectedUserId);
+            if (useServerStore.getState().user?.id === expectedUserId) setLogs(nextLogs);
+            return useServerStore.getState().user?.id === expectedUserId ? nextLogs : [];
+        } catch {
+            return [];
+        }
+    };
 
     const previewGenerationLog = async (log: GenerationLog) => {
         setPreviewLog(log);
@@ -395,6 +433,7 @@ export default function ImagePage() {
                     failCount: 0,
                     status: "成功",
                     images: [image],
+                    clientJobIds: [clientJobId],
                 }),
             );
             message.success("重试成功");
@@ -633,7 +672,11 @@ function ResultImageCard({
 }) {
     return (
         <div className="overflow-hidden rounded-lg border border-stone-200 bg-background dark:border-stone-800">
-            <Image src={image.dataUrl} alt={`生成结果 ${index + 1}`} className="aspect-square object-cover" />
+            {image.cleared ? (
+                <div className="flex aspect-square items-center justify-center bg-stone-100 text-sm text-stone-500 dark:bg-stone-900 dark:text-stone-400">图片已清除</div>
+            ) : (
+                <Image src={image.dataUrl} alt={`生成结果 ${index + 1}`} className="aspect-square object-cover" />
+            )}
             <div className="space-y-2 border-t border-stone-200 px-3 py-2.5 dark:border-stone-800">
                 <div className="flex min-w-0 gap-x-2 gap-y-1 text-xs text-stone-500 dark:text-stone-400">
                     <span>
@@ -644,17 +687,17 @@ function ResultImageCard({
                 </div>
                 <div className="grid min-w-0 grid-cols-3 gap-2">
                     <Tooltip title="添加到资产">
-                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => void onSaveAsset(image, index)}>
+                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<FolderPlus className="size-3.5" />} disabled={image.cleared} onClick={() => void onSaveAsset(image, index)}>
                             添加到资产
                         </Button>
                     </Tooltip>
                     <Tooltip title="加入参考图">
-                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<PenLine className="size-3.5" />} onClick={() => void onEdit(image, index)}>
+                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<PenLine className="size-3.5" />} disabled={image.cleared} onClick={() => void onEdit(image, index)}>
                             加入参考图
                         </Button>
                     </Tooltip>
                     <Tooltip title="下载">
-                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<Download className="size-3.5" />} onClick={() => onDownload(image, index)}>
+                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<Download className="size-3.5" />} disabled={image.cleared} onClick={() => onDownload(image, index)}>
                             下载
                         </Button>
                     </Tooltip>
@@ -762,6 +805,7 @@ function LogPanel({
 
 function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: GenerationLog; selected: boolean; active: boolean; onSelectedChange: (checked: boolean) => void; onClick: () => void }) {
     const thumbnails = (log.thumbnails || []).filter(Boolean).slice(0, 4);
+    const clearedCount = log.images.filter((image) => image.cleared).length;
 
     return (
         <button
@@ -781,6 +825,7 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                                 ))}
                             </div>
                         ) : null}
+                        {clearedCount ? <div className="mt-2 text-xs text-stone-500 dark:text-stone-400">图片已清除{clearedCount > 1 ? ` ${clearedCount} 张` : ""}</div> : null}
                     </div>
                 </div>
                 <div className="grid justify-items-end gap-2">
@@ -809,12 +854,88 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
     );
 }
 
-async function readStoredLogs() {
+async function readServerImageLogs(ownerId: string) {
+    const [localLogs, jobs] = await Promise.all([readStoredLogs(ownerId), listAllServerJobs(["succeeded", "failed", "canceled"])]);
+    return mergeServerImageLogs(
+        jobs.filter((job) => job.kind === "image"),
+        localLogs,
+        ownerId,
+    );
+}
+
+export function mergeServerImageLogs(jobs: ServerJob[], localLogs: GenerationLog[], ownerId: string) {
+    const uniqueJobs = new Map(jobs.map((job) => [job.id, job]));
+    const byJobId = new Map<string, GenerationLog>();
+    const byClientJobId = new Map<string, GenerationLog>();
+    const byOutputId = new Map<string, GenerationLog>();
+    for (const log of localLogs) {
+        if (log.ownerId !== ownerId) continue;
+        if (log.serverJobId) byJobId.set(log.serverJobId, log);
+        for (const id of log.clientJobIds || []) byClientJobId.set(id, log);
+        for (const image of log.images) {
+            const fileId = serverFileIdOf(image.storageKey) || image.id;
+            if (fileId) byOutputId.set(fileId, log);
+        }
+    }
+    return [...uniqueJobs.values()]
+        .map((job) => {
+            const local = byJobId.get(job.id) || byClientJobId.get(job.clientJobId) || job.outputs.map((file) => byOutputId.get(file.id)).find(Boolean);
+            const createdAt = validTimestamp(job.createdAt, local?.createdAt || 0);
+            const durationMs = jobDuration(job, local?.durationMs || 0);
+            const prompt = jobPrompt(job) || local?.prompt || "";
+            const images = job.outputs.map((file) => ({
+                id: file.id,
+                dataUrl: file.cleared ? "" : serverFileUrl(file.id),
+                storageKey: serverStorageKey(file.id),
+                cleared: Boolean(file.cleared),
+                durationMs,
+                width: file.width,
+                height: file.height,
+                bytes: file.bytes,
+                mimeType: file.mimeType,
+            }));
+            const size = local?.size || (images[0]?.width && images[0]?.height ? `${images[0].width}x${images[0].height}` : "");
+            const quality = local?.quality || "";
+            const config: GenerationLogConfig = {
+                model: job.model,
+                imageModel: job.model,
+                quality,
+                size,
+                count: String(Math.max(1, images.length)),
+            };
+            return {
+                id: job.id,
+                serverJobId: job.id,
+                localLogId: local?.localLogId || local?.id,
+                ownerId,
+                clientJobIds: [job.clientJobId],
+                createdAt,
+                title: prompt.slice(0, 12) || local?.title || job.model || "未命名",
+                prompt,
+                time: formatLogTime(createdAt),
+                model: job.model,
+                config,
+                references: local?.references || [],
+                durationMs,
+                successCount: job.status === "succeeded" ? images.length : 0,
+                failCount: job.status === "succeeded" ? 0 : 1,
+                imageCount: images.length,
+                size,
+                quality,
+                status: job.status === "succeeded" ? "成功" : "失败",
+                images,
+                thumbnails: images.map((image) => image.dataUrl).filter(Boolean),
+            } satisfies GenerationLog;
+        })
+        .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+async function readStoredLogs(ownerId: string) {
     if (typeof window === "undefined") return [];
     try {
         const values: GenerationLog[] = [];
         await logStore.iterate<GenerationLog, void>((value) => {
-            values.push(value);
+            if (value.ownerId === ownerId) values.push(value);
         });
         const logs = await Promise.all(values.map(normalizeLog));
         return logs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
@@ -831,14 +952,18 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
         })),
     );
     const images = await Promise.all(
-        (log.images || []).map(async (item) => ({
-            ...item,
-            dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl),
-        })),
+        (log.images || []).map(async (item) => {
+            const cleared = Boolean(item.cleared) || (await isStoredMediaCleared(item.storageKey));
+            return { ...item, cleared, dataUrl: cleared ? "" : await resolveImageUrl(item.storageKey, item.dataUrl) };
+        }),
     );
     const config = normalizeLogConfig(log);
     return {
         id: log.id || nanoid(),
+        serverJobId: log.serverJobId,
+        localLogId: log.localLogId || log.id,
+        ownerId: log.ownerId,
+        clientJobIds: log.clientJobIds || [],
         createdAt: log.createdAt || Date.now(),
         title: log.title || log.model || "未命名",
         prompt: log.prompt || log.title || "",
@@ -865,6 +990,25 @@ function serializeLog(log: GenerationLog): GenerationLog {
         images: log.images.map((image) => ({ ...image, dataUrl: image.storageKey ? "" : image.dataUrl })),
         thumbnails: [],
     };
+}
+
+function validTimestamp(value: string, fallback: number) {
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? timestamp : fallback;
+}
+
+function jobDuration(job: ServerJob, fallback: number) {
+    const startedAt = Date.parse(job.createdAt);
+    const endedAt = Date.parse(job.finishedAt || job.updatedAt);
+    return Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt >= startedAt ? endedAt - startedAt : fallback;
+}
+
+function jobPrompt(job: ServerJob) {
+    return typeof job.context?.prompt === "string" ? job.context.prompt : "";
+}
+
+function formatLogTime(createdAt: number) {
+    return createdAt ? new Date(createdAt).toLocaleString("zh-CN", { hour12: false }) : "";
 }
 
 function normalizeLogConfig(log: Partial<GenerationLog>): GenerationLogConfig {
@@ -905,6 +1049,7 @@ function buildLog({
     failCount,
     status,
     images,
+    clientJobIds = [],
 }: {
     prompt: string;
     model: string;
@@ -915,6 +1060,7 @@ function buildLog({
     failCount: number;
     status: GenerationLog["status"];
     images: GeneratedImage[];
+    clientJobIds?: string[];
 }): GenerationLog {
     const logConfig = {
         model: config.model,
@@ -925,6 +1071,8 @@ function buildLog({
     };
     return {
         id: nanoid(),
+        ownerId: useServerStore.getState().user?.id || "",
+        clientJobIds,
         createdAt: Date.now(),
         title: prompt.slice(0, 12) || "未命名",
         prompt,

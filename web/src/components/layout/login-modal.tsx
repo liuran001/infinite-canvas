@@ -4,7 +4,8 @@ import { Fingerprint, KeyRound, Loader2, Ticket, User } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { serverApi } from "@/services/api/server";
+import { Turnstile } from "@/components/auth/turnstile";
+import { serverApi, ServerApiError, type AccountDeletionPending } from "@/services/api/server";
 import { useServerStore } from "@/stores/use-server-store";
 
 type Mode = "login" | "register";
@@ -16,11 +17,13 @@ type LoginForm = { username: string; password: string; inviteCode?: string };
  * 做成弹窗而不是独立页面，用户关掉后仍能浏览已有界面。
  */
 export function LoginModal() {
-    const { message } = App.useApp();
+    const { message, modal } = App.useApp();
     const [form] = Form.useForm<LoginForm>();
     const [mode, setMode] = useState<Mode>("login");
     const [submitting, setSubmitting] = useState(false);
     const [passkeyLoading, setPasskeyLoading] = useState(false);
+    const [captchaToken, setCaptchaToken] = useState("");
+    const [captchaNonce, setCaptchaNonce] = useState(0);
     const open = useServerStore((state) => state.loginOpen);
     const settings = useServerStore((state) => state.settings);
     const setLoginOpen = useServerStore((state) => state.setLoginOpen);
@@ -30,11 +33,18 @@ export function LoginModal() {
     const isRegister = mode === "register";
     // 只有服务端确实要求邀请码时才多显示一个框，不然所有人都得对着一个用不上的输入框发呆。
     const needInvite = isRegister && Boolean(settings?.auth.requireInvite);
+    const turnstile = settings?.auth.turnstile;
+    const captchaEnabled = Boolean(turnstile?.siteKey && (isRegister ? turnstile.registerEnabled : turnstile.loginEnabled));
 
     // 服务端关闭注册后，若正停留在注册态要退回登录，避免提交必然失败的表单。
     useEffect(() => {
         if (!canRegister && isRegister) setMode("login");
     }, [canRegister, isRegister]);
+
+    useEffect(() => {
+        setCaptchaToken("");
+        setCaptchaNonce((value) => value + 1);
+    }, [isRegister, open]);
 
     const finish = (token: string, user: Parameters<typeof setSession>[1], text: string) => {
         setSession(token, user);
@@ -42,14 +52,38 @@ export function LoginModal() {
         message.success(text);
     };
 
+    const resetCaptcha = () => {
+        setCaptchaToken("");
+        setCaptchaNonce((value) => value + 1);
+    };
+
+    const handleDeletionPending = (error: unknown) => {
+        if (!(error instanceof ServerApiError) || error.code !== "ACCOUNT_DELETION_PENDING" || !error.data) return false;
+        const pending = error.data as AccountDeletionPending;
+        modal.confirm({
+            title: "账号正在自助注销",
+            content: `预计于 ${new Date(pending.deletesAt).toLocaleString()} 完成。确认登录将立即取消注销。`,
+            okText: "确认登录并取消注销",
+            cancelText: "暂不登录",
+            onOk: async () => {
+                const session = await serverApi.cancelAccountDeletion(pending.resumeToken);
+                finish(session.token, session.user, "已取消注销并登录");
+            },
+        });
+        return true;
+    };
+
     const submit = async (values: LoginForm) => {
         setSubmitting(true);
         try {
-            const session = isRegister ? await serverApi.register(values.username, values.password, values.inviteCode) : await serverApi.login(values.username, values.password);
+            const session = isRegister
+                ? await serverApi.register(values.username, values.password, values.inviteCode, captchaToken)
+                : await serverApi.login(values.username, values.password, captchaToken);
             finish(session.token, session.user, isRegister ? "注册成功" : "登录成功");
         } catch (error) {
             // 邀请码不对、已用完、已停用这些原因都由服务端给中文文案，原样透出来才有指导意义。
-            message.error(error instanceof Error ? error.message : "操作失败");
+            if (!handleDeletionPending(error)) message.error(error instanceof Error ? error.message : "操作失败");
+            resetCaptcha();
         } finally {
             setSubmitting(false);
         }
@@ -59,28 +93,30 @@ export function LoginModal() {
     const loginWithPasskey = async () => {
         setPasskeyLoading(true);
         try {
-            const { flowId, options } = await serverApi.passkeyLoginOptions();
+            const { flowId, options } = await serverApi.passkeyLoginOptions("", captchaToken);
             const session = await serverApi.passkeyLoginVerify(flowId, await startAuthentication({ optionsJSON: options }));
             finish(session.token, session.user, "登录成功");
         } catch (error) {
             // 用户主动取消系统弹窗也会抛错，这种情况不提示。
             const text = error instanceof Error ? error.message : "Passkey 登录失败";
-            if (!/NotAllowed|abort|cancel/i.test(text)) message.error(text);
+            if (!handleDeletionPending(error) && !/NotAllowed|abort|cancel/i.test(text)) message.error(text);
+            resetCaptcha();
         } finally {
             setPasskeyLoading(false);
         }
     };
 
     const thirdParty = [
-        browserSupportsWebAuthn() && { key: "passkey", icon: <Fingerprint className="size-4" />, label: "Passkey", loading: passkeyLoading, onClick: () => void loginWithPasskey() },
+        browserSupportsWebAuthn() && { key: "passkey", icon: <Fingerprint className="size-4" />, label: "Passkey", loading: passkeyLoading, disabled: captchaEnabled && !captchaToken, onClick: () => void loginWithPasskey() },
         settings?.auth.linuxDo.enabled && {
             key: "linux-do",
             icon: <img src="/icons/linuxdo.svg" alt="" className="size-4" onError={(event) => (event.currentTarget.style.display = "none")} />,
             label: "Linux.do",
             loading: false,
-            onClick: () => (window.location.href = serverApi.linuxDoAuthorizeUrl(`${window.location.pathname}${window.location.search}`)),
+            disabled: captchaEnabled && !captchaToken,
+            onClick: () => (window.location.href = serverApi.linuxDoAuthorizeUrl(`${window.location.pathname}${window.location.search}`, captchaToken)),
         },
-    ].filter(Boolean) as Array<{ key: string; icon: React.ReactNode; label: string; loading: boolean; onClick: () => void }>;
+    ].filter(Boolean) as Array<{ key: string; icon: React.ReactNode; label: string; loading: boolean; disabled: boolean; onClick: () => void }>;
 
     return (
         <Modal open={open} onCancel={() => setLoginOpen(false)} footer={null} width={400} centered destroyOnHidden styles={{ body: { padding: "8px 4px 4px" } }}>
@@ -104,17 +140,18 @@ export function LoginModal() {
                         <Input size="large" placeholder="邀请码" prefix={<Ticket className="size-4 text-stone-400" />} />
                     </Form.Item>
                 ) : null}
-                <Button type="primary" size="large" htmlType="submit" block loading={submitting}>
+                {captchaEnabled ? <Turnstile key={`${isRegister ? "register" : "login"}-${captchaNonce}`} siteKey={turnstile?.siteKey || ""} action={isRegister ? "register" : "login"} onToken={setCaptchaToken} onError={(text) => message.error(text)} /> : null}
+                <Button type="primary" size="large" htmlType="submit" block loading={submitting} disabled={captchaEnabled && !captchaToken}>
                     {isRegister ? "注册并登录" : "登录"}
                 </Button>
             </Form>
 
-            {thirdParty.length ? (
+            {!isRegister && thirdParty.length ? (
                 <>
                     <Divider className="!my-5 !text-xs !text-stone-400">或</Divider>
                     <div className="flex gap-2">
                         {thirdParty.map((item) => (
-                            <Button key={item.key} size="large" block loading={item.loading} onClick={item.onClick} className="!flex !items-center !justify-center !gap-2">
+                            <Button key={item.key} size="large" block loading={item.loading} disabled={item.disabled} onClick={item.onClick} className="!flex !items-center !justify-center !gap-2">
                                 {item.loading ? null : item.icon}
                                 {item.label}
                             </Button>
@@ -142,7 +179,7 @@ export function LoginModal() {
  * 得先补一个邀请码换回真正的登录令牌。
  */
 export function OauthCallbackHandler() {
-    const { message } = App.useApp();
+    const { message, modal } = App.useApp();
     const navigate = useNavigate();
     const setSession = useServerStore((state) => state.setSession);
     // loading 正在处理回调，invite 等用户补邀请码，done 已经处理完交给页面跳转。
@@ -150,6 +187,10 @@ export function OauthCallbackHandler() {
     const [inviteCode, setInviteCode] = useState("");
     const [inviteError, setInviteError] = useState("");
     const [submitting, setSubmitting] = useState(false);
+    const [captchaToken, setCaptchaToken] = useState("");
+    const [captchaNonce, setCaptchaNonce] = useState(0);
+    const turnstile = useServerStore((state) => state.settings?.auth.turnstile);
+    const captchaEnabled = Boolean(turnstile?.siteKey && turnstile.oauthCompleteEnabled);
     // 回调参数只在首次渲染时读一次：处理过程本身会改写地址，
     // 再去读实时地址会拿到已经被清空的参数，把结果误判成「没有令牌」。
     const [params] = useState(() => new URLSearchParams(window.location.search));
@@ -163,6 +204,9 @@ export function OauthCallbackHandler() {
         const token = params.get("token");
         const error = params.get("error");
         const bound = params.get("bound");
+        const deletionPending = params.get("deletionPending") === "1";
+        const resumeToken = params.get("resumeToken") || "";
+        const deletesAt = params.get("deletesAt") || "";
 
         if (bound) {
             message.success("已绑定 Linux.do");
@@ -177,6 +221,23 @@ export function OauthCallbackHandler() {
             useServerStore.getState().setLoginOpen(true);
             navigate(redirect, { replace: true });
             setPhase("done");
+            return;
+        }
+        if (deletionPending && resumeToken) {
+            setPhase("done");
+            modal.confirm({
+                title: "账号正在自助注销",
+                content: `预计于 ${deletesAt ? new Date(deletesAt).toLocaleString() : "稍后"} 完成。确认登录将立即取消注销。`,
+                okText: "确认登录并取消注销",
+                cancelText: "暂不登录",
+                onOk: async () => {
+                    const session = await serverApi.cancelAccountDeletion(resumeToken);
+                    setSession(session.token, session.user);
+                    message.success("已取消注销并登录");
+                    window.location.replace(redirect);
+                },
+                onCancel: () => window.location.replace(redirect),
+            });
             return;
         }
         // 只有 pendingToken 说明账号还没建出来。这条路径一个字节的登录态都不能写：
@@ -202,7 +263,7 @@ export function OauthCallbackHandler() {
                 message.error(failure.message);
                 window.location.replace("/");
             });
-    }, [navigate, params, pendingToken, redirect]);
+    }, [message, modal, navigate, params, pendingToken, redirect, setSession]);
 
     const completeInvite = async () => {
         const code = inviteCode.trim();
@@ -210,10 +271,14 @@ export function OauthCallbackHandler() {
             setInviteError("请输入邀请码");
             return;
         }
+        if (captchaEnabled && !captchaToken) {
+            setInviteError("请先完成人机验证");
+            return;
+        }
         setSubmitting(true);
         setInviteError("");
         try {
-            const session = await serverApi.completeLinuxDo(pendingToken, code);
+            const session = await serverApi.completeLinuxDo(pendingToken, code, captchaToken);
             setSession(session.token, session.user);
             message.success("注册成功");
             window.location.replace(redirect);
@@ -221,6 +286,8 @@ export function OauthCallbackHandler() {
             // pendingToken 过期、邀请码不对或已用完，服务端都会给中文原因，原样展示，
             // 过期这种重填也没用的情况下面还留着「重新登录」重走一遍授权。
             setInviteError(failure instanceof Error ? failure.message : "完成注册失败");
+            setCaptchaToken("");
+            setCaptchaNonce((value) => value + 1);
             setSubmitting(false);
         }
     };
@@ -244,11 +311,19 @@ export function OauthCallbackHandler() {
                         onChange={(event) => setInviteCode(event.target.value)}
                         onPressEnter={() => void completeInvite()}
                     />
-                    <Button type="primary" size="large" block className="!mt-3" loading={submitting} onClick={() => void completeInvite()}>
+                    {captchaEnabled ? <div className="mt-3"><Turnstile key={`oauth-${captchaNonce}`} siteKey={turnstile?.siteKey || ""} action="oauth_complete" onToken={setCaptchaToken} onError={setInviteError} /></div> : null}
+                    <Button type="primary" size="large" block className="!mt-3" loading={submitting} disabled={captchaEnabled && !captchaToken} onClick={() => void completeInvite()}>
                         完成注册
                     </Button>
                     <div className="mt-4 flex justify-center gap-5 text-xs text-stone-500">
-                        <button type="button" className="cursor-pointer transition hover:text-stone-950 dark:hover:text-stone-100" onClick={() => (window.location.href = serverApi.linuxDoAuthorizeUrl(redirect))}>
+                        <button
+                            type="button"
+                            className="cursor-pointer transition hover:text-stone-950 dark:hover:text-stone-100"
+                            onClick={() => {
+                                useServerStore.getState().setLoginOpen(true);
+                                navigate(redirect, { replace: true });
+                            }}
+                        >
                             重新登录
                         </button>
                         <button type="button" className="cursor-pointer transition hover:text-stone-950 dark:hover:text-stone-100" onClick={() => window.location.replace(redirect)}>

@@ -174,6 +174,32 @@ class Connection {
             }
         }
     }
+
+    belongsTo(userId: string) {
+        return !this.identity.guest && this.identity.userId === userId;
+    }
+
+    revoke() {
+        this.close();
+        try {
+            this.socket.close(4001, "ACCOUNT_SESSION_REVOKED");
+        } catch {
+            this.socket.terminate();
+        }
+    }
+}
+
+const activeConnections = new Set<Connection>();
+
+export function disconnectRealtimeUser(userId: string) {
+    let closed = 0;
+    for (const connection of [...activeConnections]) {
+        if (!connection.belongsTo(userId)) continue;
+        activeConnections.delete(connection);
+        closed += 1;
+        connection.revoke();
+    }
+    return closed;
 }
 
 /** 把实时协作的 WebSocket 端点挂到 HTTP server 上，走 noServer 模式自行处理 upgrade。 */
@@ -182,10 +208,17 @@ export function attachRealtime(server: Server, options: { heartbeatMs?: number }
 
     wss.on("connection", (socket: WebSocket, _req: IncomingMessage, identity: RealtimeIdentity) => {
         const connection = new Connection(socket, identity);
+        activeConnections.add(connection);
         socket.on("message", (data) => connection.handle(data as Buffer));
-        socket.on("close", () => connection.close());
+        socket.on("close", () => {
+            activeConnections.delete(connection);
+            connection.close();
+        });
         // 协议层错误（超大帧、非法 opcode）由 ws 自己关闭连接，但清理仍要走同一条路径。
-        socket.on("error", () => connection.close());
+        socket.on("error", () => {
+            activeConnections.delete(connection);
+            connection.close();
+        });
     });
 
     // 心跳周期可注入，验证脚本才能在秒级内跑完「不回 pong 就被 terminate」这条用例。

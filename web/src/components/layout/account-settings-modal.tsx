@@ -1,6 +1,7 @@
 import { App, Button, Form, Input, Modal, Progress } from "antd";
 import { useEffect, useState } from "react";
 
+import { clearCurrentAccountLocalData } from "@/services/account-local-data";
 import { formatBytes } from "@/lib/image-utils";
 import { serverApi, type ServerStorage } from "@/services/api/server";
 import { PasskeyManager } from "@/components/layout/passkey-manager";
@@ -20,6 +21,9 @@ export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose
     const [saving, setSaving] = useState(false);
     const [savingProfile, setSavingProfile] = useState(false);
     const [linking, setLinking] = useState(false);
+    const [deleteOpen, setDeleteOpen] = useState(false);
+    const [deleteName, setDeleteName] = useState("");
+    const [deleting, setDeleting] = useState(false);
     const user = useServerStore((state) => state.user);
     const linuxDoEnabled = useServerStore((state) => state.settings?.auth.linuxDo.enabled);
     const linuxDoBound = useServerStore((state) => state.user?.linuxDoBound);
@@ -86,6 +90,23 @@ export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose
             message.error(error instanceof Error ? error.message : "解绑 Linux.do 失败");
         } finally {
             setLinking(false);
+        }
+    };
+
+    const requestDeletion = async () => {
+        if (!user || deleteName.trim() !== user.username) return;
+        setDeleting(true);
+        try {
+            const result = await serverApi.requestAccountDeletion();
+            await clearCurrentAccountLocalData();
+            useServerStore.getState().clearSession();
+            setDeleteOpen(false);
+            onClose();
+            message.success(`注销申请已提交，将于 ${new Date(result.deletesAt).toLocaleString()} 完成`);
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "申请注销失败");
+        } finally {
+            setDeleting(false);
         }
     };
 
@@ -167,6 +188,36 @@ export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose
                     </div>
                 </>
             ) : null}
+
+            {user ? (
+                <div className="mt-7 border-t border-red-200 pt-5 dark:border-red-950">
+                    <div className="text-sm font-semibold text-red-600 dark:text-red-400">注销账号</div>
+                    <div className="mt-1 text-xs leading-5 text-stone-500">
+                        申请后所有设备会立即退出，24 小时内重新登录可取消注销。必须先退出或解散全部团队；到期后云端画布、素材、文件、插件、任务、分享、Passkey 与第三方绑定都会清除。
+                    </div>
+                    <Button danger className="mt-3" onClick={() => { setDeleteName(""); setDeleteOpen(true); }}>
+                        申请注销账号
+                    </Button>
+                </div>
+            ) : null}
+
+            <Modal
+                title="再次确认注销账号"
+                open={deleteOpen}
+                okText="确认提交注销申请"
+                cancelText="取消"
+                okButtonProps={{ danger: true, disabled: deleteName.trim() !== user?.username, loading: deleting }}
+                onOk={() => void requestDeletion()}
+                onCancel={() => !deleting && setDeleteOpen(false)}
+                closable={!deleting}
+                maskClosable={!deleting}
+            >
+                <div className="mt-2 text-sm leading-6 text-stone-600 dark:text-stone-300">
+                    此操作会进入 24 小时冷静期。若不再登录，账号最终只保留后台审计墓碑，原用户名会释放给其他人注册。
+                </div>
+                <div className="mt-4 text-sm">请输入用户名「{user?.username}」确认：</div>
+                <Input className="mt-2" value={deleteName} onChange={(event) => setDeleteName(event.target.value)} placeholder="输入当前用户名" disabled={deleting} />
+            </Modal>
         </Modal>
     );
 }

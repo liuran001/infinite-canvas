@@ -73,7 +73,7 @@ export default function TeamLogsPage() {
                     },
                 }}
                 columns={[
-                    { title: "时间", dataIndex: "createdAt", width: 170, render: (value: string) => <span className="text-xs text-stone-500">{value || "-"}</span> },
+                    { title: "时间", dataIndex: "createdAt", width: 180, render: (value: string) => <span className="text-xs text-stone-500">{value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "-"}</span> },
                     { title: "类型", dataIndex: "type", width: 110, render: (value: TeamCreditLogType) => <Tag className="m-0">{typeLabels[value] || value}</Tag> },
                     { title: "成员", dataIndex: "userId", width: 160, render: (value: string) => <span className="truncate text-xs text-stone-500">{value || "-"}</span> },
                     { title: "模型", dataIndex: "model", render: (value: string) => <span className="text-xs text-stone-500">{value || "-"}</span> },

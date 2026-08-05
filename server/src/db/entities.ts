@@ -1,4 +1,4 @@
-import { Column, Entity, Index, PrimaryColumn } from "typeorm";
+import { Column, Entity, Index, JoinColumn, ManyToOne, PrimaryColumn } from "typeorm";
 
 import { config } from "../config";
 
@@ -8,7 +8,7 @@ const id = { type: "varchar", length: 64 } as const;
 const short = { type: "varchar", length: 255, default: "" } as const;
 
 export type UserRole = "guest" | "user" | "admin";
-export type UserStatus = "active" | "ban";
+export type UserStatus = "active" | "ban" | "deleting" | "finalizing" | "deleted";
 export type CreditLogType = "admin_adjust" | "ai_consume" | "ai_refund" | "invite_gift";
 export type JobKind = "image" | "video" | "audio" | "text";
 export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
@@ -62,6 +62,16 @@ export class User {
     @Column(short) inviterId!: string;
     @Index() @Column(short) linuxDoId!: string;
     @Column({ type: "varchar", length: 32, default: "active" }) status!: UserStatus;
+    /** JWT 中固化此版本；申请注销或恢复账号时递增，使所有旧登录态立即失效。 */
+    @Column({ type: "int", default: 0 }) sessionVersion!: number;
+    /** 自助注销申请时间；仅 deleting 状态有值。 */
+    @Index() @Column(short) deleteRequestedAt!: string;
+    /** 注销清理租约的最后续期时间；finalizing 状态用于崩溃恢复与阻止两个清理器并发执行。 */
+    @Index() @Column(short) deleteFinalizingAt!: string;
+    /** 完成注销时间；deleted 状态用于后台审计。 */
+    @Index() @Column(short) deletedAt!: string;
+    /** 注销前的用户名只供后台审计与重新启用时预填，不参与登录和唯一占用。 */
+    @Column(short) deletedUsername!: string;
     @Column(short) lastLoginAt!: string;
     /** 用户偏好 JSON（默认模型、生成参数、系统提示词等），跟着账号走，换设备保留。 */
     @Column({ type: LONG_TEXT, nullable: true }) preferences!: string;
@@ -176,7 +186,7 @@ export class Asset {
     @Column(short) updatedAt!: string;
 }
 
-export type BlobState = "active" | "pending_delete";
+export type BlobState = "active" | "pending_delete" | "deleting";
 
 /** 全局物理对象。用户归属和配额仍由 StoredFile 表表达。 */
 @Entity("file_blobs")
@@ -192,11 +202,14 @@ export class PhysicalBlob {
     @Column({ type: "varchar", length: 512, default: "" }) path!: string;
     @Column({ type: "int", default: 0 }) refCount!: number;
     @Index() @Column({ type: "varchar", length: 16, default: "active" }) state!: BlobState;
+    /** GC 抢占物理删除时的令牌；新引用只能复活 pending_delete，不能越过正在删除的令牌。 */
+    @Column(short) deleteToken!: string;
     @Column(short) pendingSince!: string;
     @Index() @Column(short) createdAt!: string;
 }
 
 /** 服务端文件对象，图片、视频、音频与参考素材统一走这里。 */
+@Index("uq_files_owner_checksum", ["userId", "dedupeKey", "checksum"], { unique: true })
 @Entity("files")
 export class StoredFile {
     @PrimaryColumn(id) id!: string;
@@ -208,6 +221,11 @@ export class StoredFile {
      * userId 仍然保留：它决定的是「谁能查到、删掉这一行」，与计费归属是两件事。
      */
     @Index() @Column(short) teamId!: string;
+    /**
+     * 逻辑去重作用域。正常情况下与 teamId 相同；团队解散后 teamId 清空以计入个人空间，
+     * dedupeKey 仍保留原团队 ID，避免与用户原有的同图 fileId 冲突。多个 fileId 都只指向同一 PhysicalBlob。
+     */
+    @Column(short) dedupeKey!: string;
     @Column({ type: "varchar", length: 32, default: "image" }) kind!: string;
     @Column({ type: "varchar", length: 128, default: "application/octet-stream" }) mimeType!: string;
     @Column({ type: "bigint", default: 0 }) bytes!: number;
@@ -345,6 +363,31 @@ export class Job {
 }
 
 /**
+ * 生成任务的媒体历史引用。它只引用全局 PhysicalBlob，不属于任何用户/团队云空间，
+ * 因而不会计入配额；用户删除 StoredFile 后，历史仍可在保留期内继续展示同一份物理对象。
+ * clearedAt 非空表示历史记录仍在，但媒体已经按保留策略清除。
+ */
+@Index(["fileId", "clearedAt"])
+@Entity("generation_outputs")
+export class GenerationOutput {
+    @PrimaryColumn(id) jobId!: string;
+    @PrimaryColumn(id) fileId!: string;
+    /** FK 是并发清理的最后一道闸：任务已删除后，任何迟到的归档都不能留下不可见的孤儿引用。 */
+    @ManyToOne(() => Job, { onDelete: "CASCADE" })
+    @JoinColumn({ name: "jobId", referencedColumnName: "id" })
+    job!: Job;
+    @Index() @Column({ type: "varchar", length: 128, default: "" }) checksum!: string;
+    @Column({ type: "varchar", length: 32, default: "image" }) kind!: string;
+    @Column({ type: "varchar", length: 128, default: "application/octet-stream" }) mimeType!: string;
+    @Column({ type: "bigint", default: 0 }) bytes!: number;
+    @Column({ type: "int", default: 0 }) width!: number;
+    @Column({ type: "int", default: 0 }) height!: number;
+    @Column({ type: "int", default: 0 }) durationMs!: number;
+    @Index() @Column(short) clearedAt!: string;
+    @Index() @Column(short) createdAt!: string;
+}
+
+/**
  * 画布 Agent 会话，绑定到某个画布项目。sessionId 由客户端生成，
  * 不同用户之间不保证唯一，所以和画布一样用 (userId, sessionId) 复合主键。
  * lastSeq 是会话内已分配的最大消息序号，前端靠它做 sinceSeq 增量拉取。
@@ -354,6 +397,9 @@ export class AgentSession {
     @PrimaryColumn(short) userId!: string;
     @PrimaryColumn(id) sessionId!: string;
     @Index() @Column(id) projectId!: string;
+    @Column({ type: "varchar", length: 64, default: "" }) projectOwnerId!: string;
+    @Column({ type: "varchar", length: 64, default: "" }) shareId!: string;
+    @Column({ type: "varchar", length: 64, default: "" }) payerUserId!: string;
     @Column(short) title!: string;
     @Column({ type: "varchar", length: 32, default: "idle" }) status!: AgentSessionStatus;
     @Column(short) model!: string;
@@ -584,4 +630,4 @@ export class TeamCreditLog {
     @Index() @Column(short) createdAt!: string;
 }
 
-export const entities = [User, CreditLog, Setting, InviteCode, InviteUse, Prompt, PromptCategory, Asset, PhysicalBlob, StoredFile, Project, ProjectShare, ProjectAccessLog, UserAsset, UserPlugin, Passkey, Job, AgentSession, AgentMessage, Team, TeamMember, TeamInvite, TeamInviteUse, TeamCreditLog];
+export const entities = [User, CreditLog, Setting, InviteCode, InviteUse, Prompt, PromptCategory, Asset, PhysicalBlob, StoredFile, Project, ProjectShare, ProjectAccessLog, UserAsset, UserPlugin, Passkey, Job, GenerationOutput, AgentSession, AgentMessage, Team, TeamMember, TeamInvite, TeamInviteUse, TeamCreditLog];

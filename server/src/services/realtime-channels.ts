@@ -161,6 +161,7 @@ async function openProject(options: OpenChannelOptions, projectId: string): Prom
     const unsubscribe = subscribeProject(ownerId, projectId, (event) => stream.push(serverFrame("event", id, channel, event)), {
         shareId: identity.guest?.shareId,
         clientId,
+        principalId: identity.guest?.actorId || identity.userId,
         close: revoke,
     });
 

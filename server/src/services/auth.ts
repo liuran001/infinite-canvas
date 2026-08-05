@@ -9,6 +9,7 @@ import { CreditLog, DEFAULT_STORAGE_QUOTA, User, type CreditLogType, type UserRo
 import { fail, firstNonEmpty, newAffCode, newId, now } from "../lib/errors";
 import type { Query } from "../lib/response";
 import { setUserCredits } from "./billing";
+import { assertAccountLoginAllowed, finalizeAccountDeletion, requestAccountDeletion } from "./account-deletion";
 import { claimInviteCode, recordInviteUse, releaseInviteCode } from "./invites";
 import { usedBytesOf } from "./quota";
 import { getSettings } from "./settings";
@@ -63,6 +64,11 @@ function newUser(patch: Partial<User>): User {
         inviterId: "",
         linuxDoId: "",
         status: "active",
+        sessionVersion: 0,
+        deleteRequestedAt: "",
+        deleteFinalizingAt: "",
+        deletedAt: "",
+        deletedUsername: "",
         lastLoginAt: "",
         extra: "",
         createdAt: now(),
@@ -73,18 +79,44 @@ function newUser(patch: Partial<User>): User {
 
 function signToken(user: User) {
     // kind 用来和分享访客的 guest 令牌区分：两种令牌用同一把密钥签，只有载荷能证明这是账号身份。
-    return jwt.sign({ kind: "user", userId: user.id, username: user.username, role: user.role }, config.jwtSecret, { expiresIn: `${config.jwtExpireHours}h`, subject: user.id });
+    return jwt.sign({ kind: "user", userId: user.id, username: user.username, role: user.role, sessionVersion: user.sessionVersion }, config.jwtSecret, { expiresIn: `${config.jwtExpireHours}h`, subject: user.id });
+}
+
+type LoginPatch = Partial<Pick<User, "lastLoginAt" | "affCode" | "displayName" | "avatarUrl" | "extra">>;
+
+/** 只更新明确列，并用 active + sessionVersion 把旧快照挡在注销状态之外。 */
+async function patchActiveUser(snapshot: User, patch: Partial<User>) {
+    const users = repo(User);
+    await users.update({ id: snapshot.id, status: "active", sessionVersion: snapshot.sessionVersion }, patch);
+    const fresh = await users.findOneBy({ id: snapshot.id });
+    return fresh?.status === "active" && fresh.sessionVersion === snapshot.sessionVersion ? fresh : null;
+}
+
+/** 密码、Passkey、OAuth 在凭据校验完成后统一从这里签发，不能再整行 save 旧 User。 */
+export async function finishAccountLogin(snapshot: User, patch: LoginPatch = {}): Promise<AuthSession> {
+    const fresh = await patchActiveUser(snapshot, { ...patch, updatedAt: now() });
+    if (!fresh) {
+        const current = await repo(User).findOneBy({ id: snapshot.id });
+        if (current) await assertAccountLoginAllowed(current);
+        throw fail("账号状态已变化，请重新登录");
+    }
+    return { token: signToken(fresh), user: publicUser(fresh) };
 }
 
 export async function newSession(user: User): Promise<AuthSession> {
-    return { token: signToken(user), user: publicUser(user) };
+    const fresh = await repo(User).findOneBy({ id: user.id });
+    if (!fresh) throw fail("用户名或密码错误");
+    await assertAccountLoginAllowed(fresh);
+    if (fresh.sessionVersion !== user.sessionVersion) throw fail("账号状态已变化，请重新登录");
+    return { token: signToken(fresh), user: publicUser(fresh) };
 }
 
 export async function ensureDefaultAdmin() {
     if (!config.adminUsername || !config.adminPassword) return;
     warnDefaultSecurityConfig();
     const users = repo(User);
-    if (await users.findOneBy({ role: "admin" })) return;
+    // 已注销管理员只是一条审计墓碑，不能阻止系统补建可登录的默认管理员。
+    if (await users.findOneBy({ role: "admin", status: "active" })) return;
     await users.save(newUser({ username: config.adminUsername, password: await bcrypt.hash(config.adminPassword, 10), role: "admin" }));
 }
 
@@ -143,31 +175,29 @@ export async function login(username: string, password: string) {
     const users = repo(User);
     const user = await users.findOneBy({ username: (username || "").trim() });
     if (!user || !user.password || !(await bcrypt.compare(password || "", user.password))) throw fail("用户名或密码错误");
-    if (user.status === "ban") throw fail("账号已被禁用");
-    user.lastLoginAt = now();
-    user.updatedAt = now();
-    if (!user.affCode) user.affCode = newAffCode();
-    return newSession(await users.save(user));
+    return finishAccountLogin(user, { lastLoginAt: now(), affCode: user.affCode || newAffCode() });
 }
 
 export async function currentAuthUser(token: string): Promise<AuthUser | null> {
     let userId = "";
+    let sessionVersion = 0;
     try {
-        const payload = jwt.verify(token, config.jwtSecret) as { userId?: string; kind?: string };
+        const payload = jwt.verify(token, config.jwtSecret) as { userId?: string; kind?: string; sessionVersion?: number };
         // 分享访客的令牌签名同样有效，绝不能在这里被兑换成账号身份。签发早于本次改动的老令牌没有 kind，按账号处理。
         if (payload.kind && payload.kind !== "user") return null;
         userId = String(payload.userId || "");
+        sessionVersion = Number(payload.sessionVersion || 0);
     } catch {
         return null;
     }
     const user = userId ? await repo(User).findOneBy({ id: userId }) : null;
-    if (!user || user.status === "ban") return null;
+    if (!user || user.status !== "active" || user.sessionVersion !== sessionVersion) return null;
     return publicUser(user);
 }
 
 export async function listUsers(query: Query) {
     const like = query.keyword ? Like(`%${query.keyword}%`) : undefined;
-    const where = like ? [{ username: like }, { displayName: like }, { email: like }, { linuxDoId: like }] : {};
+    const where = like ? [{ username: like }, { deletedUsername: like }, { displayName: like }, { email: like }, { linuxDoId: like }] : {};
     const [items, total] = await repo(User).findAndCount({ where, order: { createdAt: "DESC" }, skip: query.offset, take: query.pageSize });
     const used = await usedBytesOf(items.map((user) => user.id));
     return { items: items.map((user) => ({ ...user, password: "", storageQuota: Number(user.storageQuota), storageUsed: used.get(user.id) || 0 })), total };
@@ -181,30 +211,53 @@ export async function saveUser(input: Partial<User>, password: string) {
     const duplicated = await users.findOneBy({ username });
     if (duplicated && duplicated.id !== input.id) throw fail("用户名已存在");
     const saved = input.id ? await users.findOneBy({ id: input.id }) : null;
+    if (saved?.status === "deleted") throw fail("已注销账号请使用重新启用操作");
+    if (saved?.status === "deleting" || saved?.status === "finalizing") throw fail("账号正在注销，不能直接修改");
     const role: UserRole = input.role && input.role !== "guest" ? input.role : "user";
-    const status: UserStatus = input.status || "active";
-    const user = saved
-        ? { ...saved, username, email: input.email || "", displayName: input.displayName || "", role, status, updatedAt: now() }
-        : newUser({ username, email: input.email || "", displayName: input.displayName || "", role, status, storageQuota: (await getSettings()).public.storage.defaultQuota });
-    if (password) user.password = await bcrypt.hash(password, 10);
-    if (!user.password) throw fail("密码不能为空");
-    return { ...(await users.save(user)), password: "" };
+    const status: UserStatus = input.status === "ban" ? "ban" : "active";
+    if (!saved) {
+        const user = newUser({ username, email: input.email || "", displayName: input.displayName || "", role, status, storageQuota: (await getSettings()).public.storage.defaultQuota });
+        if (password) user.password = await bcrypt.hash(password, 10);
+        if (!user.password) throw fail("密码不能为空");
+        return { ...(await users.save(user)), password: "" };
+    }
+
+    const nextPassword = password ? await bcrypt.hash(password, 10) : saved.password;
+    if (!nextPassword) throw fail("密码不能为空");
+    const nextVersion = saved.sessionVersion + (saved.status === status ? 0 : 1);
+    const updated = await users.update(
+        { id: saved.id, status: saved.status, sessionVersion: saved.sessionVersion },
+        {
+            username,
+            email: input.email || "",
+            displayName: input.displayName || "",
+            role,
+            status,
+            password: nextPassword,
+            sessionVersion: nextVersion,
+            updatedAt: now(),
+        },
+    );
+    if (!updated.affected) throw fail("账号状态已变化，请刷新后重试");
+    return { ...(await users.findOneByOrFail({ id: saved.id, sessionVersion: nextVersion })), password: "" };
 }
 
 export async function deleteUser(id: string) {
-    await repo(User).delete({ id });
+    const user = await repo(User).findOneBy({ id });
+    if (!user || user.status === "deleted") return;
+    await requestAccountDeletion(id);
+    await finalizeAccountDeletion(id);
 }
 
 /** 修改密码。第三方登录创建的账号本来就没有密码，这种情况允许直接设置。 */
 export async function changePassword(userId: string, oldPassword: string, newPassword: string) {
     const users = repo(User);
     const user = await users.findOneBy({ id: userId });
-    if (!user) throw fail("用户不存在");
+    if (!user || user.status !== "active") throw fail("用户不存在");
     if (user.password && !(await bcrypt.compare(oldPassword || "", user.password))) throw fail("原密码不正确");
     if ((newPassword || "").length < 6) throw fail("新密码至少 6 位");
-    user.password = await bcrypt.hash(newPassword, 10);
-    user.updatedAt = now();
-    await users.save(user);
+    const fresh = await patchActiveUser(user, { password: await bcrypt.hash(newPassword, 10), updatedAt: now() });
+    if (!fresh) throw fail("账号状态已变化，请重新登录");
 }
 
 /**
@@ -236,26 +289,24 @@ const DISPLAY_NAME_MAX = 64;
 export async function updateDisplayName(userId: string, displayName: unknown) {
     const users = repo(User);
     const user = await users.findOneBy({ id: userId });
-    if (!user) throw fail("用户不存在");
+    if (!user || user.status !== "active") throw fail("用户不存在");
     const next = String(displayName ?? "").trim();
     if (next.length > DISPLAY_NAME_MAX) throw fail(`昵称最多 ${DISPLAY_NAME_MAX} 个字符`);
-    user.displayName = next;
-    user.displayNameCustomized = true;
-    user.updatedAt = now();
-    return publicUser(await users.save(user));
+    const fresh = await patchActiveUser(user, { displayName: next, displayNameCustomized: true, updatedAt: now() });
+    if (!fresh) throw fail("账号状态已变化，请重新登录");
+    return publicUser(fresh);
 }
 
 /** 解绑第三方登录。没有密码时解绑会导致再也登不进来，必须先设密码。 */
 export async function unbindLinuxDo(userId: string) {
     const users = repo(User);
     const user = await users.findOneBy({ id: userId });
-    if (!user) throw fail("用户不存在");
+    if (!user || user.status !== "active") throw fail("用户不存在");
     if (!user.linuxDoId) throw fail("当前账号未绑定 Linux.do");
     if (!user.password) throw fail("请先设置登录密码，否则解绑后将无法登录");
-    user.linuxDoId = "";
-    user.updatedAt = now();
-    await users.save(user);
-    return publicUser(user);
+    const fresh = await patchActiveUser(user, { linuxDoId: "", updatedAt: now() });
+    if (!fresh) throw fail("账号状态已变化，请重新登录");
+    return publicUser(fresh);
 }
 
 async function writeCreditLog(userId: string, type: CreditLogType, amount: number, balance: number, remark: string, extra?: unknown) {
@@ -280,10 +331,10 @@ export async function adjustUserCredits(id: string, credits: number) {
 export async function adjustUserQuota(id: string, quota: number) {
     const users = repo(User);
     const user = await users.findOneBy({ id });
-    if (!user) throw fail("用户不存在");
-    user.storageQuota = Math.max(0, Math.floor(quota));
-    user.updatedAt = now();
-    return { ...(await users.save(user)), password: "" };
+    if (!user || user.status !== "active") throw fail("用户不存在");
+    const fresh = await patchActiveUser(user, { storageQuota: Math.max(0, Math.floor(quota)), updatedAt: now() });
+    if (!fresh) throw fail("账号状态已变化，请刷新后重试");
+    return { ...fresh, password: "" };
 }
 
 
@@ -322,6 +373,8 @@ function linuxDoRedirectUri(req: Request) {
     return `${requestOrigin(req)}/api/auth/linux-do/callback`;
 }
 
+const LINUX_DO_STATE_KIND = "linux-do-oauth";
+
 /**
  * 发起 Linux.do 授权。传 bindUserId 表示这是「给已登录账号绑定」而不是登录。
  * state 用 JWT 签名：OAuth 回调是无鉴权的浏览器跳转，只有签名过的 state 才能安全携带用户身份。
@@ -331,12 +384,24 @@ export async function linuxDoAuthorizeUrl(req: Request, redirect: string, bindUs
     if (!settings.public.auth.linuxDo.enabled) throw fail("Linux.do 登录未开启");
     const { clientId, clientSecret } = settings.private.auth.linuxDo;
     if (!clientId || !clientSecret) throw fail("Linux.do 登录未配置");
+    const bindUser = bindUserId ? await repo(User).findOneBy({ id: bindUserId, status: "active" }) : null;
+    if (bindUserId && !bindUser) throw fail("账号状态已变化，请重新登录");
     const params = new URLSearchParams({
         client_id: clientId,
         redirect_uri: linuxDoRedirectUri(req),
         response_type: "code",
         scope: "read",
-        state: jwt.sign({ redirect: safeRedirectPath(redirect || "/"), bindUserId }, config.jwtSecret, { expiresIn: "10m" }),
+        state: jwt.sign(
+            {
+                kind: LINUX_DO_STATE_KIND,
+                redirect: safeRedirectPath(redirect || "/"),
+                bindUserId,
+                bindSessionVersion: bindUser?.sessionVersion,
+                bindLinuxDoId: bindUser?.linuxDoId || "",
+            },
+            config.jwtSecret,
+            { expiresIn: "10m" },
+        ),
     });
     return `${config.linuxDo.authorizeUrl}?${params}`;
 }
@@ -383,10 +448,15 @@ async function linuxDoUsername(linuxDoId: string, profile: LinuxDoProfile) {
 export async function loginWithLinuxDo(req: Request, code: string, state: string) {
     let redirect = "/";
     let bindUserId = "";
+    let bindSessionVersion: number | undefined;
+    let bindLinuxDoId = "";
     try {
-        const payload = jwt.verify(state, config.jwtSecret) as { redirect?: string; bindUserId?: string };
+        const payload = jwt.verify(state, config.jwtSecret) as { kind?: string; redirect?: string; bindUserId?: string; bindSessionVersion?: number; bindLinuxDoId?: string };
+        if (payload.kind !== LINUX_DO_STATE_KIND) throw new Error("invalid oauth state kind");
         redirect = safeRedirectPath(payload.redirect || "/");
         bindUserId = payload.bindUserId || "";
+        bindSessionVersion = payload.bindSessionVersion;
+        bindLinuxDoId = payload.bindLinuxDoId || "";
     } catch {
         throw Object.assign(fail("授权状态已失效，请重新发起"), { redirect });
     }
@@ -409,35 +479,59 @@ export async function loginWithLinuxDo(req: Request, code: string, state: string
 
     // 绑定流程：把 Linux.do 账号挂到已登录的用户上，不换发登录态。
     if (bindUserId) {
+        if (!Number.isInteger(bindSessionVersion)) throw Object.assign(fail("授权状态已失效，请重新发起"), { redirect });
         if (bound && bound.id !== bindUserId) throw Object.assign(fail("该 Linux.do 账号已绑定其他用户"), { redirect });
         const user = await users.findOneBy({ id: bindUserId });
-        if (!user) throw Object.assign(fail("用户不存在"), { redirect });
-        user.linuxDoId = linuxDoId;
-        user.displayName = firstNonEmpty(user.displayName, profile.name);
-        user.avatarUrl = firstNonEmpty(user.avatarUrl, linuxDoAvatar(profile.avatar_template || ""));
-        user.updatedAt = now();
-        user.extra = JSON.stringify({ linuxDo: profile });
-        await users.save(user);
+        if (!user || user.status !== "active" || user.sessionVersion !== bindSessionVersion || user.linuxDoId !== bindLinuxDoId) {
+            throw Object.assign(fail("账号状态已变化，请重新发起绑定"), { redirect });
+        }
+        await users.update(
+            { id: bindUserId, status: "active", sessionVersion: bindSessionVersion, linuxDoId: bindLinuxDoId },
+            {
+                linuxDoId,
+                displayName: firstNonEmpty(user.displayName, profile.name),
+                avatarUrl: firstNonEmpty(user.avatarUrl, linuxDoAvatar(profile.avatar_template || "")),
+                updatedAt: now(),
+                extra: JSON.stringify({ linuxDo: profile }),
+            },
+        );
+        const fresh = await users.findOneBy({ id: bindUserId });
+        if (!fresh || fresh.status !== "active" || fresh.sessionVersion !== bindSessionVersion || fresh.linuxDoId !== linuxDoId) {
+            throw Object.assign(fail("账号状态已变化，请重新发起绑定"), { redirect });
+        }
         return { session: null, redirect, bound: true, pendingToken: "" };
     }
 
-    let user = bound;
-    if (!user) {
+    if (!bound) {
         if (!settings.public.auth.allowRegister) throw Object.assign(fail("当前未开放注册"), { redirect });
         // 需要邀请码时这一步绝不能建号：只签一张待注册凭据交给前端，
         // 用户补完邀请码走 /auth/linux-do/complete 才真正开户，在那之前始终是未登录状态。
         if (settings.public.auth.requireInvite) return { session: null, redirect, bound: false, pendingToken: signPendingRegister(linuxDoId, profile) };
         const username = await linuxDoUsername(linuxDoId, profile);
-        user = newUser({ username, displayName: (profile.name || "").trim(), avatarUrl: linuxDoAvatar(profile.avatar_template || ""), linuxDoId, storageQuota: settings.public.storage.defaultQuota });
-    } else if (user.status === "ban") {
-        throw Object.assign(fail("账号已被禁用"), { redirect });
+        const user = await users.save(
+            newUser({
+                username,
+                displayName: (profile.name || "").trim(),
+                avatarUrl: linuxDoAvatar(profile.avatar_template || ""),
+                linuxDoId,
+                storageQuota: settings.public.storage.defaultQuota,
+                lastLoginAt: now(),
+                extra: JSON.stringify({ linuxDo: profile }),
+            }),
+        );
+        return { session: await newSession(user), redirect, bound: false, pendingToken: "" };
     }
-    user.displayName = syncedDisplayName(user, profile.name);
-    user.avatarUrl = firstNonEmpty(linuxDoAvatar(profile.avatar_template || ""), user.avatarUrl);
-    user.lastLoginAt = now();
-    user.updatedAt = now();
-    user.extra = JSON.stringify({ linuxDo: profile });
-    return { session: await newSession(await users.save(user)), redirect, bound: false, pendingToken: "" };
+    try {
+        const session = await finishAccountLogin(bound, {
+            displayName: syncedDisplayName(bound, profile.name),
+            avatarUrl: firstNonEmpty(linuxDoAvatar(profile.avatar_template || ""), bound.avatarUrl),
+            lastLoginAt: now(),
+            extra: JSON.stringify({ linuxDo: profile }),
+        });
+        return { session, redirect, bound: false, pendingToken: "" };
+    } catch (error) {
+        throw Object.assign(error as Error, { redirect });
+    }
 }
 
 /**
@@ -459,10 +553,7 @@ export async function completeLinuxDoRegister(pendingToken: string, inviteCode: 
     // 凭据有效期内对方可能已经从别的入口把号建出来了，这时直接换成登录，不要重复建号也不要再吃一个名额。
     const bound = await users.findOneBy({ linuxDoId: payload.linuxDoId });
     if (bound) {
-        if (bound.status === "ban") throw fail("账号已被禁用");
-        bound.lastLoginAt = now();
-        bound.updatedAt = now();
-        return newSession(await users.save(bound));
+        return finishAccountLogin(bound, { lastLoginAt: now(), affCode: bound.affCode || newAffCode() });
     }
 
     const profile = payload.profile || {};

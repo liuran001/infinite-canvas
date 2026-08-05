@@ -1,8 +1,10 @@
-import type { EntityManager } from "typeorm";
+import { In, type EntityManager } from "typeorm";
 
-import { dataSource, repo, serialTransaction } from "../db/data-source";
-import { DEFAULT_STORAGE_QUOTA, PhysicalBlob, Project, ProjectShare, StoredFile, User } from "../db/entities";
+import { dataSource, serialTransaction } from "../db/data-source";
+import { DEFAULT_STORAGE_QUOTA, GenerationOutput, Job, PhysicalBlob, Project, ProjectShare, StoredFile, User } from "../db/entities";
 import { CLONE_DISABLED, fail, FORBIDDEN, newId, now, QUOTA_EXCEEDED } from "../lib/errors";
+import { reconcileBlobReferences } from "./blob-gc";
+import { requireActiveAccounts } from "./account-fence";
 import { withBlobLock } from "./files";
 import { logShareAccess, shareUsable } from "./project-share";
 
@@ -16,13 +18,15 @@ function mb(bytes: number) {
 
 /** 与 quota.usedBytesOf 同一套口径：团队文件占的是团队的空间，不能算进克隆者的个人用量。 */
 async function usedBytesIn(manager: EntityManager, userId: string) {
-    const row = await manager
+    const rows = await manager
         .getRepository(StoredFile)
         .createQueryBuilder("file")
-        .select("SUM(file.bytes)", "total")
+        .select("file.checksum", "checksum")
+        .addSelect("MAX(file.bytes)", "bytes")
         .where("file.userId = :userId AND file.teamId = :teamId", { userId, teamId: "" })
-        .getRawOne<{ total: string | number | null }>();
-    return Number(row?.total || 0);
+        .groupBy("file.checksum")
+        .getRawMany<{ checksum: string; bytes: string | number | null }>();
+    return rows.reduce((total, row) => total + Number(row.bytes || 0), 0);
 }
 
 /**
@@ -40,31 +44,78 @@ export async function cloneSharedProject(share: ProjectShare, clonerId: string, 
     if (!share.allowClone) throw fail("这条分享链接不允许保存副本", 403, CLONE_DISABLED);
 
     const cloned = await serialTransaction(async (manager) => {
+        await requireActiveAccounts(manager, [clonerId, share.ownerId]);
         const source = await manager.getRepository(Project).findOneBy({ userId: share.ownerId, projectId: share.projectId });
         if (!source || source.deleted) throw fail("画布项目不存在", 404, "PROJECT_NOT_FOUND");
 
         const sourceIds = [...new Set(Array.from((source.data || "").matchAll(FILE_REFERENCE), (matched) => matched[1]))];
         const files = manager.getRepository(StoredFile);
+        const sourceFiles = sourceIds.length ? await files.findBy({ id: In(sourceIds), userId: share.ownerId }) : [];
+        const sources = new Map(sourceFiles.map((file) => [file.id, file]));
+        const missingIds = sourceIds.filter((id) => !sources.has(id));
+        if (missingIds.length) {
+            const outputs = await manager.getRepository(GenerationOutput).findBy({ fileId: In(missingIds), clearedAt: "" });
+            const jobs = outputs.length
+                ? await manager.getRepository(Job).findBy({ id: In(outputs.map((output) => output.jobId)), storageUserId: share.ownerId })
+                : [];
+            const ownedJobIds = new Set(jobs.map((job) => job.id));
+            const blobs = outputs.length
+                ? await manager.getRepository(PhysicalBlob).findBy({ checksum: In([...new Set(outputs.map((output) => output.checksum))]) })
+                : [];
+            const blobsByChecksum = new Map(blobs.filter((blob) => blob.state !== "deleting").map((blob) => [blob.checksum, blob]));
+            for (const output of outputs) {
+                if (!ownedJobIds.has(output.jobId) || sources.has(output.fileId)) continue;
+                const blob = blobsByChecksum.get(output.checksum);
+                if (!blob) continue;
+                sources.set(
+                    output.fileId,
+                    files.create({
+                        id: output.fileId,
+                        userId: share.ownerId,
+                        teamId: "",
+                        dedupeKey: "",
+                        kind: output.kind,
+                        mimeType: output.mimeType,
+                        bytes: Number(output.bytes),
+                        width: output.width,
+                        height: output.height,
+                        durationMs: output.durationMs,
+                        storage: blob.storage,
+                        path: blob.path,
+                        checksum: output.checksum,
+                        createdAt: output.createdAt,
+                    }),
+                );
+            }
+        }
+        if (sourceIds.some((id) => !sources.has(id))) throw fail("画布包含已失效或无权访问的文件，无法保存副本");
+
         const mapping = new Map<string, string>();
         const created: StoredFile[] = [];
+        const createdByChecksum = new Map<string, StoredFile>();
         let incoming = 0;
         for (const sourceId of sourceIds) {
-            // 只认属于画布所有者的文件：画布数据是 editor 访客能改的，
-            // 不限归属的话，往里塞一个别人的 fileId 就能在自己账号下建出指向他人文件的引用。
-            const file = await files.findOneBy({ id: sourceId, userId: share.ownerId });
-            if (!file) continue;
+            // 只认属于画布所有者的云文件，或由其生成历史仍持有的媒体；画布数据可由 editor 访客修改，
+            // 外部账号的 fileId 和已经清除的历史都必须整次拒绝，不能原样留在副本里形成越权/延迟破图。
+            const file = sources.get(sourceId)!;
             // 克隆者已经有同一份内容时直接复用自己的引用，不给同一内容再记一次账。
             // 只认克隆者个人名下的那一条：他在某个团队里有同一份内容，不代表这张个人副本能白用团队的空间。
-            const owned = file.checksum ? await files.findOneBy({ userId: clonerId, teamId: "", checksum: file.checksum }) : null;
+            const owned = file.checksum ? await files.findOneBy({ userId: clonerId, dedupeKey: "", checksum: file.checksum }) : null;
             if (owned) {
                 mapping.set(sourceId, owned.id);
                 continue;
             }
+            const pending = file.checksum ? createdByChecksum.get(file.checksum) : null;
+            if (pending) {
+                mapping.set(sourceId, pending.id);
+                continue;
+            }
             // teamId 显式清空：源文件可能挂在源画布的团队名下，照抄过来等于让访客往别人的团队空间里写东西，
             // 而副本本身是归个人的（下面建的 Project 也是 teamId: ""）。
-            const copy = files.create({ ...file, id: newId("file"), userId: clonerId, teamId: "", bytes: Number(file.bytes), createdAt: now() });
+            const copy = files.create({ ...file, id: newId("file"), userId: clonerId, teamId: "", dedupeKey: "", bytes: Number(file.bytes), createdAt: now() });
             mapping.set(sourceId, copy.id);
             created.push(copy);
+            if (copy.checksum) createdByChecksum.set(copy.checksum, copy);
             incoming += Number(file.bytes);
         }
 
@@ -76,13 +127,15 @@ export async function cloneSharedProject(share: ProjectShare, clonerId: string, 
         for (const copy of created) {
             await files.insert(copy);
             if (!copy.checksum) continue;
-            await manager
+            const attached = await manager
                 .getRepository(PhysicalBlob)
                 .createQueryBuilder()
                 .update()
-                .set({ refCount: () => `${column("refCount")} + 1`, state: "active", pendingSince: "" })
+                .set({ refCount: () => `${column("refCount")} + 1`, state: "active", deleteToken: "", pendingSince: "" })
                 .where("checksum = :checksum", { checksum: copy.checksum })
+                .andWhere("state IN (:...states)", { states: ["active", "pending_delete"] })
                 .execute();
+            if (!attached.affected) throw fail("文件正在回收，请稍后重试");
         }
 
         const project = manager.getRepository(Project).create({
@@ -108,8 +161,7 @@ export async function cloneSharedProject(share: ProjectShare, clonerId: string, 
     // 提交后在同一把 checksum 锁里重新对账一次，把被误判的 blob 拉回 active。
     for (const checksum of cloned.checksums) {
         await withBlobLock(checksum, async () => {
-            const actual = await repo(StoredFile).countBy({ checksum });
-            if (actual > 0) await repo(PhysicalBlob).update({ checksum }, { refCount: actual, state: "active", pendingSince: "" });
+            await reconcileBlobReferences(checksum);
         });
     }
 

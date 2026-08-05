@@ -99,7 +99,8 @@ async function main() {
     check("首个候选不可读时回退到下一个可读候选", (await blobs.findOneByOrFail({ checksum: fallbackChecksum })).path, "2025/01/f.bin");
     check("回退分组 refCount 正确", (await blobs.findOneByOrFail({ checksum: fallbackChecksum })).refCount, 2);
     check("物理对象总数等于内容种类数", await blobs.count(), 3);
-    check("迁移不会删除落选历史对象", objectExists(env.filesDir, "2025/01/b.bin"), true);
+    check("全量校验后删除落选历史对象", objectExists(env.filesDir, "2025/01/b.bin"), false);
+    check("已存在 blob 胜出时旧 files 路径也会回收", objectExists(env.filesDir, "2025/01/c.bin"), false);
 
     console.log("重复执行");
     await migratePhysicalBlobs();

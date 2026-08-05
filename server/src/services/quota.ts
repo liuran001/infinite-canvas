@@ -23,12 +23,16 @@ export async function usedBytesOf(userIds: string[]) {
         ? await repo(StoredFile)
               .createQueryBuilder("file")
               .select("file.userId", "userId")
-              .addSelect("SUM(file.bytes)", "total")
+              .addSelect("file.checksum", "checksum")
+              .addSelect("MAX(file.bytes)", "bytes")
               .where("file.userId IN (:...userIds) AND file.teamId = :teamId", { userIds, teamId: "" })
               .groupBy("file.userId")
-              .getRawMany<{ userId: string; total: string | number | null }>()
+              .addGroupBy("file.checksum")
+              .getRawMany<{ userId: string; checksum: string; bytes: string | number | null }>()
         : [];
-    return new Map(rows.map((row) => [row.userId, Number(row.total || 0)]));
+    const totals = new Map<string, number>();
+    for (const row of rows) totals.set(row.userId, (totals.get(row.userId) || 0) + Number(row.bytes || 0));
+    return totals;
 }
 
 export async function usedBytes(userId: string) {
@@ -37,8 +41,14 @@ export async function usedBytes(userId: string) {
 
 /** 团队已用量。与个人用量走同一张表、同一套聚合，只是过滤条件换成 teamId。 */
 export async function usedBytesOfTeam(teamId: string) {
-    const row = await repo(StoredFile).createQueryBuilder("file").select("SUM(file.bytes)", "total").where("file.teamId = :teamId", { teamId }).getRawOne<{ total: string | number | null }>();
-    return Number(row?.total || 0);
+    const rows = await repo(StoredFile)
+        .createQueryBuilder("file")
+        .select("file.checksum", "checksum")
+        .addSelect("MAX(file.bytes)", "bytes")
+        .where("file.teamId = :teamId", { teamId })
+        .groupBy("file.checksum")
+        .getRawMany<{ checksum: string; bytes: string | number | null }>();
+    return rows.reduce((total, row) => total + Number(row.bytes || 0), 0);
 }
 
 /** 一批团队的用量，一次 GROUP BY 出结果。后台列表逐个团队各查一次是 N+1，团队一多就把列表拖垮。 */
@@ -47,12 +57,16 @@ export async function usedBytesOfTeams(teamIds: string[]) {
         ? await repo(StoredFile)
               .createQueryBuilder("file")
               .select("file.teamId", "teamId")
-              .addSelect("SUM(file.bytes)", "total")
+              .addSelect("file.checksum", "checksum")
+              .addSelect("MAX(file.bytes)", "bytes")
               .where("file.teamId IN (:...teamIds)", { teamIds })
               .groupBy("file.teamId")
-              .getRawMany<{ teamId: string; total: string | number | null }>()
+              .addGroupBy("file.checksum")
+              .getRawMany<{ teamId: string; checksum: string; bytes: string | number | null }>()
         : [];
-    return new Map(rows.map((row) => [row.teamId, Number(row.total || 0)]));
+    const totals = new Map<string, number>();
+    for (const row of rows) totals.set(row.teamId, (totals.get(row.teamId) || 0) + Number(row.bytes || 0));
+    return totals;
 }
 
 export async function quotaOf(userId: string) {

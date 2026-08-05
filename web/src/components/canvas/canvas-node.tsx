@@ -20,6 +20,7 @@ type CanvasNodeProps = {
     data: CanvasNodeData;
     scale: number;
     isSelected: boolean;
+    readOnly?: boolean;
     remoteEditors?: ServerProjectPresence[];
     isRelated: boolean;
     isFocusRelated: boolean;
@@ -62,6 +63,7 @@ type CanvasNodeProps = {
 type NodeContentRendererProps = {
     node: CanvasNodeData;
     theme: (typeof canvasThemes)[keyof typeof canvasThemes];
+    readOnly: boolean;
     isEditingContent: boolean;
     textareaRef: React.RefObject<HTMLTextAreaElement | null>;
     isBatchRoot: boolean;
@@ -85,6 +87,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     data,
     scale,
     isSelected,
+    readOnly = false,
     remoteEditors = [],
     isRelated,
     isFocusRelated,
@@ -164,6 +167,12 @@ export const CanvasNode = React.memo(function CanvasNode({
     }, [data.title]);
 
     useEffect(() => {
+        if (!readOnly) return;
+        setIsEditingTitle(false);
+        setIsEditingContent(false);
+    }, [readOnly]);
+
+    useEffect(() => {
         if (!isEditingTitle) return;
         titleInputRef.current?.focus();
         titleInputRef.current?.select();
@@ -173,8 +182,8 @@ export const CanvasNode = React.memo(function CanvasNode({
         const title = titleDraft.trim() || data.title || "未命名节点";
         setTitleDraft(title);
         setIsEditingTitle(false);
-        if (title !== data.title) onTitleChange(data.id, title);
-    }, [data.id, data.title, onTitleChange, titleDraft]);
+        if (!readOnly && title !== data.title) onTitleChange(data.id, title);
+    }, [data.id, data.title, onTitleChange, readOnly, titleDraft]);
 
     useEffect(() => {
         if (!isEditingTitle) return;
@@ -204,9 +213,9 @@ export const CanvasNode = React.memo(function CanvasNode({
     }, [isEditingContent]);
 
     useEffect(() => {
-        if (!editRequestNonce || data.type !== CanvasNodeType.Text) return;
+        if (readOnly || !editRequestNonce || data.type !== CanvasNodeType.Text) return;
         setIsEditingContent(true);
-    }, [data.type, editRequestNonce]);
+    }, [data.type, editRequestNonce, readOnly]);
 
     useEffect(() => {
         if (!isEditingContent) return;
@@ -272,6 +281,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     }, [data.id, handleResizeMove, onResizeEnd]);
 
     const handleResizeMouseDown = (event: React.MouseEvent, corner: ResizeCorner) => {
+        if (readOnly) return;
         event.stopPropagation();
         event.preventDefault();
         onResizeStart(data.id);
@@ -333,8 +343,12 @@ export const CanvasNode = React.memo(function CanvasNode({
                 </>
             ) : null}
             {(isSelected || hovered || isEditingTitle) && (
-                <div className="absolute left-3 top-[-28px] z-[65] max-w-[calc(100%-24px)]" onMouseDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
-                    {isEditingTitle ? (
+                <div
+                    className="absolute left-3 top-[-28px] z-[65] max-w-[calc(100%-24px)]"
+                    onMouseDown={readOnly ? undefined : (event) => event.stopPropagation()}
+                    onPointerDown={readOnly ? undefined : (event) => event.stopPropagation()}
+                >
+                    {isEditingTitle && !readOnly ? (
                         <input
                             ref={titleInputRef}
                             value={titleDraft}
@@ -351,6 +365,10 @@ export const CanvasNode = React.memo(function CanvasNode({
                                 }
                             }}
                         />
+                    ) : readOnly ? (
+                        <span className="block max-w-full truncate py-0.5 text-xs font-medium opacity-75" style={{ color: theme.node.text }}>
+                            {data.title || "未命名节点"}
+                        </span>
                     ) : (
                         <button
                             type="button"
@@ -378,6 +396,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                 }}
                 onMouseDown={(event) => onMouseDown(event, data.id)}
                 onDoubleClick={(event) => {
+                    if (readOnly) return;
                     if (isBatchRoot) {
                         event.stopPropagation();
                         onToggleBatch?.(data.id);
@@ -414,6 +433,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                     <NodeContent
                         node={data}
                         theme={theme}
+                        readOnly={readOnly}
                         isEditingContent={isEditingContent}
                         textareaRef={textareaRef}
                         isBatchRoot={isBatchRoot}
@@ -438,14 +458,18 @@ export const CanvasNode = React.memo(function CanvasNode({
 
                 {!isGroup && !hasImageContent && !hasVideoContent && !hasAudioContent ? <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12" style={{ background: `linear-gradient(to top, ${theme.canvas.background}66, transparent)` }} /> : null}
 
-                <ResizeHandle corner="top-left" onMouseDown={handleResizeMouseDown} />
-                <ResizeHandle corner="top-right" onMouseDown={handleResizeMouseDown} />
-                <ResizeHandle corner="bottom-left" onMouseDown={handleResizeMouseDown} />
-                <ResizeHandle corner="bottom-right" onMouseDown={handleResizeMouseDown} />
+                {!readOnly ? (
+                    <>
+                        <ResizeHandle corner="top-left" onMouseDown={handleResizeMouseDown} />
+                        <ResizeHandle corner="top-right" onMouseDown={handleResizeMouseDown} />
+                        <ResizeHandle corner="bottom-left" onMouseDown={handleResizeMouseDown} />
+                        <ResizeHandle corner="bottom-right" onMouseDown={handleResizeMouseDown} />
+                    </>
+                ) : null}
             </div>
 
-            {!isGroup ? <ConnectionHandleDot side="left" visible={hovered || isSelected || isConnecting} onMouseDown={(event) => onConnectStart(event, data.id, "target")} /> : null}
-            {!isGroup ? <ConnectionHandleDot side="right" visible={(definition?.hasSourceHandle ?? true) && data.type !== CanvasNodeType.Config && (hovered || isSelected || isConnecting)} onMouseDown={(event) => onConnectStart(event, data.id, "source")} /> : null}
+            {!readOnly && !isGroup ? <ConnectionHandleDot side="left" visible={hovered || isSelected || isConnecting} onMouseDown={(event) => onConnectStart(event, data.id, "target")} /> : null}
+            {!readOnly && !isGroup ? <ConnectionHandleDot side="right" visible={(definition?.hasSourceHandle ?? true) && data.type !== CanvasNodeType.Config && (hovered || isSelected || isConnecting)} onMouseDown={(event) => onConnectStart(event, data.id, "source")} /> : null}
 
             {showPanel && !isGroup && renderPanel ? <div className="absolute left-1/2 top-full z-[70] w-[600px] -translate-x-1/2 pt-4">{renderPanel(data)}</div> : null}
         </div>
@@ -457,7 +481,7 @@ function NodeContent(props: NodeContentRendererProps) {
     if (props.isBatchRoot) return <ImageNodeContent {...props} />;
     // 文本是边生成边流回来的，已经有半截内容就直接渲染，别用转圈把它盖住。
     if (props.node.metadata?.status === "loading") return props.node.type === CanvasNodeType.Text && props.node.metadata.content ? <TextContent {...props} /> : <LoadingContent theme={props.theme} />;
-    if (props.node.metadata?.status === "error") return <ErrorContent node={props.node} theme={props.theme} onRetry={props.onRetry} />;
+    if (props.node.metadata?.status === "error") return <ErrorContent node={props.node} theme={props.theme} readOnly={props.readOnly} onRetry={props.onRetry} />;
 
     const Renderer = nodeContentRenderers[props.node.type as CanvasNodeType];
     if (Renderer) return <Renderer {...props} />;
@@ -506,23 +530,25 @@ function LoadingContent({ theme }: Pick<NodeContentRendererProps, "theme">) {
     );
 }
 
-function ErrorContent({ node, theme, onRetry }: Pick<NodeContentRendererProps, "node" | "theme" | "onRetry">) {
+function ErrorContent({ node, theme, readOnly, onRetry }: Pick<NodeContentRendererProps, "node" | "theme" | "readOnly" | "onRetry">) {
     return (
         <div className="flex max-w-[260px] flex-col items-center gap-3 px-5 text-center">
             <div className="text-xs leading-5 text-red-300">{node.metadata?.errorDetails || "生成失败"}</div>
-            <button
-                type="button"
-                className="inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition hover:scale-[1.02]"
-                style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}
-                onClick={(event) => {
-                    event.stopPropagation();
-                    onRetry?.(node);
-                }}
-                onMouseDown={(event) => event.stopPropagation()}
-            >
-                <RefreshCw className="size-3.5" />
-                重试
-            </button>
+            {!readOnly ? (
+                <button
+                    type="button"
+                    className="inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition hover:scale-[1.02]"
+                    style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}
+                    onClick={(event) => {
+                        event.stopPropagation();
+                        onRetry?.(node);
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                >
+                    <RefreshCw className="size-3.5" />
+                    重试
+                </button>
+            ) : null}
         </div>
     );
 }
@@ -537,29 +563,31 @@ function MissingPluginContent({ theme, type }: Pick<NodeContentRendererProps, "t
     );
 }
 
-function TextContent({ node, theme, isEditingContent, textareaRef, mentionReferences, onContentChange, onStopEditing, onGenerateImage }: NodeContentRendererProps) {
+function TextContent({ node, theme, readOnly, isEditingContent, textareaRef, mentionReferences, onContentChange, onStopEditing, onGenerateImage }: NodeContentRendererProps) {
     const fontSize = node.metadata?.fontSize || 14;
     const textStyle = { fontSize: `${fontSize}px`, lineHeight: `${Math.round(fontSize * 1.65)}px`, color: theme.node.text, boxSizing: "border-box" } as React.CSSProperties;
 
     return (
         <div className="flex h-full w-full flex-col overflow-hidden pt-8">
-            <button
-                type="button"
-                className="absolute right-3 top-3 z-20 inline-flex h-8 items-center gap-1 rounded-full border px-2.5 text-xs font-medium opacity-85 backdrop-blur-md transition hover:scale-[1.02] hover:opacity-100"
-                style={{ background: `${theme.toolbar.panel}dd`, borderColor: theme.node.stroke, color: theme.node.text }}
-                onClick={(event) => {
-                    event.stopPropagation();
-                    onGenerateImage?.(node);
-                }}
-                onMouseDown={(event) => event.stopPropagation()}
-                onPointerDown={(event) => event.stopPropagation()}
-                title="用文本生图"
-                aria-label="用文本生图"
-            >
-                <ImageIcon className="size-3.5" />
-                生图
-            </button>
-            {isEditingContent ? (
+            {!readOnly ? (
+                <button
+                    type="button"
+                    className="absolute right-3 top-3 z-20 inline-flex h-8 items-center gap-1 rounded-full border px-2.5 text-xs font-medium opacity-85 backdrop-blur-md transition hover:scale-[1.02] hover:opacity-100"
+                    style={{ background: `${theme.toolbar.panel}dd`, borderColor: theme.node.stroke, color: theme.node.text }}
+                    onClick={(event) => {
+                        event.stopPropagation();
+                        onGenerateImage?.(node);
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    title="用文本生图"
+                    aria-label="用文本生图"
+                >
+                    <ImageIcon className="size-3.5" />
+                    生图
+                </button>
+            ) : null}
+            {isEditingContent && !readOnly ? (
                 <CanvasResourceMentionTextarea
                     ref={textareaRef}
                     className="thin-scrollbar block h-full w-full resize-none overflow-y-auto whitespace-pre-wrap break-words border-none bg-transparent pl-4 pr-14 pt-0 pb-4 m-0 font-mono outline-none select-text appearance-none"
@@ -582,7 +610,7 @@ function TextContent({ node, theme, isEditingContent, textareaRef, mentionRefere
                     style={textStyle}
                     onWheel={(event) => event.stopPropagation()}
                 >
-                    {node.metadata?.content || <span style={{ color: theme.node.placeholder }}>双击编辑文字</span>}
+                    {node.metadata?.content || <span style={{ color: theme.node.placeholder }}>{readOnly ? "暂无文字内容" : "双击编辑文字"}</span>}
                 </div>
             )}
         </div>
@@ -595,12 +623,12 @@ function ImageNodeContent(props: NodeContentRendererProps) {
             props.node.metadata?.status === "loading" ? (
                 <LoadingContent theme={props.theme} />
             ) : props.node.metadata?.status === "error" ? (
-                <ErrorContent node={props.node} theme={props.theme} onRetry={props.onRetry} />
+                <ErrorContent node={props.node} theme={props.theme} readOnly={props.readOnly} onRetry={props.onRetry} />
             ) : (
                 <EmptyImageContent {...props} isBatchRoot={false} />
             );
         return (
-            <BatchFrame batchCount={props.batchCount} batchExpanded={props.batchExpanded} batchOpening={props.batchOpening} batchRecovering={props.batchRecovering} onToggleBatch={props.onToggleBatch}>
+            <BatchFrame batchCount={props.batchCount} batchExpanded={props.batchExpanded} batchOpening={props.batchOpening} batchRecovering={props.batchRecovering} onToggleBatch={props.onToggleBatch} readOnly={props.readOnly}>
                 {content}
             </BatchFrame>
         );
@@ -617,11 +645,12 @@ function ImageNodeContent(props: NodeContentRendererProps) {
             batchRecovering={props.batchRecovering}
             onToggleBatch={props.onToggleBatch}
             onSetBatchPrimary={props.onSetBatchPrimary}
+            readOnly={props.readOnly}
         />
     );
 }
 
-function EmptyImageContent({ theme, isBatchRoot, batchCount, batchExpanded, batchOpening, batchRecovering, onToggleBatch }: NodeContentRendererProps) {
+function EmptyImageContent({ theme, readOnly, isBatchRoot, batchCount, batchExpanded, batchOpening, batchRecovering, onToggleBatch }: NodeContentRendererProps) {
     const content = (
         <div className="flex h-full w-full flex-col items-center justify-center gap-3" style={{ color: theme.node.placeholder }}>
             <div className="flex size-14 items-center justify-center rounded-2xl" style={{ background: theme.toolbar.activeBg }}>
@@ -632,7 +661,7 @@ function EmptyImageContent({ theme, isBatchRoot, batchCount, batchExpanded, batc
     );
     if (isBatchRoot)
         return (
-            <BatchFrame batchCount={batchCount} batchExpanded={batchExpanded} batchOpening={batchOpening} batchRecovering={batchRecovering} onToggleBatch={onToggleBatch}>
+            <BatchFrame batchCount={batchCount} batchExpanded={batchExpanded} batchOpening={batchOpening} batchRecovering={batchRecovering} onToggleBatch={onToggleBatch} readOnly={readOnly}>
                 {content}
             </BatchFrame>
         );
@@ -678,6 +707,7 @@ function ImageContent({
     batchRecovering,
     onToggleBatch,
     onSetBatchPrimary,
+    readOnly,
 }: {
     node: CanvasNodeData;
     isBatchRoot: boolean;
@@ -687,12 +717,13 @@ function ImageContent({
     batchRecovering: boolean;
     onToggleBatch?: () => void;
     onSetBatchPrimary?: () => void;
+    readOnly: boolean;
 }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const isBatchChild = Boolean(node.metadata?.batchRootId);
 
     return (
-        <BatchFrame batchCount={isBatchRoot ? batchCount : 0} batchExpanded={batchExpanded} batchOpening={batchOpening} batchRecovering={batchRecovering} onToggleBatch={onToggleBatch}>
+        <BatchFrame batchCount={isBatchRoot ? batchCount : 0} batchExpanded={batchExpanded} batchOpening={batchOpening} batchRecovering={batchRecovering} onToggleBatch={onToggleBatch} readOnly={readOnly}>
             <div className="h-full w-full overflow-hidden rounded-3xl">
                 <img
                     src={node.metadata!.content!}
@@ -702,7 +733,7 @@ function ImageContent({
                     className={`pointer-events-none block h-full w-full select-none ${node.metadata?.freeResize ? "object-fill" : "object-contain"}`}
                 />
             </div>
-            {isBatchRoot ? (
+            {isBatchRoot && !readOnly ? (
                 <button
                     type="button"
                     className="absolute right-2.5 top-2.5 z-30 flex h-8 items-center justify-center gap-1 rounded-full border px-2.5 text-xs font-semibold shadow-[0_6px_18px_rgba(15,23,42,.10)] backdrop-blur-md transition hover:scale-[1.02]"
@@ -719,7 +750,7 @@ function ImageContent({
                     <ChevronRight className={`size-3.5 opacity-55 transition-transform ${batchExpanded ? "rotate-90" : ""}`} />
                 </button>
             ) : null}
-            {isBatchChild ? (
+            {isBatchChild && !readOnly ? (
                 <button
                     type="button"
                     className="absolute right-3 top-3 z-30 flex h-9 items-center gap-1.5 rounded-xl border px-2.5 text-xs font-medium opacity-0 shadow-[0_8px_20px_rgba(68,64,60,.13)] backdrop-blur-md transition group-hover/batch:opacity-100 hover:scale-[1.02]"
@@ -753,14 +784,14 @@ function ImageInfoBar({ node }: { node: CanvasNodeData }) {
     );
 }
 
-function BatchFrame({ batchCount, batchExpanded, batchOpening, batchRecovering, onToggleBatch, children }: { batchCount: number; batchExpanded: boolean; batchOpening: boolean; batchRecovering: boolean; onToggleBatch?: () => void; children: ReactNode }) {
+function BatchFrame({ batchCount, batchExpanded, batchOpening, batchRecovering, onToggleBatch, readOnly = false, children }: { batchCount: number; batchExpanded: boolean; batchOpening: boolean; batchRecovering: boolean; onToggleBatch?: () => void; readOnly?: boolean; children: ReactNode }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const isBatchRoot = batchCount > 1;
     return (
         <div
             className="group/batch relative h-full w-full overflow-visible"
             onDoubleClick={
-                isBatchRoot
+                isBatchRoot && !readOnly
                     ? (event) => {
                           event.stopPropagation();
                           onToggleBatch?.();

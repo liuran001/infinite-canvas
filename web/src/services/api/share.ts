@@ -1,5 +1,15 @@
 import { serverApiUrl } from "@/services/api/server";
-import type { ServerFile, ServerJob, ServerJobStatus, ServerProject, ServerProjectEvent, ServerProjectPresence } from "@/services/api/server";
+import type {
+    ServerAgentEvent,
+    ServerAgentMessage,
+    ServerAgentSession,
+    ServerFile,
+    ServerJob,
+    ServerJobStatus,
+    ServerProject,
+    ServerProjectEvent,
+    ServerProjectPresence,
+} from "@/services/api/server";
 import { useServerStore } from "@/stores/use-server-store";
 
 /**
@@ -185,6 +195,21 @@ export const shareApi = {
     jobs: (guestToken: string, statuses: ServerJobStatus[] = []) => shareRequest<{ items: ServerJob[] }>(`/v1/jobs${statuses.length ? `?status=${encodeURIComponent(statuses.join(","))}` : ""}`, {}, "查询分享生成任务失败", guestToken),
     cancelJob: (guestToken: string, id: string) => shareRequest<ServerJob>(`/v1/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", ...jsonBody({ acceptSelfPay: true }) }, "取消分享生成任务失败", guestToken),
 
+    /** 分享态 Agent：历史主体由 guest 令牌里的 actorId 决定，房主与其他访客都读不到。 */
+    agentSessions: (guestToken: string, projectId: string) => shareRequest<{ items: ServerAgentSession[] }>(`/v1/agent/sessions?projectId=${encodeURIComponent(projectId)}`, {}, "读取分享 Agent 会话失败", guestToken),
+    createAgentSession: (guestToken: string, body: { sessionId: string; projectId: string; title: string; model: string; acceptSelfPay: boolean }) =>
+        shareRequest<ServerAgentSession>("/v1/agent/sessions", { method: "POST", ...jsonBody(body) }, "新建分享 Agent 会话失败", guestToken),
+    agentSession: (guestToken: string, id: string) => shareRequest<ServerAgentSession>(`/v1/agent/sessions/${encodeURIComponent(id)}`, {}, "读取分享 Agent 会话失败", guestToken),
+    deleteAgentSession: (guestToken: string, id: string) => shareRequest<boolean>(`/v1/agent/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }, "删除分享 Agent 会话失败", guestToken),
+    agentMessages: (guestToken: string, id: string, sinceSeq: number) =>
+        shareRequest<{ items: ServerAgentMessage[] }>(`/v1/agent/sessions/${encodeURIComponent(id)}/messages?sinceSeq=${sinceSeq}`, {}, "读取分享 Agent 消息失败", guestToken),
+    sendAgentMessage: (guestToken: string, id: string, body: { clientMessageId: string; content: string; model: string; attachmentIds: string[]; references: Array<{ nodeId: string }>; acceptSelfPay: boolean }) =>
+        shareRequest<ServerAgentMessage>(`/v1/agent/sessions/${encodeURIComponent(id)}/messages`, { method: "POST", ...jsonBody(body) }, "发送分享 Agent 消息失败", guestToken),
+    abortAgentSession: (guestToken: string, id: string) => shareRequest<ServerAgentSession>(`/v1/agent/sessions/${encodeURIComponent(id)}/abort`, { method: "POST" }, "中止分享 Agent 执行失败", guestToken),
+    resolveAgentSession: (guestToken: string, id: string, approved: boolean, acceptSelfPay: boolean) =>
+        shareRequest<ServerAgentSession>(`/v1/agent/sessions/${encodeURIComponent(id)}/resolve`, { method: "POST", ...jsonBody({ approved, acceptSelfPay }) }, "回应分享 Agent 请求失败", guestToken),
+    agentStream: (guestToken: string, sessionId: string, sinceSeq: number, onEvent: (event: ServerAgentEvent) => void, signal: AbortSignal) => shareAgentStream(guestToken, sessionId, sinceSeq, onEvent, signal),
+
     /** 以下是分享态下的画布读写，走的仍是现有项目接口，只是换成 guest 令牌。 */
     project: (projectId: string, guestToken: string) => shareRequest<ServerProject>(`/v1/projects/${encodeURIComponent(projectId)}`, {}, "读取分享画布失败", guestToken),
     saveProject: (projectId: string, guestToken: string, body: { title: string; data: unknown; revision: number; clientId: string }) =>
@@ -245,6 +270,36 @@ export async function shareProjectStream(projectId: string, guestToken: string, 
                 .join("");
             buffer = buffer.slice(index + 2);
             if (data) onEvent(JSON.parse(data) as ServerProjectEvent);
+        }
+    }
+}
+
+/** 分享 Agent 只走这条 guest SSE，不接账号级 WebSocket 频道。 */
+export async function shareAgentStream(guestToken: string, sessionId: string, sinceSeq: number, onEvent: (event: ServerAgentEvent) => void, signal: AbortSignal) {
+    const response = await fetch(serverApiUrl(`/v1/agent/sessions/${encodeURIComponent(sessionId)}/stream?sinceSeq=${sinceSeq}`), {
+        headers: shareAuthHeaders(guestToken, { Accept: "text/event-stream" }),
+        signal,
+    }).catch(() => {
+        throw new ShareApiError("Agent 事件流连接失败：无法连接服务端，请检查网络", 0, "NETWORK", null);
+    });
+    if (!response.ok) throw new ShareApiError(`Agent 事件流连接失败（HTTP ${response.status}）`, response.status, "STREAM", null);
+    const reader = response.body?.getReader();
+    if (!reader) throw new ShareApiError("Agent 事件流没有返回内容", response.status, "STREAM", null);
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        buffer += decoder.decode(value, { stream: true });
+        for (let index = buffer.indexOf("\n\n"); index >= 0; index = buffer.indexOf("\n\n")) {
+            const data = buffer
+                .slice(0, index)
+                .split("\n")
+                .filter((line) => line.startsWith("data:"))
+                .map((line) => line.slice(5).trim())
+                .join("");
+            buffer = buffer.slice(index + 2);
+            if (data) onEvent(JSON.parse(data) as ServerAgentEvent);
         }
     }
 }

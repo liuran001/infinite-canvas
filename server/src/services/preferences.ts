@@ -18,10 +18,13 @@ export async function getPreferences(userId: string): Promise<Preferences> {
 export async function savePreferences(userId: string, preferences: Preferences): Promise<Preferences> {
     const users = repo(User);
     const user = await users.findOneBy({ id: userId });
-    if (!user) throw fail("用户不存在");
-    user.preferences = JSON.stringify(preferences || {});
-    user.updatedAt = now();
-    await users.save(user);
+    if (!user || user.status !== "active") throw fail("用户不存在");
+    await users.update(
+        { id: userId, status: "active", sessionVersion: user.sessionVersion },
+        { preferences: JSON.stringify(preferences || {}), updatedAt: now() },
+    );
+    const fresh = await users.findOneBy({ id: userId });
+    if (!fresh || fresh.status !== "active" || fresh.sessionVersion !== user.sessionVersion) throw fail("账号状态已变化，请重新登录");
     return preferences;
 }
 

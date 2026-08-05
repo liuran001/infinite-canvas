@@ -167,6 +167,32 @@ check("保存遇到只读响应时立即回拉权威快照", /isShareReadOnly\(e
 check("旧分享请求不会跨会话回写", /isCurrentScope\(scope/.test(shareSync) && /syncGeneration/.test(shareSync), "旧链接的异步保存或拉取仍可能污染新分享会话");
 check("同一分享的续期响应按请求序号防乱序", /sessionRequestSeq/.test(shareSession) && /requestId !== sessionRequestSeq/.test(shareSession), "并发续期的旧响应仍可能覆盖较新的权限");
 check("登录态变化立即重换分享身份", /\[status,\s*userToken\]/.test(sharePage) && /status !== "ready"[\s\S]{0,120}?refreshShareSession\(\)/.test(sharePage), "登录或退出后仍要等定时续期才刷新分享权限");
+
+console.log("分享画布界面与只读节点契约");
+const canvasTopBar = read("components/canvas/canvas-top-bar.tsx");
+const hoverToolbar = read("components/canvas/canvas-node-hover-toolbar.tsx");
+check("房主顶栏接收协作人数", /viewers\??:\s*number/.test(canvasTopBar) && /<Users/.test(canvasTopBar), "普通画布顶栏没有协作人数入口");
+check("房主画布把 Presence 人数传给顶栏", /<CanvasTopBar[\s\S]{0,1200}?viewers=\{remotePresence\.length \+ 1\}/.test(projectPage), "房主多人协作时左上角不显示人数");
+const sharedTopBar = block(projectPage, "function SharedCanvasTopBar", "function CanvasRefreshShell");
+check("分享完整画布顶栏使用图标与提示", /<Tooltip/.test(sharedTopBar) && /aria-label=/.test(sharedTopBar), "分享完整画布顶栏仍是纯文字按钮");
+check("分享完整画布顶栏不再直接渲染文字操作按钮", !/>撤销<\/button>/.test(sharedTopBar) && !/>重做<\/button>/.test(sharedTopBar) && !/>导入素材<\/button>/.test(sharedTopBar), "分享顶栏的常用操作仍以文字按钮展示");
+check("只读轻量分享保留节点指针事件", !/pointerEvents:\s*editable\s*\?\s*undefined\s*:\s*"none"/.test(sharePage), "viewer 节点整层禁用 pointer-events，无法打开只读菜单");
+check("只读分享提供节点信息菜单", /CanvasNodeInfoModal/.test(sharePage) && /节点信息/.test(sharePage), "viewer 点击节点后没有信息入口");
+check("只读分享提供下载和查看大图", /下载/.test(sharePage) && /查看大图/.test(sharePage), "viewer 缺少非编辑媒体操作");
+check("只读工具栏只保留非编辑动作", /readOnly\??:\s*boolean/.test(hoverToolbar) && /readOnly[\s\S]{0,600}?(?:info|download)/.test(hoverToolbar), "完整画布的只读工具栏没有过滤编辑动作");
+
+console.log("分享云 Agent 契约");
+const cloudStore = read("stores/use-cloud-agent-store.ts");
+const cloudPanel = read("components/agent/cloud-agent-panel.tsx");
+const shareAgentHistory = read("services/share-agent-history.ts");
+check("分享页不再强制本地 Agent", !/<AgentPanel forceLocal/.test(sharePage), "fullCanvas 分享仍禁用云 Agent");
+check("分享 API 提供 Agent 会话与消息接口", /agentSessions:/.test(shareApi) && /createAgentSession:/.test(shareApi) && /sendAgentMessage:/.test(shareApi) && /agentStream/.test(shareApi), "shareApi 缺少云 Agent 调用链");
+check("分享 Agent 发送前复用自费确认", /ensureShareBillingConsent/.test(cloudStore), "登录协作者发 Agent 消息前不会弹自费确认");
+check("分享 Agent 已有会话发送会透传自费确认", /api\.send\(sessionId,[\s\S]{0,180}?acceptSelfPay\)/.test(cloudStore) && /sendAgentMessage:[\s\S]{0,260}?acceptSelfPay/.test(shareApi), "只在新建会话时传了 acceptSelfPay，已有会话发送会被服务端拒绝");
+check("分享 Agent 续跑会透传自费确认", /api\(channel\)\.resolve|agentApi\(channel\)\.resolve/.test(cloudStore) && /resolve\(sessionId, approved, acceptSelfPay\)/.test(cloudStore) && /resolveAgentSession:[\s\S]{0,260}?acceptSelfPay/.test(shareApi), "续跑虽然弹了自费确认，但没有把同意结果交给服务端");
+check("分享 Agent 附件上传到房主画布空间", /uploadShareImage/.test(cloudStore), "分享 Agent 图片附件仍走当前账号空间");
+check("匿名 Agent 显示本地历史风险提示", /匿名访客[\s\S]{0,160}?浏览器[\s\S]{0,120}?建议登录/.test(cloudPanel), "匿名访客没有历史可能丢失的提示");
+check("匿名 Agent 历史使用 localforage", /localforage/.test(shareAgentHistory) && /shareId/.test(shareAgentHistory) && /actorId/.test(shareAgentHistory), "匿名会话没有按分享和访客身份隔离的浏览器本地持久化");
 check("远程更新不会覆盖本地待保存改动", /hasLocalChanges[\s\S]{0,500}?mergeProjectSnapshots\(scope\.state\.base, local, remote\)/.test(shareSync), "协作者更新到达时会直接丢掉本地防抖队列里的改动");
 check("异步远程水合会把期间本地编辑重放到远程快照", /pendingShareHydrationRef/.test(projectPage) && /mergeProjectSnapshots\(/.test(projectPage), "远程图片水合期间的本地编辑会覆盖远程新增内容");
 check("远程快照只跳过完全相同的保存", /matchesRenderSnapshot\(pendingRemoteRenderRef\.current/.test(projectPage), "远程更新与同批次本地编辑可能一起被误判为无需保存");
@@ -176,12 +202,20 @@ check("账号实时 ready 不提前推进已应用版本", /pullReadyRevision/.t
 check("分享协作者不会写回个人视口", /if \(!projectLoaded \|\| shared\) return;[\s\S]{0,300}?updateProject\(projectId, \{ viewport/.test(projectPage), "分享协作者移动视角会污染其他人的初始视口");
 check("插件文本生成复用分享任务计费", /generateText/.test(pluginHost) && !/requestImageQuestion/.test(pluginHost), "插件文本仍走只认账号 JWT 的同步 AI 接口，会绕过 ownerPays 与自费确认");
 check("插件图像视频文本生成都携带分享画布上下文", (pluginHost.match(/context:\s*pluginGenerationContext\(/g) || []).length >= 3 && /shared:\s*boolean/.test(pluginHost), "插件调用没有携带分享 projectId，匿名会走错账号通道，登录协作者也会绕过分享计费");
-check("完整分享工作区提供本地 Agent 面板", /<AgentPanel forceLocal/.test(sharePage) && /onToggleAgent=\{toggleAgentPanel\}/.test(projectPage) && !/if \(shared\) useAgentStore\.getState\(\)\.setCanvasContext\(null\)/.test(projectPage), "分享页没有 Agent 面板入口，或仍把分享画布上下文清空");
-check("分享 Agent 强制本地模式", /forceLocal\?: boolean/.test(agentPanel) && /!forceLocal && cloudEnabled/.test(agentPanel) && /forceLocal\?: boolean/.test(agentModeSwitch), "分享页直接开放了不具备分享鉴权和计费语义的云端 Agent");
-check("分享 Agent 禁止链接参数自动连接", /const urlAgentAutoConnect = !forceLocal &&/.test(localAgentPanel) && /const urlToken = forceLocal \? "" :/.test(localAgentPanel) && /const urlEndpoint = forceLocal \? "" :/.test(localAgentPanel) && /if \(forceLocal \|\| \(!autoConnect/.test(localAgentPanel), "分享链接仍可通过 agentUrl/agentToken 自动连接并外发画布快照");
-check("分享 Agent 必须本页手动授权连接", /manualConnectionRef/.test(localAgentPanel) && /forceLocal && !manualConnectionRef\.current/.test(localAgentPanel) && /manualConnectionRef\.current = true/.test(localAgentPanel), "分享页会继承旧页面的 enabled 状态自动连接并上报画布");
-check("分享 Agent 屏蔽账号级工具与页面跳转", /forceLocal && \(isSiteTool\(payload\.name\) \|\| payload\.name === "site_navigate"\)/.test(localAgentPanel), "分享 Agent 仍可读取账号资产、工作台或跳离当前分享画布");
+check("完整分享工作区提供 Agent 面板", /<AgentPanel \/>/.test(sharePage) && /onToggleAgent=\{toggleAgentPanel\}/.test(projectPage) && !/if \(shared\) useAgentStore\.getState\(\)\.setCanvasContext\(null\)/.test(projectPage), "分享页没有 Agent 面板入口，或仍把分享画布上下文清空");
+check("分享 Agent 绑定 guest 云通道", /bindCloudAgentProject\(projectId, shared \? "share" : "account"\)/.test(projectPage) && /channelReady/.test(cloudStore), "完整分享画布没有绑定分享 Agent 数据通道");
+check("分享 Agent 只走 SSE", /channel === "account" && realtimeAvailable\(\)/.test(cloudStore) && /shareApi\.agentStream/.test(cloudStore), "分享访客仍可能订阅账号 WebSocket 频道");
+check("分享页本地 Agent 禁止链接参数自动连接", /const restricted = forceLocal \|\| shareRestricted/.test(localAgentPanel) && /const urlAgentAutoConnect = !restricted &&/.test(localAgentPanel) && /const urlToken = restricted \? "" :/.test(localAgentPanel) && /const urlEndpoint = restricted \? "" :/.test(localAgentPanel), "分享链接仍可通过 agentUrl/agentToken 自动连接并外发画布快照");
+check("分享页本地 Agent 必须本页手动授权连接", /manualConnectionRef/.test(localAgentPanel) && /restricted && !manualConnectionRef\.current/.test(localAgentPanel) && /manualConnectionRef\.current = true/.test(localAgentPanel), "分享页会继承旧页面的 enabled 状态自动连接并上报画布");
+check("分享页本地 Agent 屏蔽账号级工具与页面跳转", /restricted && \(isSiteTool\(payload\.name\) \|\| payload\.name === "site_navigate"\)/.test(localAgentPanel), "分享 Agent 仍可读取账号资产、工作台或跳离当前分享画布");
 check("本地 Agent 产物按分享通道复制", /uploadCanvasAgentImage/.test(localAgentPanel) && /uploadShareImage/.test(localAgentPanel) && /share\.fullCanvas/.test(localAgentPanel), "本地 Agent 插入的图片仍落在协作者个人空间，房主和其他协作者无法读取");
+
+console.log("Agent 入口路由契约");
+const appTopNav = read("components/layout/app-top-nav.tsx");
+const userLayout = read("layouts/user-layout.tsx");
+check("非画布顶栏不显示 Agent 入口", !/打开 Agent/.test(appTopNav) && !/useAgentStore/.test(appTopNav), "AppTopNav 仍保留全局 Agent 按钮或状态订阅");
+check("Agent 面板只挂载在具体画布路由", /const canvasProject = \/\^\\\/canvas\\\/\[\^\/\]\+\//.test(userLayout) && /\{canvasProject \? <AgentPanel \/> : null\}/.test(userLayout), "UserLayout 仍会在非画布页面挂载 AgentPanel");
+check("普通画布保留 Local Agent 自动连接", /<LocalAgentPanel[^>]*autoConnect=\{!shareRestricted\}/.test(agentPanel), "移除全局入口时连带取消了普通画布 Local Agent 自动连接");
 
 console.log(`\n通过 ${pass}，失败 ${fail}`);
 process.exit(fail ? 1 : 0);

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Bot, CloudOff, Download, Home, Images, Loader2, Menu, PanelLeftClose, PanelLeftOpen, Plus, Redo2, Share2, Trash2, Undo2, Upload } from "lucide-react";
+import { Bot, CloudOff, Download, Home, Images, Loader2, Menu, PanelLeftClose, PanelLeftOpen, Plus, Redo2, Share2, Trash2, Undo2, Upload, Users } from "lucide-react";
 import { Dropdown, Modal, Tooltip } from "antd";
 
 import { CanvasSurfaceButton } from "@/components/canvas/canvas-surface-button";
@@ -11,6 +11,7 @@ import { useThemeStore } from "@/stores/use-theme-store";
 
 export function CanvasTopBar({
     title,
+    viewers,
     titleDraft,
     isTitleEditing,
     onTitleDraftChange,
@@ -34,6 +35,7 @@ export function CanvasTopBar({
     onToggleAgent,
 }: {
     title: string;
+    viewers?: number;
     titleDraft: string;
     isTitleEditing: boolean;
     onTitleDraftChange: (value: string) => void;
@@ -136,6 +138,18 @@ export function CanvasTopBar({
                             </button>
                         )}
                     </div>
+                    {viewers && viewers > 1 ? (
+                        <Tooltip title={`${viewers} 人正在协作`}>
+                            <span
+                                className="inline-flex h-8 shrink-0 items-center gap-1 text-xs"
+                                style={{ color: theme.node.muted }}
+                                aria-label={`${viewers} 人正在协作`}
+                            >
+                                <Users className="size-3.5" />
+                                <span>{viewers}</span>
+                            </span>
+                        </Tooltip>
+                    ) : null}
                     <CanvasSyncStatus />
                     <CompactAgentStatus status={compactAgentStatus} onClick={onToggleAgent} />
                 </div>

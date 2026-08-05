@@ -13,11 +13,13 @@ import { canvasThemes } from "@/lib/canvas-theme";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { IMAGE_FILE_ACCEPT, isImageFile } from "@/lib/image-transcode";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, seedanceReferenceLabel, seedanceVideoReferenceError, seedanceVideoReferenceHint, SEEDANCE_REFERENCE_LIMITS, SEEDANCE_VIDEO_MIME_TYPES } from "@/lib/seedance-video";
-import { adoptServerMedia, deleteStoredMedia, resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
-import { resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { adoptServerMedia, resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
+import { isStoredMediaCleared, resolveImageUrl, serverFileIdOf, serverStorageKey, uploadImage } from "@/services/image-storage";
 import { awaitVideoTask, createVideoTask, isGenerationReady, serverVideoTask, type VideoTask } from "@/services/api/generation";
+import { listAllServerJobs, serverApi, serverFileUrl, type ServerJob } from "@/services/api/server";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useJobStore } from "@/stores/use-job-store";
+import { useServerStore } from "@/stores/use-server-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import { generationCreditCost, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -28,6 +30,7 @@ type GeneratedVideo = {
     id: string;
     url: string;
     storageKey: string;
+    cleared?: boolean;
     durationMs: number;
     width: number;
     height: number;
@@ -44,6 +47,10 @@ type GenerationResult = {
 
 type GenerationLog = {
     id: string;
+    /** 服务端任务 ID 是历史记录的稳定主键；localLogId 只用于清理本机参数补充。 */
+    serverJobId?: string;
+    localLogId?: string;
+    ownerId?: string;
     createdAt: number;
     title: string;
     prompt: string;
@@ -80,6 +87,7 @@ export default function VideoPage() {
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
+    const userId = useServerStore((state) => state.user?.id || "");
     const [prompt, setPrompt] = useState("");
     const [references, setReferences] = useState<ReferenceImage[]>([]);
     const [videoReferences, setVideoReferences] = useState<ReferenceVideo[]>([]);
@@ -116,8 +124,11 @@ export default function VideoPage() {
     }, [running, startedAt]);
 
     useEffect(() => {
-        void restoreSession();
-    }, []);
+        setLogs([]);
+        setSelectedLogIds([]);
+        setPreviewLog(null);
+        if (userId) void restoreSession();
+    }, [userId]);
 
     /**
      * 本地有日志的任务由 resumePendingLogs 凭日志里的 task 续查；
@@ -321,10 +332,12 @@ export default function VideoPage() {
     };
 
     const downloadVideo = (video: GeneratedVideo) => {
+        if (video.cleared) return message.warning("视频已清除，无法下载");
         saveAs(video.url, "video.mp4");
     };
 
     const saveResultToAssets = (video: GeneratedVideo) => {
+        if (video.cleared) return message.warning("视频已清除，无法加入资产");
         addAsset({
             kind: "video",
             title: "生成视频",
@@ -361,30 +374,42 @@ export default function VideoPage() {
         setPreviewLog(null);
     };
 
-    const deleteSelectedLogs = () => {
-        const mediaKeys = logs
-            .filter((log) => selectedLogIds.includes(log.id))
-            .map((log) => log.video?.storageKey)
-            .filter((key): key is string => Boolean(key));
-        void Promise.all([deleteStoredMedia(mediaKeys), ...selectedLogIds.map((id) => logStore.removeItem(id))]).then(() => refreshLogs());
-        if (previewLog && selectedLogIds.includes(previewLog.id)) {
-            setPreviewLog(null);
-            setResults([]);
+    const deleteSelectedLogs = async () => {
+        const selected = logs.filter((log) => selectedLogIds.includes(log.id));
+        try {
+            await Promise.all(selected.map((log) => serverApi.deleteJobHistory(log.serverJobId || log.id)));
+            await Promise.all(selected.map((log) => logStore.removeItem(log.localLogId || log.id)));
+            await refreshLogs();
+            if (previewLog && selectedLogIds.includes(previewLog.id)) {
+                setPreviewLog(null);
+                setResults([]);
+            }
+            setSelectedLogIds([]);
+            setDeleteConfirmOpen(false);
+        } catch (error) {
+            await refreshLogs();
+            message.error(error instanceof Error ? error.message : "删除生成记录失败");
         }
-        setSelectedLogIds([]);
-        setDeleteConfirmOpen(false);
     };
 
     const saveLog = async (log: GenerationLog, resumePending = true) => {
-        await logStore.setItem(log.id, serializeLog(log));
+        const next = { ...log, ownerId: useServerStore.getState().user?.id || "" };
+        await logStore.setItem(next.id, serializeLog(next));
         await refreshLogs(resumePending);
     };
 
     const refreshLogs = async (resumePending = true) => {
-        const nextLogs = await readStoredLogs();
-        setLogs(nextLogs);
-        if (resumePending) resumePendingLogs(nextLogs);
-        return nextLogs;
+        const expectedUserId = useServerStore.getState().user?.id || "";
+        if (!expectedUserId) return [];
+        try {
+            const nextLogs = await readServerVideoLogs(expectedUserId);
+            if (useServerStore.getState().user?.id !== expectedUserId) return [];
+            setLogs(nextLogs);
+            if (resumePending) resumePendingLogs(nextLogs);
+            return nextLogs;
+        } catch {
+            return [];
+        }
     };
 
     const resumePendingLogs = (items: GenerationLog[]) => {
@@ -725,7 +750,11 @@ function GenerationSettings({ config, model, updateConfig, openConfigDialog }: {
 function ResultVideoCard({ video, onDownload, onSaveAsset }: { video: GeneratedVideo; onDownload: (video: GeneratedVideo) => void; onSaveAsset: (video: GeneratedVideo) => void }) {
     return (
         <div className="overflow-hidden rounded-lg border border-stone-200 bg-background dark:border-stone-800">
-            <video src={video.url} controls className="aspect-video w-full bg-black object-contain" />
+            {video.cleared ? (
+                <div className="flex aspect-video items-center justify-center bg-stone-100 text-sm text-stone-500 dark:bg-stone-900 dark:text-stone-400">视频已清除</div>
+            ) : (
+                <video src={video.url} controls className="aspect-video w-full bg-black object-contain" />
+            )}
             <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-stone-200 px-3 py-2.5 dark:border-stone-800">
                 <div className="flex min-w-0 flex-wrap gap-x-2 gap-y-1 text-xs text-stone-500 dark:text-stone-400">
                     <span>
@@ -735,10 +764,10 @@ function ResultVideoCard({ video, onDownload, onSaveAsset }: { video: GeneratedV
                     <span>{formatDuration(video.durationMs)}</span>
                 </div>
                 <div className="flex shrink-0 gap-1">
-                    <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => onSaveAsset(video)}>
+                    <Button size="small" icon={<FolderPlus className="size-3.5" />} disabled={video.cleared} onClick={() => onSaveAsset(video)}>
                         添加到资产
                     </Button>
-                    <Button size="small" icon={<Download className="size-3.5" />} onClick={() => onDownload(video)}>
+                    <Button size="small" icon={<Download className="size-3.5" />} disabled={video.cleared} onClick={() => onDownload(video)}>
                         下载
                     </Button>
                 </div>
@@ -846,6 +875,7 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                         <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none">{log.resolution}p</Tag>
                         <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none">{log.seconds}s</Tag>
                     </div>
+                    {log.video?.cleared ? <div className="mt-2 text-xs text-stone-500 dark:text-stone-400">视频已清除</div> : null}
                 </div>
                 <div className="grid justify-items-end gap-2">
                     <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color={log.status === "成功" ? "blue" : log.status === "生成中" ? "processing" : "red"}>
@@ -860,12 +890,92 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
     );
 }
 
-async function readStoredLogs() {
+async function readServerVideoLogs(ownerId: string) {
+    const [localLogs, jobs] = await Promise.all([readStoredLogs(ownerId), listAllServerJobs(["succeeded", "failed", "canceled"])]);
+    return mergeServerVideoLogs(
+        jobs.filter((job) => job.kind === "video"),
+        localLogs,
+        ownerId,
+    );
+}
+
+export function mergeServerVideoLogs(jobs: ServerJob[], localLogs: GenerationLog[], ownerId: string) {
+    const uniqueJobs = new Map(jobs.map((job) => [job.id, job]));
+    const byJobId = new Map<string, GenerationLog>();
+    const byClientJobId = new Map<string, GenerationLog>();
+    const byOutputId = new Map<string, GenerationLog>();
+    for (const log of localLogs) {
+        if (log.ownerId !== ownerId) continue;
+        if (log.serverJobId) byJobId.set(log.serverJobId, log);
+        if (log.task?.id) byJobId.set(log.task.id, log);
+        if (log.task?.clientJobId) byClientJobId.set(log.task.clientJobId, log);
+        const fileId = serverFileIdOf(log.video?.storageKey) || log.video?.id;
+        if (fileId) byOutputId.set(fileId, log);
+    }
+    return [...uniqueJobs.values()]
+        .map((job) => {
+            const local = byJobId.get(job.id) || byClientJobId.get(job.clientJobId) || job.outputs.map((file) => byOutputId.get(file.id)).find(Boolean);
+            const createdAt = validTimestamp(job.createdAt, local?.createdAt || 0);
+            const durationMs = jobDuration(job, local?.durationMs || 0);
+            const prompt = jobPrompt(job) || local?.prompt || "";
+            const file = job.outputs[0];
+            const video = file
+                ? {
+                      id: file.id,
+                      url: file.cleared ? "" : serverFileUrl(file.id),
+                      storageKey: serverStorageKey(file.id),
+                      cleared: Boolean(file.cleared),
+                      durationMs,
+                      width: file.width,
+                      height: file.height,
+                      bytes: file.bytes,
+                      mimeType: file.mimeType,
+                  }
+                : undefined;
+            const size = local?.size || (video?.width && video?.height ? `${video.width}x${video.height}` : "");
+            const resolution = local?.resolution || (video?.height ? String(video.height) : "");
+            const seconds = local?.seconds || (file?.durationMs ? String(Math.max(1, Math.round(file.durationMs / 1000))) : "");
+            const config: GenerationLogConfig = {
+                ...(local?.config || normalizeLogConfig({ model: job.model, size, resolution, seconds })),
+                model: job.model,
+                videoModel: job.model,
+                size,
+                vquality: resolution,
+                videoSeconds: seconds,
+            };
+            return {
+                id: job.id,
+                serverJobId: job.id,
+                localLogId: local?.localLogId || local?.id,
+                ownerId,
+                createdAt,
+                title: prompt.slice(0, 12) || local?.title || job.model || "未命名",
+                prompt,
+                time: formatLogTime(createdAt),
+                model: job.model,
+                config,
+                references: local?.references || [],
+                videoReferences: local?.videoReferences || [],
+                audioReferences: local?.audioReferences || [],
+                durationMs,
+                size,
+                resolution,
+                seconds,
+                status: job.status === "succeeded" ? "成功" : "失败",
+                task: { id: job.id, model: job.model, clientJobId: job.clientJobId },
+                video,
+                error: job.error || local?.error,
+            } satisfies GenerationLog;
+        })
+        .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+async function readStoredLogs(ownerId: string) {
     if (typeof window === "undefined") return [];
     try {
         const logs: GenerationLog[] = [];
         await logStore.iterate<GenerationLog, void>((value) => {
-            logs.push(value);
+            if (value.ownerId === ownerId) logs.push(value);
         });
         return (await Promise.all(logs.map(normalizeLog))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
     } catch {
@@ -874,7 +984,11 @@ async function readStoredLogs() {
 }
 
 async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog> {
-    const video = log.video?.storageKey ? { ...log.video, url: await resolveMediaUrl(log.video.storageKey, log.video.url) } : log.video;
+    let video = log.video;
+    if (video?.storageKey) {
+        const cleared = Boolean(video.cleared) || (await isStoredMediaCleared(video.storageKey));
+        video = { ...video, cleared, url: cleared ? "" : await resolveMediaUrl(video.storageKey, video.url) };
+    }
     const videoReferences = await Promise.all(
         (log.videoReferences || []).map(async (item) => ({
             ...item,
@@ -896,6 +1010,9 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
     const config = normalizeLogConfig(log);
     return {
         id: log.id || nanoid(),
+        serverJobId: log.serverJobId,
+        localLogId: log.localLogId || log.id,
+        ownerId: log.ownerId,
         createdAt: log.createdAt || Date.now(),
         title: log.title || log.model || "未命名",
         prompt: log.prompt || "",
@@ -924,6 +1041,25 @@ function serializeLog(log: GenerationLog): GenerationLog {
         audioReferences: log.audioReferences.map((item) => (item.storageKey ? { ...item, url: "" } : item)),
         video: log.video?.storageKey ? { ...log.video, url: "" } : log.video,
     };
+}
+
+function validTimestamp(value: string, fallback: number) {
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? timestamp : fallback;
+}
+
+function jobDuration(job: ServerJob, fallback: number) {
+    const startedAt = Date.parse(job.createdAt);
+    const endedAt = Date.parse(job.finishedAt || job.updatedAt);
+    return Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt >= startedAt ? endedAt - startedAt : fallback;
+}
+
+function jobPrompt(job: ServerJob) {
+    return typeof job.context?.prompt === "string" ? job.context.prompt : "";
+}
+
+function formatLogTime(createdAt: number) {
+    return createdAt ? new Date(createdAt).toLocaleString("zh-CN", { hour12: false }) : "";
 }
 
 function isSupportedAudioFile(file: File) {
@@ -1016,6 +1152,7 @@ function buildLog({
     };
     return {
         id: nanoid(),
+        ownerId: useServerStore.getState().user?.id || "",
         createdAt: Date.now(),
         title: prompt.slice(0, 12) || "未命名",
         prompt,

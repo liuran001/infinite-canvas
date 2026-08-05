@@ -2,9 +2,10 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import jwt from "jsonwebtoken";
 
 import { config } from "../config";
-import { repo } from "../db/data-source";
+import { repo, serialTransaction } from "../db/data-source";
 import { ProjectAccessLog, ProjectShare, type ShareAccessEvent, type ShareRole } from "../db/entities";
 import { fail, newId, now, RATE_LIMITED } from "../lib/errors";
+import { requireActiveAccount } from "./account-fence";
 
 /**
  * 分享 token 的存储形态：哈希与明文各存一列，职责完全分开。
@@ -156,7 +157,10 @@ export async function createShare(ownerId: string, projectId: string, input: Sha
         createdAt: now(),
         updatedAt: now(),
     });
-    await repo(ProjectShare).insert(share);
+    await serialTransaction(async (manager) => {
+        await requireActiveAccount(manager, ownerId);
+        await manager.getRepository(ProjectShare).insert(share);
+    });
     return { share, token };
 }
 

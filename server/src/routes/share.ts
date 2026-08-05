@@ -3,6 +3,7 @@ import { Router } from "express";
 import { fail, FORBIDDEN, NOT_FOUND } from "../lib/errors";
 import { handle, ok, parseQuery } from "../lib/response";
 import { accessContext, optionalAuth, requireUser, userAuth } from "../middleware/auth";
+import { disconnectAgentShareSubscribers } from "../services/agent";
 import { requestOrigin } from "../services/auth";
 import { cloneSharedProject } from "../services/project-clone";
 import { resolveProjectAccess } from "../services/project-access";
@@ -80,7 +81,10 @@ shareRouter.patch(
         };
         const updated = await updateShare(share, patch);
         // 角色、匿名编辑与付款策略变化后，在线客户端必须立刻重换 session；旧 SSE 自己不会重新鉴权。
-        if (shareRevokesAccess(share, updated)) disconnectShare(access.ownerId, projectId, share.id);
+        if (shareRevokesAccess(share, updated)) {
+            disconnectShare(access.ownerId, projectId, share.id);
+            disconnectAgentShareSubscribers(share.id);
+        }
         ok(res, withShareUrl(req, ownerShareView(updated)));
     }),
 );
@@ -94,6 +98,7 @@ shareRouter.delete(
         const share = await getOwnedShare(String(req.params.shareId), projectId, access.ownerId);
         await updateShare(share, { enabled: false });
         disconnectShare(access.ownerId, projectId, share.id);
+        disconnectAgentShareSubscribers(share.id);
         ok(res, true);
     }),
 );

@@ -5,7 +5,8 @@ import { handle, ok } from "../lib/response";
 import { accessContext, projectAuth } from "../middleware/auth";
 import { resolveProjectAccess } from "../services/project-access";
 import { fail } from "../lib/errors";
-import { cancelJob, createJob, findJobByClientId, getJob, listJobs, listJobsSince, subscribeJobs, toJobView, type JobEvent } from "../services/jobs";
+import { deleteUserGenerationHistoryJob } from "../services/generation-history";
+import { cancelJob, createJob, findJobByClientId, getJob, listJobsPage, listJobsSince, subscribeJobs, toJobView, type JobEvent } from "../services/jobs";
 
 const JOB_STATUSES: JobStatus[] = ["pending", "running", "succeeded", "failed", "canceled"];
 const JOB_KINDS: JobKind[] = ["image", "video", "audio", "text"];
@@ -75,8 +76,10 @@ jobRouter.get(
             .map((item) => item.trim())
             .filter((item): item is JobStatus => JOB_STATUSES.includes(item as JobStatus));
         const actor = await jobActor(req);
-        const items = await listJobs(actor, requested, String(req.query.since || ""), req.guest?.shareId || "");
-        ok(res, { items: await Promise.all(items.map(toJobView)) });
+        const parsedLimit = Number.parseInt(String(req.query.limit || "200"), 10);
+        const limit = Number.isFinite(parsedLimit) ? Math.min(200, Math.max(1, parsedLimit)) : 200;
+        const page = await listJobsPage(actor, requested, String(req.query.before || ""), limit, req.guest?.shareId || "");
+        ok(res, { items: await Promise.all(page.items.map(toJobView)), nextBefore: page.nextBefore });
     }),
 );
 
@@ -134,7 +137,7 @@ jobRouter.get(
             if (closed) return;
             if (replaying) buffered.push(event);
             else deliver(event);
-        }, shareId);
+        }, shareId, () => res.end());
         req.on("close", () => {
             closed = true;
             clearInterval(keepAlive);
@@ -162,6 +165,17 @@ jobRouter.get(
 );
 
 jobRouter.get("/v1/jobs/:id", projectAuth, handle(async (req, res) => ok(res, await toJobView(await getJob(await jobActor(req), String(req.params.id), req.guest?.shareId || "")))));
+
+jobRouter.delete(
+    "/v1/jobs/:id",
+    projectAuth,
+    handle(async (req, res) => {
+        // 分享页历史与协作者私有历史刻意隔离；删除只开放给账号通道，由云空间所有者处理。
+        if (req.guest || !req.user) throw fail("分享访客不能删除生成历史", 403, "SHARE_HISTORY_DELETE_FORBIDDEN");
+        await deleteUserGenerationHistoryJob(req.user.id, String(req.params.id));
+        ok(res, true);
+    }),
+);
 
 // 降级为只读只禁止继续修改画布，不应把发起者已经在跑的任务变成无法止损；取消按读权限确认仍属于该分享。
 jobRouter.post("/v1/jobs/:id/cancel", projectAuth, handle(async (req, res) => ok(res, await toJobView(await cancelJob(await jobActor(req, "read"), String(req.params.id), req.guest?.shareId || "")))));

@@ -14,13 +14,14 @@ const env = prepareEnv("verify-share");
 async function main() {
     const { check, rejects, finish } = createChecker();
     const { initDatabase, repo } = await import("./src/db/data-source");
-    const { PhysicalBlob, Project, ProjectAccessLog, ProjectShare, StoredFile, User } = await import("./src/db/entities");
+    const { Job, PhysicalBlob, Project, ProjectAccessLog, ProjectShare, StoredFile, User } = await import("./src/db/entities");
     const { createShare, findShareByToken, guestSessionOf, listShares, logShareAccess, ownerShareView, resetShareRuntimeState, scheduleShareExpiry, shareRevokesAccess, shareTokenHash, shareView, signGuestToken, updateShare, verifyGuestToken, assertShareUploadAllowed } = await import("./src/services/project-share");
     const { resolveProjectAccess } = await import("./src/services/project-access");
     const { disconnectShare, listProjectPresence, subscribeProject, updateProjectPresence } = await import("./src/services/project-realtime");
     const { cloneSharedProject } = await import("./src/services/project-clone");
     const { currentAuthUser } = await import("./src/services/auth");
-    const { saveFile } = await import("./src/services/files");
+    const { deleteFile, saveFile } = await import("./src/services/files");
+    const { archiveJobOutputs, deleteGenerationHistoryJob } = await import("./src/services/generation-history");
     const { storageOf } = await import("./src/services/quota");
     const { saveProject } = await import("./src/services/sync");
     const { now } = await import("./src/lib/errors");
@@ -32,6 +33,7 @@ async function main() {
     const projects = repo(Project);
     const files = repo(StoredFile);
     const blobs = repo(PhysicalBlob);
+    const jobs = repo(Job);
     const makeUser = async (id: string, quota: number) =>
         users.insert({ id, username: id, password: "", email: "", displayName: id, avatarUrl: "", role: "user", credits: 0, storageQuota: quota, affCode: id, affCount: 0, inviterId: "", linuxDoId: "", status: "active", lastLoginAt: "", preferences: "", extra: "", createdAt: now(), updatedAt: now() });
     const actorOf = (id: string) => ({ id, displayName: id, avatarUrl: "" });
@@ -58,6 +60,7 @@ async function main() {
     await makeUser("owner-1", 10 << 20);
     await makeUser("stranger", 10 << 20);
     await makeUser("cloner", 10 << 20);
+    await makeUser("cloner-duplicate", 10 << 20);
     await makeUser("cloner-tight", 16);
 
     const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
@@ -456,6 +459,103 @@ async function main() {
     await cloneSharedProject(cloneShare.share, "cloner");
     check("重复克隆复用克隆者已有的文件引用", await files.countBy({ userId: "cloner" }), usedBeforeRepeat);
     check("重复克隆不会重复增加引用计数", (await blobs.findOneByOrFail({ checksum: fileA.checksum })).refCount, 2);
+
+    // 同一画布可能在团队解散、旧数据导入等场景里出现两个 fileId 指向同一 checksum。
+    // 克隆必须把它们都改写到克隆者的一条逻辑文件，不能撞唯一约束导致整张画布无法保存。
+    const duplicateSource = files.create({ ...fileA, id: "file-owner-duplicate", teamId: "", dedupeKey: "legacy-scope", bytes: Number(fileA.bytes), createdAt: now() });
+    await files.insert(duplicateSource);
+    await blobs.increment({ checksum: fileA.checksum }, "refCount", 1);
+    await saveProject("owner-1", {
+        id: "p-duplicate",
+        title: "同图多引用",
+        data: { nodes: [{ id: "same-a", type: "image", metadata: { storageKey: `server:${fileA.id}` } }, { id: "same-b", type: "image", metadata: { storageKey: `server:${duplicateSource.id}` } }], connections: [] },
+        revision: 0,
+        clientId: "verify-owner-duplicate",
+    });
+    const duplicateShare = await createShare("owner-1", "p-duplicate", { role: "viewer", allowAnonymous: true, allowClone: true, expiresAt: "" });
+    const duplicateClone = await cloneSharedProject(duplicateShare.share, "cloner-duplicate");
+    const duplicateCloneRow = await projects.findOneByOrFail({ userId: "cloner-duplicate", projectId: duplicateClone.id });
+    const duplicateCloneIds = Array.from(duplicateCloneRow.data.matchAll(/server:(file-[\w-]+)/g), (matched) => matched[1]);
+    check("同 checksum 的多个源 fileId 克隆后仍保留全部节点引用", duplicateCloneIds.length, 2);
+    check("同 checksum 的多个源 fileId 复用克隆者同一 fileId", new Set(duplicateCloneIds).size, 1);
+    check("同 checksum 的多个源 fileId 只新增一条逻辑文件", await files.countBy({ userId: "cloner-duplicate" }), 1);
+
+    // 画布数据可由访客编辑，不能把外部账号的 fileId 原样带进副本，也不能只复制一半后留下半成品。
+    const validOwnerFile = await saveFile("owner-1", Buffer.from("valid owner clone file"), "image/png");
+    const foreignFile = await saveFile("stranger", Buffer.from("foreign clone file"), "image/png");
+    await saveProject("owner-1", {
+        id: "p-foreign-file",
+        title: "夹带外部文件",
+        data: {
+            nodes: [
+                { id: "valid", type: "image", metadata: { storageKey: `server:${validOwnerFile.id}` } },
+                { id: "foreign", type: "image", metadata: { storageKey: `server:${foreignFile.id}` } },
+            ],
+            connections: [],
+        },
+        revision: 0,
+        clientId: "verify-foreign-file",
+    });
+    const foreignShare = await createShare("owner-1", "p-foreign-file", { role: "viewer", allowAnonymous: true, allowClone: true, expiresAt: "" });
+    const clonerFilesBeforeForeign = await files.countBy({ userId: "cloner" });
+    const clonerProjectsBeforeForeign = await projects.countBy({ userId: "cloner" });
+    check("夹带外部账号 fileId 的画布拒绝克隆", await status(() => cloneSharedProject(foreignShare.share, "cloner")), 400);
+    check("拒绝外部 fileId 时不留下文件", await files.countBy({ userId: "cloner" }), clonerFilesBeforeForeign);
+    check("拒绝外部 fileId 时不留下画布", await projects.countBy({ userId: "cloner" }), clonerProjectsBeforeForeign);
+
+    // 房主从云空间删掉生成图后，画布仍能靠 GenerationOutput 的历史引用显示。
+    // 克隆必须把这份历史媒体转成克隆者自己的 StoredFile；继续引用房主 fileId 会在历史到期后破图，且绕过克隆者配额。
+    const historyFile = await saveFile("owner-1", Buffer.from("history-only clone image"), "image/png");
+    const historyJob = jobs.create({
+        id: "job-history-only-clone",
+        userId: "owner-1",
+        storageUserId: "owner-1",
+        payerUserId: "owner-1",
+        shareId: "",
+        clientJobId: "client-history-only-clone",
+        kind: "image",
+        status: "succeeded",
+        model: "image-model",
+        prompt: "history clone",
+        params: "{}",
+        inputFileIds: [],
+        outputFileIds: [historyFile.id],
+        text: "",
+        context: {},
+        error: "",
+        credits: 1,
+        progress: 100,
+        seq: 1,
+        upstreamTaskId: "",
+        payerKind: "user",
+        payerTeamId: "",
+        payerLogId: "",
+        storageTeamId: "",
+        createdAt: now(),
+        updatedAt: now(),
+        finishedAt: now(),
+    });
+    await jobs.insert(historyJob);
+    await archiveJobOutputs(historyJob);
+    await saveProject("owner-1", {
+        id: "p-history-only",
+        title: "仅历史媒体",
+        data: { nodes: [{ id: "history-image", type: "image", metadata: { storageKey: `server:${historyFile.id}` } }], connections: [] },
+        revision: 0,
+        clientId: "verify-history-only",
+    });
+    await deleteFile(historyFile.id, "owner-1");
+    check("仅历史媒体的原云文件已删除", await files.countBy({ id: historyFile.id }), 0);
+    const historyShare = await createShare("owner-1", "p-history-only", { role: "viewer", allowAnonymous: true, allowClone: true, expiresAt: "" });
+    const historyClone = await cloneSharedProject(historyShare.share, "cloner");
+    const historyCloneRow = await projects.findOneByOrFail({ userId: "cloner", projectId: historyClone.id });
+    const historyCloneId = Array.from(historyCloneRow.data.matchAll(/server:(file-[\w-]+)/g), (matched) => matched[1])[0];
+    check("仅历史媒体克隆后换成克隆者 fileId", historyCloneId === historyFile.id, false);
+    const historyCloneFile = await files.findOneByOrFail({ id: historyCloneId, userId: "cloner" });
+    check("仅历史媒体克隆后仍指向同一物理对象", historyCloneFile.checksum, historyFile.checksum);
+    await deleteGenerationHistoryJob(historyJob.id);
+    check("房主历史删除后克隆媒体仍保持 active", (await blobs.findOneByOrFail({ checksum: historyFile.checksum })).state, "active");
+    check("房主历史删除后克隆者文件仍存在", await files.countBy({ id: historyCloneId, userId: "cloner" }), 1);
 
     await saveProject("owner-1", { id: "p1", title: "源画布改了", data: { nodes: [], connections: [] }, revision: (await projects.findOneByOrFail({ userId: "owner-1", projectId: "p1" })).revision, clientId: "verify-owner" });
     check("源画布后续修改不影响副本", (await projects.findOneByOrFail({ userId: "cloner", projectId: cloned.id })).data.includes(clonedIds[0]), true);

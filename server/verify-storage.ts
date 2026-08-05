@@ -99,6 +99,26 @@ async function main() {
     check("复活后的物理对象不会被 GC 误删", objectExists(env.filesDir, revived.path), true);
     check("复活后引用仍可用", await files.countBy({ id: revived.id }), 1);
 
+    console.log("物理删除租约与新引用隔离");
+    const leasedBody = Buffer.from(`leased-delete-${Date.now()}`);
+    const leased = await saveFile("user-a", leasedBody, "application/octet-stream");
+    await deleteFile(leased.id, "user-a");
+    const deleteToken = "gc-test-token";
+    await blobs.update({ checksum: leased.checksum }, { state: "deleting", deleteToken, pendingSince: "2000-01-01T00:00:00.000Z", refCount: 0 });
+    const savedDuringDelete = await saveFile("user-b", leasedBody, "application/octet-stream");
+    const recoveredBlob = await blobs.findOneByOrFail({ checksum: leased.checksum });
+    check("deleting 状态下新上传改用隔离的物理路径", recoveredBlob.path !== leased.path, true);
+    check("恢复后的 blob 为 active", recoveredBlob.state, "active");
+    check("新引用只在新物理对象就绪后落库", await files.countBy({ id: savedDuringDelete.id, checksum: leased.checksum }), 1);
+    const { deleteObject } = await import("./src/services/storage");
+    await deleteObject(leased.path, leased.storage);
+    const staleDelete = await blobs.delete({ checksum: leased.checksum, state: "deleting", deleteToken, refCount: 0 });
+    check("旧 GC 令牌不能删除已恢复的 blob 行", staleDelete.affected, 0);
+    check("旧 GC 删除旧路径后新物理对象仍在", objectExists(env.filesDir, recoveredBlob.path), true);
+    check("旧 GC 完成后新引用仍有效", await files.countBy({ id: savedDuringDelete.id }), 1);
+    await deleteFile(savedDuringDelete.id, "user-b");
+    await collectPendingBlobs({ graceMs: 0 });
+
     console.log("待回收 blob 上还挂着同用户引用");
     const stale = await saveFile("user-a", otherPng, "image/png");
     await blobs.update({ checksum: stale.checksum }, { state: "pending_delete", pendingSince: "2000-01-01T00:00:00.000Z", refCount: 0 });

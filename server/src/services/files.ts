@@ -4,9 +4,10 @@ import mime from "mime-types";
 
 import { dataSource, repo, serialTransaction } from "../db/data-source";
 import { PhysicalBlob, StoredFile } from "../db/entities";
-import { isBlobChecksumConflict } from "../lib/db-errors";
+import { isBlobChecksumConflict, isUniqueViolation } from "../lib/db-errors";
 import { fail, newId, now } from "../lib/errors";
-import { markBlobPending, reviveBlob } from "./blob-gc";
+import { reconcileBlobReferences, reviveBlob } from "./blob-gc";
+import { requireActiveStorageOwner } from "./account-fence";
 import { assertQuota, ownerOfUpload } from "./quota";
 import { configuredFileStorage, deleteObject, putObject } from "./storage";
 
@@ -16,6 +17,9 @@ const AUDIO_MAX_BYTES = 30 << 20;
 export type FileMeta = { width?: number; height?: number; durationMs?: number };
 const checksumLocks = new Map<string, Promise<void>>();
 const column = (name: string) => dataSource.driver.escape(name);
+const ATTACHABLE_BLOB_STATES = ["active", "pending_delete"] as const;
+
+class BlobBusyError extends Error {}
 
 export function fileKind(mimeType: string) {
     if (mimeType.startsWith("image/")) return "image";
@@ -25,9 +29,10 @@ export function fileKind(mimeType: string) {
 }
 function maxBytes(kind: string) { return kind === "video" ? VIDEO_MAX_BYTES : kind === "audio" ? AUDIO_MAX_BYTES : IMAGE_MAX_BYTES; }
 function sizeMessage(kind: string) { return kind === "video" ? "视频超过大小限制，请使用 200MB 以内的文件" : kind === "audio" ? "音频超过大小限制，请使用 30MB 以内的文件" : "图片超过大小限制，请使用 30MB 以内的文件"; }
-function objectKey(id: string, mimeType: string) {
-    const date = new Date();
-    return `${date.getUTCFullYear()}/${String(date.getUTCMonth() + 1).padStart(2, "0")}/${id}.${mime.extension(mimeType) || "bin"}`;
+function objectKey(checksum: string, mimeType: string, suffix = "") {
+    // checksum 让多实例首次上传同一内容时写到同一个 key；即使同时 PUT，也只是相同字节覆盖相同字节，
+    // 不会像随机 key 那样产生一个数据库永远不知道的落选对象。
+    return `blobs/${checksum.slice(0, 2)}/${checksum}${suffix}.${mime.extension(mimeType) || "bin"}`;
 }
 function readImageMeta(body: Buffer, mimeType: string): FileMeta {
     if (!mimeType.startsWith("image/")) return {};
@@ -53,6 +58,81 @@ export async function storedObjectOf(file: StoredFile) {
     return blob ? { path: blob.path, storage: blob.storage } : { path: file.path, storage: file.storage };
 }
 
+async function deleteIfUnreferenced(path: string, storage: PhysicalBlob["storage"]) {
+    if (await repo(PhysicalBlob).exist({ where: { path, storage } })) return;
+    await deleteObject(path, storage).catch((error) => console.warn(`未采用物理对象回收失败 ${storage}:${path}:`, error));
+}
+
+/**
+ * 确保 checksum 对应的物理对象可安全挂新引用。deleting 已经被 GC 抢占，绝不能只把状态改回 active：
+ * GC 可能正在删旧 path。恢复时改写到带删除令牌的新 key，再用同一令牌 CAS 换 path；旧 GC 即使完成，
+ * 也只能删旧 key，删数据库行时会因令牌失效而失败。
+ */
+async function ensurePhysicalBlob(checksum: string, body: Buffer, type: string, kind: string, meta: FileMeta, imageMeta: FileMeta) {
+    const blobs = repo(PhysicalBlob);
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+        let blob = await blobs.findOneBy({ checksum });
+        if (blob?.state === "active") return blob;
+        if (blob?.state === "pending_delete") {
+            await reviveBlob(checksum);
+            continue;
+        }
+        if (blob?.state === "deleting") {
+            if (!blob.deleteToken) {
+                const token = newId("gc");
+                await blobs.update({ checksum, state: "deleting", deleteToken: "" }, { deleteToken: token, pendingSince: now() });
+                continue;
+            }
+            const storage = configuredFileStorage();
+            const previous = { path: blob.path, storage: blob.storage };
+            const replacement = objectKey(checksum, blob.mimeType || type, `-${blob.deleteToken}`);
+            await putObject(replacement, body, blob.mimeType || type, storage);
+            const recovered = await blobs.update(
+                { checksum, state: "deleting", deleteToken: blob.deleteToken },
+                { path: replacement, storage, state: "active", deleteToken: "", pendingSince: "" },
+            );
+            if (recovered.affected) {
+                if (previous.path !== replacement || previous.storage !== storage) await deleteIfUnreferenced(previous.path, previous.storage);
+                return blobs.findOneByOrFail({ checksum, state: "active" });
+            }
+            await deleteIfUnreferenced(replacement, storage);
+            continue;
+        }
+
+        const storage = configuredFileStorage();
+        const path = objectKey(checksum, type);
+        await putObject(path, body, type, storage);
+        const candidate = blobs.create({
+            checksum,
+            bytes: body.length,
+            kind,
+            mimeType: type,
+            width: meta.width || imageMeta.width || 0,
+            height: meta.height || imageMeta.height || 0,
+            durationMs: meta.durationMs || 0,
+            storage,
+            path,
+            refCount: 0,
+            state: "active",
+            deleteToken: "",
+            pendingSince: "",
+            createdAt: now(),
+        });
+        try {
+            await blobs.insert(candidate);
+        } catch (error) {
+            if (!isBlobChecksumConflict(error)) {
+                await deleteIfUnreferenced(path, storage);
+                throw error;
+            }
+        }
+        blob = await blobs.findOneBy({ checksum });
+        if (blob?.path !== path || blob.storage !== storage) await deleteIfUnreferenced(path, storage);
+        if (blob?.state === "active") return blob;
+    }
+    throw fail("文件正在回收，请稍后重试");
+}
+
 /**
  * 全局物理去重；每个归属方仍获得独立 fileId 和逻辑配额引用。
  *
@@ -70,48 +150,59 @@ export async function saveFile(userId: string, body: Buffer, mimeType: string, m
     if (body.length > maxBytes(kind)) throw fail(sizeMessage(kind));
     const owner = ownerOfUpload(userId, teamId);
     const checksum = createHash("sha256").update(body).digest("hex");
+    // 尽早挡住已经进入注销/团队停用流程的请求；真正插行时还会在同一事务内再验一次，
+    // 这一层主要避免明知不可写还先创建一个零引用物理对象。
+    await serialTransaction((manager) => requireActiveStorageOwner(manager, userId, teamId));
     return withBlobLock(checksum, async () => {
-        const existing = await repo(StoredFile).findOneBy({ userId, teamId, checksum });
+        const existing = await repo(StoredFile).findOneBy({ userId, dedupeKey: teamId, checksum });
         if (existing) {
-            // 重复上传命中去重，但物理对象可能因为对账漂移或跨实例删除被标成待回收；
-            // 直接返回会让这个引用等着被 GC 抽走底下的对象，所以先无条件复活。
-            await reviveBlob(checksum);
+            await ensurePhysicalBlob(checksum, body, type, kind, meta, readImageMeta(body, type));
+            await reconcileBlobReferences(checksum);
             return existing;
         }
         await assertQuota(owner, body.length);
         const id = newId("file");
         const imageMeta = readImageMeta(body, type);
-        let blob = await repo(PhysicalBlob).findOneBy({ checksum });
-        if (!blob) {
-            const storage = configuredFileStorage();
-            const path = objectKey(id, type);
-            await putObject(path, body, type, storage);
-            const candidate = repo(PhysicalBlob).create({ checksum, bytes: body.length, kind, mimeType: type, width: meta.width || imageMeta.width || 0, height: meta.height || imageMeta.height || 0, durationMs: meta.durationMs || 0, storage, path, refCount: 0, state: "active", pendingSince: "", createdAt: now() });
-            // 只吞「别人抢先按同一个 checksum 插进去了」这一种冲突：紧接着的 findOneByOrFail 会重新读一次。
-            // 其余错误（列长度、连接断开）必须原样抛——吞掉的话，故障会被翻译成下一行那条
-            // 毫无线索的「找不到记录」，排查时根本看不出真正坏在哪。
-            await repo(PhysicalBlob)
-                .insert(candidate)
-                .catch((error) => {
-                    if (!isBlobChecksumConflict(error)) throw error;
-                });
-            blob = await repo(PhysicalBlob).findOneByOrFail({ checksum });
-            // 多实例同时首传时只有一个 insert 能赢。输家写出的对象没人引用，必须回收；
-            // 但只允许删自己刚写的那个 key，胜出 blob 的 path 一个字节都不能碰。
-            if (blob.path !== path || blob.storage !== storage) await deleteObject(path, storage).catch((error) => console.warn(`并发上传落选对象回收失败 ${storage}:${path}:`, error));
-            if (blob.state === "pending_delete") await reviveBlob(checksum);
-        } else if (blob.state === "pending_delete") {
-            await reviveBlob(checksum);
-        }
-        const file = repo(StoredFile).create({ id, userId, teamId, kind: blob.kind, mimeType: blob.mimeType, bytes: Number(blob.bytes), width: blob.width, height: blob.height, durationMs: blob.durationMs, storage: blob.storage, path: blob.path, checksum, createdAt: now() });
+        let blob = await ensurePhysicalBlob(checksum, body, type, kind, meta, imageMeta);
+        const file = repo(StoredFile).create({ id, userId, teamId, dedupeKey: teamId, kind: blob.kind, mimeType: blob.mimeType, bytes: Number(blob.bytes), width: blob.width, height: blob.height, durationMs: blob.durationMs, storage: blob.storage, path: blob.path, checksum, createdAt: now() });
         // 走全局串行队列而不是 dataSource.transaction：SQLite 全程只有一条连接，
         // 绕过队列直接 BEGIN 会撞上别人已经打开的事务（「cannot start a transaction within a transaction」），
         // 更糟的是落进别人的事务里，对方一回滚就把这次引用计数一起抹掉。
-        await serialTransaction(async (manager) => {
-            await manager.getRepository(StoredFile).insert(file);
-            await manager.getRepository(PhysicalBlob).createQueryBuilder().update().set({ refCount: () => `${column("refCount")} + 1`, state: "active", pendingSince: "" }).where("checksum = :checksum", { checksum }).execute();
-        });
-        return file;
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+            try {
+                await serialTransaction(async (manager) => {
+                    await requireActiveStorageOwner(manager, userId, teamId);
+                    const attached = await manager
+                        .getRepository(PhysicalBlob)
+                        .createQueryBuilder()
+                        .update()
+                        .set({ refCount: () => `${column("refCount")} + 1`, state: "active", deleteToken: "", pendingSince: "" })
+                        .where("checksum = :checksum", { checksum })
+                        .andWhere(`state IN (:...states)`, { states: ATTACHABLE_BLOB_STATES })
+                        .execute();
+                    if (!attached.affected) throw new BlobBusyError();
+                    await manager.getRepository(StoredFile).insert(file);
+                });
+                return file;
+            } catch (error) {
+                if (error instanceof BlobBusyError) {
+                    blob = await ensurePhysicalBlob(checksum, body, type, kind, meta, imageMeta);
+                    Object.assign(file, { kind: blob.kind, mimeType: blob.mimeType, bytes: Number(blob.bytes), width: blob.width, height: blob.height, durationMs: blob.durationMs, storage: blob.storage, path: blob.path });
+                    continue;
+                }
+                // 多实例会各自持有进程内锁，数据库唯一约束才是最后一道去重门禁。
+                if (!isUniqueViolation(error)) {
+                    await reconcileBlobReferences(checksum).catch((reconcileError) => console.error(`回收未采用文件 ${checksum} 失败:`, reconcileError));
+                    throw error;
+                }
+                const raced = await repo(StoredFile).findOneBy({ userId, dedupeKey: teamId, checksum });
+                if (!raced) throw error;
+                await ensurePhysicalBlob(checksum, body, type, kind, meta, imageMeta);
+                await reconcileBlobReferences(checksum);
+                return raced;
+            }
+        }
+        throw fail("文件正在回收，请稍后重试");
     });
 }
 
@@ -126,7 +217,7 @@ export async function saveFileFromUrl(userId: string, url: string, meta?: FileMe
     return saveFile(userId, Buffer.from(await response.arrayBuffer()), response.headers.get("content-type") || "application/octet-stream", meta, teamId);
 }
 export async function getFile(id: string, userId?: string) {
-    const file = await repo(StoredFile).findOneBy({ id }); if (!file) throw fail("文件不存在");
+    const file = await repo(StoredFile).findOneBy({ id }); if (!file) throw fail("文件不存在", 404);
     if (userId !== undefined && file.userId && file.userId !== userId) throw fail("无权访问该文件"); return file;
 }
 export async function deleteFile(id: string, userId: string) {
@@ -137,9 +228,7 @@ export async function deleteFile(id: string, userId: string) {
             if (!deleted.affected) return;
             await manager.getRepository(PhysicalBlob).createQueryBuilder().update().set({ refCount: () => `CASE WHEN ${column("refCount")} > 0 THEN ${column("refCount")} - 1 ELSE 0 END` }).where("checksum = :checksum", { checksum: file.checksum }).execute();
         });
-        const actual = await repo(StoredFile).countBy({ checksum: file.checksum });
-        await repo(PhysicalBlob).update({ checksum: file.checksum }, { refCount: actual });
-        if (actual <= 0) await markBlobPending(file.checksum);
+        await reconcileBlobReferences(file.checksum);
     });
 }
 export async function listFiles(userId: string, ids: string[]) {

@@ -106,10 +106,14 @@ async function moveUserCredits(manager: EntityManager, userId: string, delta: nu
         .createQueryBuilder()
         .update(User)
         .set({ credits: () => (delta < 0 ? "credits - :amount" : "credits + :amount"), updatedAt: now() })
-        .where(delta < 0 ? "id = :userId AND credits >= :amount" : "id = :userId", { userId })
+        .where(delta < 0 ? "id = :userId AND status = :status AND credits >= :amount" : "id = :userId", { userId, status: "active" })
         .setParameter("amount", Math.abs(delta))
         .execute();
-    if (!result.affected) throw fail(delta < 0 ? "算力点不足" : "用户不存在");
+    if (!result.affected) {
+        const user = await users.findOneBy({ id: userId });
+        if (delta < 0 && user && user.status !== "active") throw fail("账号不可用", 403, "ACCOUNT_NOT_ACTIVE");
+        throw fail(delta < 0 ? "算力点不足" : "用户不存在");
+    }
     const user = await users.findOneBy({ id: userId });
     const logId = newId("credit");
     await manager.getRepository(CreditLog).insert({
@@ -224,7 +228,13 @@ export async function publishTeamBalance(teamId: string) {
 export async function charge(payer: Payer, credits: number, meta: ChargeMeta, persist?: ChargePersist): Promise<ChargeReceipt> {
     if (credits <= 0) {
         const receipt: ChargeReceipt = { payer, credits: 0, logId: "" };
-        if (persist) await serialTransaction((manager) => persist(manager, receipt));
+        await serialTransaction(async (manager) => {
+            if (payer.kind === "user") {
+                const user = await manager.getRepository(User).findOneBy({ id: payer.userId });
+                if (!user || user.status !== "active") throw fail("账号不可用", 403, "ACCOUNT_NOT_ACTIVE");
+            }
+            if (persist) await persist(manager, receipt);
+        });
         return receipt;
     }
     if (payer.kind === "user") {
@@ -315,8 +325,8 @@ export function payerOfJob(job: Pick<Job, "userId" | "payerUserId" | "payerKind"
     return job.payerKind === "team" && job.payerTeamId ? { kind: "team", teamId: job.payerTeamId, memberId: job.payerUserId || job.userId } : { kind: "user", userId: job.payerUserId || job.userId };
 }
 
-export function payerOfSession(session: Pick<AgentSession, "userId" | "payerKind" | "payerTeamId">): Payer {
-    return session.payerKind === "team" && session.payerTeamId ? { kind: "team", teamId: session.payerTeamId, memberId: session.userId } : { kind: "user", userId: session.userId };
+export function payerOfSession(session: Pick<AgentSession, "userId" | "payerKind" | "payerTeamId"> & { payerUserId?: string }): Payer {
+    return session.payerKind === "team" && session.payerTeamId ? { kind: "team", teamId: session.payerTeamId, memberId: session.userId } : { kind: "user", userId: session.payerUserId || session.userId };
 }
 
 /**

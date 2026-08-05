@@ -4,6 +4,7 @@ import { repo } from "../db/data-source";
 import { Job, Project, StoredFile, User, type JobKind, type JobStatus } from "../db/entities";
 import { fail } from "../lib/errors";
 import type { Query } from "../lib/response";
+import { generationOutputViews } from "./generation-history";
 
 export type JobFilter = { userId: string; status: string; kind: string };
 export type FileFilter = { userId: string; kind: string };
@@ -47,7 +48,7 @@ function pickFiles(ids: string[], files: Map<string, ReturnType<typeof toFileVie
     return ids.map((id) => files.get(id)).filter((file): file is ReturnType<typeof toFileView> => Boolean(file));
 }
 
-function toJobRow(job: Job, owners: Map<string, Owner>, files: Map<string, ReturnType<typeof toFileView>>) {
+async function toJobRow(job: Job, owners: Map<string, Owner>) {
     return {
         id: job.id,
         ...ownerOf(owners, job.userId),
@@ -58,7 +59,7 @@ function toJobRow(job: Job, owners: Map<string, Owner>, files: Map<string, Retur
         credits: job.credits,
         progress: job.progress,
         error: job.error || "",
-        outputs: pickFiles(job.outputFileIds || [], files),
+        outputs: await generationOutputViews(job),
         createdAt: job.createdAt,
         finishedAt: job.finishedAt || "",
     };
@@ -74,17 +75,16 @@ export async function listReviewJobs(query: Query, filter: JobFilter) {
     const where = like ? [{ ...base, prompt: like }, { ...base, model: like }, { ...base, id: like }] : base;
     const [rows, total] = await repo(Job).findAndCount({ where, order: { createdAt: "DESC" }, skip: query.offset, take: query.pageSize });
     const owners = await loadOwners(rows.map((row) => row.userId));
-    const files = await loadFiles(rows.flatMap((row) => row.outputFileIds || []));
-    return { items: rows.map((row) => toJobRow(row, owners, files)), total };
+    return { items: await Promise.all(rows.map((row) => toJobRow(row, owners))), total };
 }
 
 export async function getReviewJob(id: string) {
     const job = await repo(Job).findOneBy({ id });
     if (!job) throw fail("任务不存在");
     const owners = await loadOwners([job.userId]);
-    const files = await loadFiles([...(job.outputFileIds || []), ...(job.inputFileIds || [])]);
+    const files = await loadFiles(job.inputFileIds || []);
     return {
-        ...toJobRow(job, owners, files),
+        ...(await toJobRow(job, owners)),
         clientJobId: job.clientJobId,
         params: parseJson<Record<string, unknown>>(job.params, {}),
         context: job.context || {},

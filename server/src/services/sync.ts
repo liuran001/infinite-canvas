@@ -1,8 +1,9 @@
 import { MoreThan } from "typeorm";
 
-import { repo } from "../db/data-source";
+import { repo, serialTransaction } from "../db/data-source";
 import { Project, UserAsset, UserPlugin } from "../db/entities";
-import { fail, now } from "../lib/errors";
+import { fail, now, SafeError } from "../lib/errors";
+import { requireActiveAccount } from "./account-fence";
 import { releaseFiles } from "./cleanup";
 import { publishProjectDeleted, publishProjectSaved } from "./project-realtime";
 
@@ -41,9 +42,17 @@ export async function saveProject(userId: string, input: ProjectInput) {
         if (input.revision !== 0) throw fail("画布项目在其他设备上已更新，请先同步", 409, "REVISION_CONFLICT");
         // teamId 显式写空串：新画布一律归个人，归属只能之后通过受控接口显式改。
         const row = projects.create({ projectId: id, userId, title: input.title || "未命名画布", data: JSON.stringify(input.data ?? {}), revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
-        try { await projects.insert(row); } catch {
+        try {
+            await serialTransaction(async (manager) => {
+                await requireActiveAccount(manager, userId);
+                const current = await manager.getRepository(Project).findOneBy({ userId, projectId: id });
+                if (current) throw conflict(current);
+                await manager.getRepository(Project).insert(row);
+            });
+        } catch (error) {
             const current = await projects.findOneBy({ userId, projectId: id });
             if (current) throw conflict(current);
+            if (error instanceof SafeError) throw error;
             throw fail("保存画布项目失败", 500);
         }
         publishProjectSaved(userId, id, 1, input.clientId);
@@ -120,24 +129,30 @@ export async function listUserAssets(userId: string, since: string) {
 }
 export async function saveUserAsset(userId: string, input: UserAssetInput) {
     const id = input.id?.trim(); if (!id) throw fail("缺少素材 ID");
-    const assets = repo(UserAsset); const saved = await assets.findOneBy({ userId, assetId: id });
-    if (saved && input.revision !== undefined && input.revision < saved.revision) throw fail("素材在其他设备上已更新，请先同步");
-    return toAssetView(await assets.save({ assetId: id, userId, kind: input.kind || saved?.kind || "image", title: input.title || saved?.title || "", data: JSON.stringify(input.data ?? {}), revision: (saved?.revision || 0) + 1, deleted: false, createdAt: saved?.createdAt || now(), updatedAt: now() } as UserAsset));
+    return serialTransaction(async (manager) => {
+        await requireActiveAccount(manager, userId);
+        const assets = manager.getRepository(UserAsset); const saved = await assets.findOneBy({ userId, assetId: id });
+        if (saved && input.revision !== undefined && input.revision < saved.revision) throw fail("素材在其他设备上已更新，请先同步");
+        return toAssetView(await assets.save({ assetId: id, userId, kind: input.kind || saved?.kind || "image", title: input.title || saved?.title || "", data: JSON.stringify(input.data ?? {}), revision: (saved?.revision || 0) + 1, deleted: false, createdAt: saved?.createdAt || now(), updatedAt: now() } as UserAsset));
+    });
 }
 export async function deleteUserAsset(userId: string, id: string) {
     const assets = repo(UserAsset); const saved = await assets.findOneBy({ userId, assetId: id }); if (!saved) return;
-    await assets.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() }); await releaseFiles(userId, saved.data);
+    await assets.update({ userId, assetId: id, revision: saved.revision }, { deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() }); await releaseFiles(userId, saved.data);
 }
 export async function listUserPlugins(userId: string, since: string) {
     return (await repo(UserPlugin).find({ where: since ? { userId, updatedAt: MoreThan(since) } : { userId }, order: { updatedAt: "DESC" }, take: MAX_SYNC_ITEMS })).map(toPluginView);
 }
 export async function saveUserPlugin(userId: string, input: UserPluginInput) {
     const id = input.id?.trim(); if (!id) throw fail("缺少插件 ID");
-    const plugins = repo(UserPlugin); const saved = await plugins.findOneBy({ userId, pluginId: id });
-    if (saved && input.revision !== undefined && input.revision < saved.revision) throw fail("插件在其他设备上已更新，请先同步");
-    return toPluginView(await plugins.save({ pluginId: id, userId, data: JSON.stringify(input.data ?? {}), revision: (saved?.revision || 0) + 1, deleted: false, createdAt: saved?.createdAt || now(), updatedAt: now() } as UserPlugin));
+    return serialTransaction(async (manager) => {
+        await requireActiveAccount(manager, userId);
+        const plugins = manager.getRepository(UserPlugin); const saved = await plugins.findOneBy({ userId, pluginId: id });
+        if (saved && input.revision !== undefined && input.revision < saved.revision) throw fail("插件在其他设备上已更新，请先同步");
+        return toPluginView(await plugins.save({ pluginId: id, userId, data: JSON.stringify(input.data ?? {}), revision: (saved?.revision || 0) + 1, deleted: false, createdAt: saved?.createdAt || now(), updatedAt: now() } as UserPlugin));
+    });
 }
 export async function deleteUserPlugin(userId: string, id: string) {
     const plugins = repo(UserPlugin); const saved = await plugins.findOneBy({ userId, pluginId: id }); if (!saved) return;
-    await plugins.save({ ...saved, deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() });
+    await plugins.update({ userId, pluginId: id, revision: saved.revision }, { deleted: true, data: "", revision: saved.revision + 1, updatedAt: now() });
 }

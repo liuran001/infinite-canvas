@@ -10,6 +10,7 @@ import { isInviteCodeUniqueViolation, isUniqueViolation } from "../lib/db-errors
 import { newInviteCode, normalizeInviteCode } from "../lib/invite-code";
 import { requireTeamRole } from "./team-access";
 import { publishTeamMember } from "./team-realtime";
+import { requireActiveAccountForMembership } from "./account-deletion";
 
 /** 192 bit 随机值，base64url 后固定 32 个字符，远超「至少 128 bit」的要求。 */
 const TOKEN_BYTES = 24;
@@ -240,6 +241,7 @@ export async function previewTeamInvite(tokenOrCode: string, at = Date.now()) {
  */
 export async function acceptTeamInvite(tokenOrCode: string, userId: string, at = Date.now()) {
     const joined = await serialTransaction(async (manager) => {
+        await requireActiveAccountForMembership(manager, userId);
         const invite = await findInvite(manager, tokenOrCode);
         assertUsable(invite, at);
         const team = await manager.getRepository(Team).findOneBy({ id: invite.teamId });

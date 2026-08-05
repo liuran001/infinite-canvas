@@ -8,6 +8,56 @@ import { createChecker, prepareEnv } from "./verify-common";
  */
 const env = prepareEnv("verify-teams");
 
+/** 团队写入现在会锁定真实账号行；专项用例的符号 userId 也必须有 active User 夹具。 */
+async function ensureActiveUser(userId: string) {
+    const { repo } = await import("./src/db/data-source");
+    const { DEFAULT_STORAGE_QUOTA, User } = await import("./src/db/entities");
+    const { now } = await import("./src/lib/errors");
+    const users = repo(User);
+    if (await users.exist({ where: { id: userId } })) return;
+    try {
+        await users.insert({
+            id: userId,
+            username: userId,
+            password: "",
+            email: "",
+            displayName: userId,
+            displayNameCustomized: false,
+            avatarUrl: "",
+            role: "user",
+            credits: 0,
+            storageQuota: DEFAULT_STORAGE_QUOTA,
+            affCode: userId,
+            affCount: 0,
+            inviterId: "",
+            linuxDoId: "",
+            status: "active",
+            sessionVersion: 0,
+            deleteRequestedAt: "",
+            deleteFinalizingAt: "",
+            deletedAt: "",
+            deletedUsername: "",
+            lastLoginAt: "",
+            preferences: "",
+            extra: "",
+            createdAt: now(),
+            updatedAt: now(),
+        });
+    } catch (error) {
+        if (!(await users.exist({ where: { id: userId } }))) throw error;
+    }
+}
+
+async function createTeamAsActive(userId: string, input: { name?: unknown; description?: unknown; avatarUrl?: unknown }) {
+    await ensureActiveUser(userId);
+    return (await import("./src/services/teams")).createTeam(userId, input);
+}
+
+async function acceptTeamInviteAsActive(tokenOrCode: string, userId: string, at?: number) {
+    await ensureActiveUser(userId);
+    return (await import("./src/services/team-invites")).acceptTeamInvite(tokenOrCode, userId, at);
+}
+
 async function main() {
     const { check, rejects, finish } = createChecker();
     const { initDatabase, repo } = await import("./src/db/data-source");
@@ -245,7 +295,7 @@ async function main() {
     console.log("团队生命周期与 owner 不变量");
     const { createTeam, disbandTeam, getTeam, leaveTeam, listMyTeams, removeMember, transferOwner, updateMemberRole, updateTeam } = await import("./src/services/teams");
 
-    const fresh = await createTeam("user-boss", { name: "新团队" });
+    const fresh = await createTeamAsActive("user-boss", { name: "新团队" });
     check(
         "创建者即 owner",
         (
@@ -264,7 +314,7 @@ async function main() {
     );
     check("列表带上我的角色", (await listMyTeams("user-boss")).find((item) => item.id === fresh.id)?.myRole, "owner");
     check("不在团队的人列表为空", (await listMyTeams("user-outsider")).length, 0);
-    await rejects("团队名不能为空", () => createTeam("user-boss", { name: "   " }));
+    await rejects("团队名不能为空", () => createTeamAsActive("user-boss", { name: "   " }));
 
     await repo(TeamMember).insert({
         teamId: fresh.id,
@@ -344,7 +394,7 @@ async function main() {
 
     // 平台停用团队后成员仍必须能退出：退出是「保护自己」的动作，
     // 把它一起掐掉等于把人永久锁在一个已经停用的团队里，连断开关系都做不到。
-    const frozen = await createTeam("user-frozen-owner", { name: "被停用的团队" });
+    const frozen = await createTeamAsActive("user-frozen-owner", { name: "被停用的团队" });
     await repo(TeamMember).insert({ teamId: frozen.id, userId: "user-frozen-member", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-frozen-owner", joinedAt: now(), updatedAt: now() });
     await repo(Team).update({ id: frozen.id }, { status: "disabled" });
     await leaveTeam(frozen.id, "user-frozen-member");
@@ -386,9 +436,9 @@ async function main() {
 
     // 解散前留下的邀请必须一起失效，否则一条还在群里流传的链接能把人拉进一个已经没有 owner 的空壳团队。
     check("解散前的邀请已被停用", (await repo(TeamInvite).findOneByOrFail({ id: leftoverInviteId })).enabled, false);
-    await rejects("解散后旧邀请无法领取", () => acceptTeamInvite(leftoverInviteToken, "user-late-join"));
+    await rejects("解散后旧邀请无法领取", () => acceptTeamInviteAsActive(leftoverInviteToken, "user-late-join"));
 
-    const host = await createTeam("user-host", { name: "邀请团队" });
+    const host = await createTeamAsActive("user-host", { name: "邀请团队" });
     const link = await createTeamInvite(host.id, "user-host", {
         kind: "link",
         role: "member",
@@ -447,7 +497,7 @@ async function main() {
 
     check("预览返回团队名", (await previewTeamInvite(link.token)).teamName, "邀请团队");
     await rejects("无效 token 预览失败", () => previewTeamInvite("not-a-real-token"));
-    await acceptTeamInvite(link.token, "user-x");
+    await acceptTeamInviteAsActive(link.token, "user-x");
     check(
         "领取后成为 member",
         (
@@ -460,11 +510,11 @@ async function main() {
     );
     check("领取写入使用记录", await repo(TeamInviteUse).countBy({ inviteId: link.id }), 1);
 
-    await acceptTeamInvite(link.token, "user-x");
+    await acceptTeamInviteAsActive(link.token, "user-x");
     check("重复领取幂等，不新增成员", await repo(TeamMember).countBy({ teamId: host.id, userId: "user-x" }), 1);
     check("重复领取不消耗名额", (await repo(TeamInvite).findOneByOrFail({ id: link.id })).usedCount, 1);
 
-    check("手输码大小写不敏感", (await acceptTeamInvite(codeInvite.code.toLowerCase(), "user-lower")).role, "viewer");
+    check("手输码大小写不敏感", (await acceptTeamInviteAsActive(codeInvite.code.toLowerCase(), "user-lower")).role, "viewer");
 
     console.log("并发领取原子性");
     const limited = await createTeamInvite(host.id, "user-host", {
@@ -472,7 +522,7 @@ async function main() {
         role: "member",
         maxUses: 3,
     });
-    const results = await Promise.allSettled(Array.from({ length: 10 }, (_unused, index) => acceptTeamInvite(limited.token, `rush-${index}`)));
+    const results = await Promise.allSettled(Array.from({ length: 10 }, (_unused, index) => acceptTeamInviteAsActive(limited.token, `rush-${index}`)));
     check("成功数恰好等于名额上限", results.filter((item) => item.status === "fulfilled").length, 3);
     check("usedCount 不超过 maxUses", (await repo(TeamInvite).findOneByOrFail({ id: limited.id })).usedCount, 3);
     // 只数本轮 rush-* 用户：按 invitedBy 数会把更早通过同一个人加入的成员算进来，
@@ -484,14 +534,14 @@ async function main() {
         role: "member",
         maxUses: 1,
     });
-    const duel = await Promise.allSettled([acceptTeamInvite(single.code, "duel-a"), acceptTeamInvite(single.code, "duel-b")]);
+    const duel = await Promise.allSettled([acceptTeamInviteAsActive(single.code, "duel-a"), acceptTeamInviteAsActive(single.code, "duel-b")]);
     check("同时抢一个名额只有一人成功", duel.filter((item) => item.status === "fulfilled").length, 1);
     check("单名额邀请 usedCount 为 1", (await repo(TeamInvite).findOneByOrFail({ id: single.id })).usedCount, 1);
 
     // 同一个人手抖点两次链接：两次都该成功且指向同一条成员记录，只吃一个名额。
     // 「其中一次拿到 409」不是可接受的语义——用户看到的是一次莫名其妙的失败。
     const twice = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0 });
-    const sameUser = await Promise.allSettled([acceptTeamInvite(twice.token, "user-double"), acceptTeamInvite(twice.token, "user-double")]);
+    const sameUser = await Promise.allSettled([acceptTeamInviteAsActive(twice.token, "user-double"), acceptTeamInviteAsActive(twice.token, "user-double")]);
     check("同一用户并发领取两次都成功", sameUser.filter((item) => item.status === "fulfilled").length, 2);
     check("同一用户并发领取只产生一条成员记录", await repo(TeamMember).countBy({ teamId: host.id, userId: "user-double" }), 1);
     check("同一用户并发领取只消耗一个名额", (await repo(TeamInvite).findOneByOrFail({ id: twice.id })).usedCount, 1);
@@ -499,7 +549,7 @@ async function main() {
 
     // 挂起的成员再点链接，必须给一个明确的错误，而不是「返回成功但进去什么都做不了」。
     await repo(TeamMember).update({ teamId: host.id, userId: "user-double" }, { status: "suspended" });
-    await rejects("挂起成员领取邀请被明确拒绝", () => acceptTeamInvite(twice.token, "user-double"));
+    await rejects("挂起成员领取邀请被明确拒绝", () => acceptTeamInviteAsActive(twice.token, "user-double"));
     check("挂起成员领取后状态不变", (await repo(TeamMember).findOneByOrFail({ teamId: host.id, userId: "user-double" })).status, "suspended");
     check("挂起成员领取不消耗名额", (await repo(TeamInvite).findOneByOrFail({ id: twice.id })).usedCount, 1);
     await repo(TeamMember).update({ teamId: host.id, userId: "user-double" }, { status: "active" });
@@ -595,7 +645,7 @@ async function main() {
     // claimSlot 的字符串比较与 Date.parse 判定会分家，已过期的邀请在并发路径上还能被领走。
     const tz = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0, expiresAt: "2020-01-01T00:00:00+08:00" });
     check("过期时间归一化为 UTC ISO", (await repo(TeamInvite).findOneByOrFail({ id: tz.id })).expiresAt, new Date("2020-01-01T00:00:00+08:00").toISOString());
-    await rejects("带时区的过期邀请无法领取", () => acceptTeamInvite(tz.token, "user-tz"));
+    await rejects("带时区的过期邀请无法领取", () => acceptTeamInviteAsActive(tz.token, "user-tz"));
     check("带时区的过期邀请没有消耗名额", (await repo(TeamInvite).findOneByOrFail({ id: tz.id })).usedCount, 0);
     await rejects("非法过期时间被拒绝", () => createTeamInvite(host.id, "user-host", { kind: "link", role: "member", expiresAt: "明天" }));
     const tzPatch = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0 });
@@ -611,7 +661,7 @@ async function main() {
 
     const joinLink = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0 });
     await repo(Team).update({ id: host.id }, { memberLimit: 0 });
-    await acceptTeamInvite(joinLink.token, "user-broadcast");
+    await acceptTeamInviteAsActive(joinLink.token, "user-broadcast");
     check("加入后广播 member.joined", events.filter((event) => event.type === "member.joined" && event.userId === "user-broadcast").length, 1);
     check("其他团队的订阅者收不到", otherEvents.length, 0);
 
@@ -651,7 +701,7 @@ async function main() {
     check("全部退订后归零", teamListenerCount(host.id), 0);
 
     console.log("转让广播");
-    const relay = await createTeam("user-relay-a", { name: "转让广播团队" });
+    const relay = await createTeamAsActive("user-relay-a", { name: "转让广播团队" });
     await repo(TeamMember).insert({ teamId: relay.id, userId: "user-relay-b", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-relay-a", joinedAt: now(), updatedAt: now() });
     const relayEvents: Array<{ type: string; userId: string; role: string }> = [];
     const stopRelay = subscribeTeam(relay.id, "user-relay-a", (event) => relayEvents.push(event));
@@ -714,7 +764,7 @@ async function main() {
 
     // 扣费与管理员调整都必须把最新余额广播出去，否则界面上的团队余额要等用户自己刷新。
     const { charge, setTeamCredits } = await import("./src/services/billing");
-    const busTeam = await createTeam("user-bus-owner", { name: "余额广播团队" });
+    const busTeam = await createTeamAsActive("user-bus-owner", { name: "余额广播团队" });
     await repo(Team).update({ id: busTeam.id }, { credits: 100 });
     const busEvents: Array<{ type: string; credits?: number }> = [];
     const stopBus = subscribeTeam(busTeam.id, "user-bus-owner", (event) => busEvents.push(event));
@@ -730,7 +780,7 @@ async function main() {
 
     console.log("降级与挂起后断流");
     const { updateMember } = await import("./src/services/teams");
-    const guard = await createTeam("user-guard-owner", { name: "断流团队" });
+    const guard = await createTeamAsActive("user-guard-owner", { name: "断流团队" });
     await repo(TeamMember).insert({ teamId: guard.id, userId: "user-guard-m", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-guard-owner", joinedAt: now(), updatedAt: now() });
     let demoted = false;
     subscribeTeam(guard.id, "user-guard-m", () => undefined, () => {
@@ -763,7 +813,7 @@ async function main() {
     check("解散后总线上不留 listener", teamListenerCount(guard.id), 0);
 
     console.log("团队流水的可见范围");
-    const ledger = await createTeam("user-ledger-owner", { name: "流水团队" });
+    const ledger = await createTeamAsActive("user-ledger-owner", { name: "流水团队" });
     await repo(TeamMember).insert({ teamId: ledger.id, userId: "user-ledger-m", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-ledger-owner", joinedAt: now(), updatedAt: now() });
     await repo(Team).update({ id: ledger.id }, { credits: 100 });
     const { listMyTeamCreditLogs, listTeamCreditLogs } = await import("./src/services/teams");
@@ -780,12 +830,12 @@ async function main() {
     // 变成「因为用完了所以被拒」，那条断言就再也咬不住停用/过期的判定本身。
     const toDisable = await createTeamInvite(host.id, "user-host", { kind: "code", role: "member", maxUses: 0 });
     await updateTeamInvite(host.id, "user-host", toDisable.id, { enabled: false });
-    await rejects("停用后无法领取", () => acceptTeamInvite(toDisable.code, "user-y"));
+    await rejects("停用后无法领取", () => acceptTeamInviteAsActive(toDisable.code, "user-y"));
 
     const toExpire = await createTeamInvite(host.id, "user-host", { kind: "code", role: "member", maxUses: 0 });
     await updateTeamInvite(host.id, "user-host", toExpire.id, { expiresAt: new Date(Date.now() - 1000).toISOString() });
-    await rejects("过期后无法领取", () => acceptTeamInvite(toExpire.code, "user-y2"));
-    await rejects("错误 token 无法领取", () => acceptTeamInvite("not-a-real-token", "user-y"));
+    await rejects("过期后无法领取", () => acceptTeamInviteAsActive(toExpire.code, "user-y2"));
+    await rejects("错误 token 无法领取", () => acceptTeamInviteAsActive("not-a-real-token", "user-y"));
     check("停用后没有加入团队", await repo(TeamMember).countBy({ teamId: host.id, userId: "user-y" }), 0);
     check("过期后没有加入团队", await repo(TeamMember).countBy({ teamId: host.id, userId: "user-y2" }), 0);
 
@@ -794,8 +844,8 @@ async function main() {
         role: "member",
         maxUses: 1,
     });
-    await acceptTeamInvite(usedUp.token, "user-fill");
-    await rejects("名额用完后无法领取", () => acceptTeamInvite(usedUp.token, "user-late"));
+    await acceptTeamInviteAsActive(usedUp.token, "user-fill");
+    await rejects("名额用完后无法领取", () => acceptTeamInviteAsActive(usedUp.token, "user-late"));
 
     console.log("成员数上限");
     // 名额只剩一个人的位置，两个人同时抢：一个进去，另一个必须被拒且不留下任何痕迹。
@@ -803,7 +853,7 @@ async function main() {
     // 被拒那一方回滚时会把成功那一方占掉的名额一起抹掉，usedCount 从此对不上真实入队人数。
     await repo(Team).update({ id: host.id }, { memberLimit: (await repo(TeamMember).countBy({ teamId: host.id })) + 1 });
     const race = await createTeamInvite(host.id, "user-host", { kind: "link", role: "member", maxUses: 0 });
-    const raced = await Promise.allSettled([acceptTeamInvite(race.token, "user-race-a"), acceptTeamInvite(race.token, "user-race-b")]);
+    const raced = await Promise.allSettled([acceptTeamInviteAsActive(race.token, "user-race-a"), acceptTeamInviteAsActive(race.token, "user-race-b")]);
     check("只剩一个位置时只有一人挤进来", raced.filter((item) => item.status === "fulfilled").length, 1);
     check("被上限拒绝的一方不留成员记录", (await repo(TeamMember).findBy({ teamId: host.id })).filter((member) => member.userId.startsWith("user-race-")).length, 1);
     check("并发触上限后 usedCount 等于真实入队人数", (await repo(TeamInvite).findOneByOrFail({ id: race.id })).usedCount, 1);
@@ -814,7 +864,7 @@ async function main() {
         role: "member",
         maxUses: 0,
     });
-    await rejects("达到成员上限后拒绝加入", () => acceptTeamInvite(overflow.token, "user-z"));
+    await rejects("达到成员上限后拒绝加入", () => acceptTeamInviteAsActive(overflow.token, "user-z"));
     check("被拒后名额已归还", (await repo(TeamInvite).findOneByOrFail({ id: overflow.id })).usedCount, 0);
     check("被拒后没有写入成员", await repo(TeamMember).countBy({ teamId: host.id, userId: "user-z" }), 0);
 
@@ -872,7 +922,7 @@ async function memberSettings({ check, rejects }: { check: (name: string, actual
     const { now } = await import("./src/lib/errors");
 
     console.log("成员设置的入参与原子性");
-    const team = await createTeam("user-set-owner", { name: "设置团队" });
+    const team = await createTeamAsActive("user-set-owner", { name: "设置团队" });
     const member = () => repo(TeamMember).findOneByOrFail({ teamId: team.id, userId: "user-set-m" });
     await repo(TeamMember).insert({ teamId: team.id, userId: "user-set-m", role: "member", creditLimit: 7, limitWindow: "month", status: "active", invitedBy: "user-set-owner", joinedAt: now(), updatedAt: now() });
 
@@ -916,7 +966,7 @@ async function memberSettings({ check, rejects }: { check: (name: string, actual
     check("成员列表算出本人已用额度", views.find((view) => view.userId === "user-set-m")?.usedCredits, 12);
     check("不同窗口的成员各算各的", views.find((view) => view.userId === "user-set-owner")?.usedCredits, 30);
     check("批量聚合与判定口径一致", views.find((view) => view.userId === "user-set-m")?.usedCredits, await usedCreditsOfMember(team.id, "user-set-m", "day"));
-    const zero = await createTeam("user-zero", { name: "零消费团队" });
+    const zero = await createTeamAsActive("user-zero", { name: "零消费团队" });
     check("没花过钱的成员是 0 而不是缺字段", (await listMemberViews("user-zero", zero.id))[0].usedCredits, 0);
 }
 
@@ -931,7 +981,7 @@ async function backstage({ check, rejects }: { check: (name: string, actual: unk
     const { now } = await import("./src/lib/errors");
 
     console.log("平台团队后台");
-    const team = await createTeam("user-back-owner", { name: "后台团队" });
+    const team = await createTeamAsActive("user-back-owner", { name: "后台团队" });
     await repo(TeamMember).insert({ teamId: team.id, userId: "user-back-m", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-back-owner", joinedAt: now(), updatedAt: now() });
     await repo(Project).insert({ userId: "user-back-owner", projectId: "pb-1", title: "后台画布", data: "{}", revision: 1, deleted: false, teamId: team.id, createdAt: now(), updatedAt: now() });
 
@@ -1038,7 +1088,7 @@ async function projectOwnership({ check, rejects }: { check: (name: string, actu
 
     console.log("画布团队归属");
     const projects = repo(Project);
-    const owned = await createTeam("user-canvas-owner", { name: "画布团队" });
+    const owned = await createTeamAsActive("user-canvas-owner", { name: "画布团队" });
     await repo(TeamMember).insert({ teamId: owned.id, userId: "user-canvas-viewer", role: "viewer", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-canvas-owner", joinedAt: now(), updatedAt: now() });
     await projects.insert({ userId: "user-canvas-owner", projectId: "pt-1", title: "画布", data: "{}", revision: 1, deleted: false, teamId: "", createdAt: now(), updatedAt: now() });
     check("新画布默认没有团队归属", (await getProjectTeam("user-canvas-owner", "pt-1")).teamId, "");
@@ -1071,31 +1121,31 @@ async function teamLimits({ check, rejects }: { check: (name: string, actual: un
 
     console.log("团队数量上限");
     await saveSettings({ public: { team: { maxPerUser: 2 } } } as never);
-    const first = await createTeam("user-limit", { name: "上限一" });
-    await createTeam("user-limit", { name: "上限二" });
-    await rejects("超过上限时拒绝创建", () => createTeam("user-limit", { name: "上限三" }));
+    const first = await createTeamAsActive("user-limit", { name: "上限一" });
+    await createTeamAsActive("user-limit", { name: "上限二" });
+    await rejects("超过上限时拒绝创建", () => createTeamAsActive("user-limit", { name: "上限三" }));
     check("被拒的团队没有留在库里", await repo(Team).countBy({ ownerId: "user-limit" }), 2);
     // 事务回滚必须把 owner 成员行一起撤掉，否则库里会留下一条指向不存在团队的成员记录。
     check("被拒时没有留下孤儿成员行", await repo(TeamMember).countBy({ userId: "user-limit" }), 2);
 
     // 加入别人的团队不占自己的创建名额：把上限放宽一个，他仍应能建出第 3 个，
     // 哪怕此时他已经是 4 个团队的成员。数「我加入了几个」的话，这一步会被误拒。
-    const host = await createTeam("user-limit-host", { name: "别人的团队" });
+    const host = await createTeamAsActive("user-limit-host", { name: "别人的团队" });
     await repo(TeamMember).insert({ teamId: host.id, userId: "user-limit", role: "member", creditLimit: 0, limitWindow: "month", status: "active", invitedBy: "user-limit-host", joinedAt: now(), updatedAt: now() });
     await saveSettings({ public: { team: { maxPerUser: 3 } } } as never);
-    const third = await createTeam("user-limit", { name: "上限三" });
+    const third = await createTeamAsActive("user-limit", { name: "上限三" });
     check("加入他人团队不占创建名额", third.ownerId, "user-limit");
-    await rejects("放宽后的上限仍然拦得住", () => createTeam("user-limit", { name: "上限四" }));
+    await rejects("放宽后的上限仍然拦得住", () => createTeamAsActive("user-limit", { name: "上限四" }));
 
     await disbandTeam(first.id, "user-limit");
-    const revived = await createTeam("user-limit", { name: "解散后腾出的名额" });
+    const revived = await createTeamAsActive("user-limit", { name: "解散后腾出的名额" });
     check("解散的团队不占名额", revived.ownerId, "user-limit");
 
     // 0 表示不限，而它必须能被保存住：`Number(x) || 默认` 会把 0 吞成 5，管理员每存一次「不限」都会被改回去。
     await saveSettings({ public: { team: { maxPerUser: 0 } } } as never);
     const { publicSettings } = await import("./src/services/settings");
     check("不限（0）能被保存住", (await publicSettings()).team.maxPerUser, 0);
-    await createTeam("user-limit", { name: "不限之后" });
+    await createTeamAsActive("user-limit", { name: "不限之后" });
     check("不限时可以继续创建", await repo(Team).countBy({ ownerId: "user-limit", status: "active" }), 4);
     check("解散的那个仍在库里，只是不占名额", await repo(Team).countBy({ ownerId: "user-limit", status: "disbanded" }), 1);
     // 恢复默认，免得影响后面的用例。
@@ -1124,7 +1174,7 @@ async function teamStorageQuota({ check, rejects }: { check: (name: string, actu
     await makeUser("user-fs-owner", 1 << 20);
     await makeUser("user-fs-mate", 1 << 20);
 
-    const team = await createTeam("user-fs-owner", { name: "空间团队" });
+    const team = await createTeamAsActive("user-fs-owner", { name: "空间团队" });
     check("新团队拿到系统默认配额", Number((await repo(Team).findOneByOrFail({ id: team.id })).storageQuota), (await publicSettings()).team.defaultQuota);
 
     const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
@@ -1185,16 +1235,23 @@ async function teamStorageQuota({ check, rejects }: { check: (name: string, actu
     // 改系统默认值只影响之后新建的团队，已有团队一个字节都不动。
     await saveSettings({ public: { team: { defaultQuota: 7 << 20 } } } as never);
     check("改默认值不影响已有团队", Number((await repo(Team).findOneByOrFail({ id: team.id })).storageQuota), 6 << 20);
-    const fresh = await createTeam("user-fs-mate", { name: "新默认值团队" });
+    const fresh = await createTeamAsActive("user-fs-mate", { name: "新默认值团队" });
     check("新建团队用新的默认值", Number((await repo(Team).findOneByOrFail({ id: fresh.id })).storageQuota), 7 << 20);
 
-    // 解散时文件必须跟着画布回到个人名下，否则它们既不算任何人的用量、也没有任何入口能清理。
-    await repo(Project).insert({ userId: "user-fs-owner", projectId: "pfs-1", title: "团队画布", data: "{}", revision: 1, deleted: false, teamId: team.id, createdAt: now(), updatedAt: now() });
+    // 解散时文件必须跟着画布回到个人名下，但 fileId 不能为了去重被改写：同一张图可能同时被多份
+    // 画布引用，批量替换 JSON 很容易误伤。逻辑行保留，底层仍只共享一个 PhysicalBlob，配额按 checksum 去重。
+    const personalDuplicate = await saveFile("user-fs-owner", png, "image/png");
+    await repo(Project).insert({ userId: "user-fs-owner", projectId: "pfs-1", title: "团队画布", data: JSON.stringify({ nodes: [{ metadata: { storageKey: `server:${shared.id}` } }], connections: [] }), revision: 1, deleted: false, teamId: team.id, createdAt: now(), updatedAt: now() });
     const before = await usedBytes("user-fs-owner");
     await disbandTeam(team.id, "user-fs-owner");
     check("解散后团队用量归零", await usedBytesOfTeam(team.id), 0);
-    check("解散后文件回到个人名下", (await repo(StoredFile).findOneByOrFail({ id: shared.id })).teamId, "");
-    check("解散后个人用量涨了这些文件", (await storageOf("user-fs-owner")).used, before + png.length);
+    check("解散后团队文件保留原 fileId 并转为个人归属", (await repo(StoredFile).findOneByOrFail({ id: shared.id })).teamId, "");
+    check("解散后保留原团队去重作用域", (await repo(StoredFile).findOneByOrFail({ id: shared.id })).dedupeKey, team.id);
+    check("同图的多个逻辑 fileId 仍只对应一个物理对象", await repo(PhysicalBlob).countBy({ checksum: shared.checksum }), 1);
+    check("解散后个人用量不重复计算同一图片", (await storageOf("user-fs-owner")).used, before);
+    const returnedProject = await repo(Project).findOneByOrFail({ userId: "user-fs-owner", projectId: "pfs-1" });
+    check("解散后画布继续引用原团队 fileId", returnedProject.data.includes(`server:${shared.id}`), true);
+    check("解散不会把引用误写成另一条个人 fileId", returnedProject.data.includes(`server:${personalDuplicate.id}`), false);
 }
 
 void main();

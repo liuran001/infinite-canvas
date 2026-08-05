@@ -2,10 +2,11 @@ import { Router } from "express";
 import multer from "multer";
 
 import { config } from "../config";
-import { fail } from "../lib/errors";
+import { fail, SafeError } from "../lib/errors";
 import { handle, ok } from "../lib/response";
 import { accessContext, projectAuth, requireUser, userAuth } from "../middleware/auth";
 import { deleteFile, getFile, saveFile, storedObjectOf } from "../services/files";
+import { generationOutputObject } from "../services/generation-history";
 import { resolveProjectAccess } from "../services/project-access";
 import { assertShareUploadAllowed } from "../services/project-share";
 import { storageOf } from "../services/quota";
@@ -75,13 +76,28 @@ fileRouter.delete(
  * 好让火山方舟等上游厂商能直接回源读取参考素材。
  */
 const serveContent = handle(async (req, res) => {
-    const file = await getFile(String(req.params.id));
-    const stored = await storedObjectOf(file);
-    const total = Number(file.bytes);
+    const id = String(req.params.id);
+    let file = null;
+    try {
+        file = await getFile(id);
+    } catch (error) {
+        // 只有明确的“不存在”才能回退查历史引用；数据库/服务异常必须继续抛，不能伪装成 404。
+        if (!(error instanceof SafeError) || error.status !== 404) throw error;
+    }
+    const archived = file ? null : await generationOutputObject(id);
+    if (!file && !archived) throw fail("文件不存在", 404);
+    const stored = file ? await storedObjectOf(file) : archived!;
+    const meta = file || archived!;
+    const total = Number(meta.bytes);
     const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ""));
-    res.setHeader("Content-Type", file.mimeType);
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.setHeader("Content-Type", meta.mimeType);
+    // 历史保留策略会让同一个 fileId 从可读变为 404，不能 immutable 一年；短缓存兼顾画布加载与及时清除。
+    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=60");
     res.setHeader("Accept-Ranges", "bytes");
+    if (req.method === "HEAD") {
+        if (total) res.setHeader("Content-Length", String(total));
+        return res.end();
+    }
 
     if (range && total) {
         const start = range[1] ? Number(range[1]) : 0;
@@ -99,7 +115,6 @@ const serveContent = handle(async (req, res) => {
 
     const object = await getObject(stored.path, undefined, stored.storage);
     if (object.bytes) res.setHeader("Content-Length", String(object.bytes));
-    if (req.method === "HEAD") return res.end();
     return object.stream.pipe(res);
 });
 

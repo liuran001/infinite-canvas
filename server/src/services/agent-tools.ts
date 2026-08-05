@@ -26,7 +26,7 @@ export type AgentToolAccess = { search: boolean; image: boolean; video: boolean;
  */
 export type ToolState = { autoRenamed: boolean; action?: AgentPendingAction };
 
-export type ToolContext = { userId: string; projectId: string; sessionId: string; seq: number; access: AgentToolAccess; prefs: AgentGenerationPreference; state: ToolState; signal: AbortSignal };
+export type ToolContext = { userId: string; actorId: string; projectOwnerId: string; payerUserId: string; shareId: string; projectId: string; sessionId: string; seq: number; access: AgentToolAccess; prefs: AgentGenerationPreference; state: ToolState; signal: AbortSignal };
 
 /** 与 web/src/constant/canvas.ts 的 NODE_SPECS 保持一致，agent 建的节点才不会在前端显示成畸形尺寸或缺默认元数据。 */
 const NODE_SPECS: Record<string, { width: number; height: number; title: string; metadata: Record<string, unknown> }> = {
@@ -408,7 +408,7 @@ function delay(ms: number, signal: AbortSignal) {
  * clientJobId 由「会话 + 消息序号 + 类型」拼出来，同一次工具调用重试不会重复生成也不会重复扣费。
  */
 async function runGenerationJob(ctx: ToolContext, kind: JobKind, model: string, prompt: string, params: GenerationParams, inputFileIds: string[]) {
-    const created = await createJob(ctx.userId, {
+    const created = await createJob(ctx.actorId, {
         clientJobId: `agent-${ctx.sessionId}-${ctx.seq}-${kind}`,
         kind,
         model,
@@ -418,12 +418,15 @@ async function runGenerationJob(ctx: ToolContext, kind: JobKind, model: string, 
         context: { source: "agent", projectId: ctx.projectId, sessionId: ctx.sessionId },
         // 计费归属走独立参数而不是 context：context 是给界面看的自定义信息，不该决定谁付钱。
         billingProjectId: ctx.projectId,
+        storageUserId: ctx.projectOwnerId,
+        payerUserId: ctx.payerUserId,
+        shareId: ctx.shareId,
     });
 
     let job: Job = created;
     for (let attempt = 0; attempt < JOB_WAIT_LIMIT && (job.status === "pending" || job.status === "running"); attempt += 1) {
         await delay(JOB_WAIT_INTERVAL_MS, ctx.signal);
-        job = await getJob(ctx.userId, created.id);
+        job = await getJob(ctx.actorId, created.id);
     }
     if (job.status === "failed" || job.status === "canceled") throw fail(job.error || "生成失败");
     if (job.status !== "succeeded") throw fail("生成超时，请稍后在画布上查看任务结果");
@@ -480,7 +483,7 @@ async function generateImage(ctx: ToolContext, args: Record<string, unknown>) {
     const size = text(args, "size") || ctx.prefs.imageSize;
     const quality = text(args, "quality") || ctx.prefs.imageQuality;
     const background = text(args, "background") || ctx.prefs.imageBackground;
-    const references = await resolveFiles(ctx.userId, list(args, "referenceStorageKeys"));
+    const references = await resolveFiles(ctx.projectOwnerId, list(args, "referenceStorageKeys"));
     const { job, outputs } = await runGenerationJob(
         ctx,
         "image",
@@ -495,7 +498,7 @@ async function generateImage(ctx: ToolContext, args: Record<string, unknown>) {
         references.map((file) => file.id),
     );
 
-    return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+    return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
         const nodes = outputs.map((file, index) => {
             const spec = specOf("image");
             // 图片节点尊重原图比例，只在宽度上对齐默认尺寸。
@@ -514,7 +517,7 @@ async function generateVideo(ctx: ToolContext, args: Record<string, unknown>) {
     const model = resolveGenerationModel(settings, "video", text(args, "model"), settings.modelChannel.defaultVideoModel);
     if (!model) throw fail("系统未配置视频模型");
 
-    const references = await resolveFiles(ctx.userId, list(args, "referenceStorageKeys"));
+    const references = await resolveFiles(ctx.projectOwnerId, list(args, "referenceStorageKeys"));
     const { job, outputs } = await runGenerationJob(
         ctx,
         "video",
@@ -530,7 +533,7 @@ async function generateVideo(ctx: ToolContext, args: Record<string, unknown>) {
         references.map((file) => file.id),
     );
 
-    return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+    return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
         const node = appendNode(data, "video", args, outputMetadata(outputs[0], prompt, model));
         return { jobId: job.id, model, credits: job.credits, node: nodeSummary(node) };
     });
@@ -551,7 +554,7 @@ async function generateAudio(ctx: ToolContext, args: Record<string, unknown>) {
         ...(text(args, "instructions") ? { instructions: text(args, "instructions") } : {}),
     }, []);
 
-    return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+    return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
         const node = appendNode(data, "audio", args, outputMetadata(outputs[0], prompt, model));
         return { jobId: job.id, model, credits: job.credits, node: nodeSummary(node) };
     });
@@ -573,7 +576,7 @@ async function generateTextNode(ctx: ToolContext, args: Record<string, unknown>)
     const { job, text: content } = await runGenerationJob(ctx, "text", model, prompt, { ...(text(args, "reasoningEffort") ? { reasoningEffort: text(args, "reasoningEffort") } : {}) }, []);
     if (!content.trim()) throw fail("文本生成没有返回内容");
 
-    return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+    return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
         const node = appendNode(data, "text", args, { content, status: "success", prompt, model });
         return { jobId: job.id, model, credits: job.credits, chars: content.length, node: nodeSummary(node) };
     });
@@ -587,12 +590,12 @@ async function generateTextNode(ctx: ToolContext, args: Record<string, unknown>)
 async function renameCanvas(ctx: ToolContext, args: Record<string, unknown>) {
     const title = text(args, "title").slice(0, MAX_CANVAS_TITLE_CHARS);
     if (!title) throw fail("画布标题不能为空");
-    const project = await readProjectCanvas(ctx.userId, ctx.projectId);
+    const project = await readProjectCanvas(ctx.projectOwnerId, ctx.projectId);
     if (project.title === title) return { title, changed: false, note: "画布已经是这个标题了" };
 
     if (DEFAULT_CANVAS_TITLE.test(project.title) && !ctx.state.autoRenamed) {
         ctx.state.autoRenamed = true;
-        return { ...(await renameProjectCanvas(ctx.userId, ctx.projectId, title)), changed: true, note: "画布原来是默认标题，已直接改名；之后再要改标题都需要用户确认" };
+        return { ...(await renameProjectCanvas(ctx.projectOwnerId, ctx.projectId, title)), changed: true, note: "画布原来是默认标题，已直接改名；之后再要改标题都需要用户确认" };
     }
     ctx.state.action = { type: "rename_canvas", title, reason: text(args, "reason") };
     return { title, changed: false, pending: true, note: "已请求用户确认这次改名，等他同意后才会生效；不要重复请求" };
@@ -607,7 +610,7 @@ async function viewImage(ctx: ToolContext, args: Record<string, unknown>) {
     let key = text(args, "storageKey");
     const nodeId = text(args, "nodeId");
     if (!key && nodeId) {
-        const project = await readProjectCanvas(ctx.userId, ctx.projectId);
+        const project = await readProjectCanvas(ctx.projectOwnerId, ctx.projectId);
         const node = project.data.nodes.find((item) => item.id === nodeId);
         if (!node) throw fail(`节点不存在：${nodeId}`);
         key = typeof node.metadata?.storageKey === "string" ? node.metadata.storageKey : "";
@@ -615,7 +618,7 @@ async function viewImage(ctx: ToolContext, args: Record<string, unknown>) {
     }
     if (!key) throw fail("请指定要查看的图片节点或 storageKey");
 
-    const [file] = await resolveFiles(ctx.userId, [key]);
+    const [file] = await resolveFiles(ctx.projectOwnerId, [key]);
     if (file.kind !== "image") throw fail("只能查看图片");
     return { storageKey: storageKeyOf(file.id), mimeType: file.mimeType, width: file.width, height: file.height, note: "图片已加入对话上下文，可以直接描述或据此继续操作" };
 }
@@ -673,7 +676,7 @@ async function importImage(ctx: ToolContext, args: Record<string, unknown>) {
 
     // 走和用户上传同一条 saveFile：同样占云空间配额、同样按内容去重，配额不够时由它抛中文错误。
     // 归属跟着画布走：团队画布里导进来的图记团队的账，和用户手动上传落在同一本账上。
-    const file = await saveFile(ctx.userId, body, mimeType, {}, await storageTeamOfProject(ctx.userId, ctx.projectId));
+    const file = await saveFile(ctx.projectOwnerId, body, mimeType, {}, await storageTeamOfProject(ctx.projectOwnerId, ctx.projectId));
     return {
         storageKey: storageKeyOf(file.id),
         mimeType: file.mimeType,
@@ -686,7 +689,7 @@ async function importImage(ctx: ToolContext, args: Record<string, unknown>) {
 
 export async function runAgentTool(ctx: ToolContext, name: string, args: Record<string, unknown>): Promise<unknown> {
     if (name === "read_canvas") {
-        const project = await readProjectCanvas(ctx.userId, ctx.projectId);
+        const project = await readProjectCanvas(ctx.projectOwnerId, ctx.projectId);
         return { projectId: ctx.projectId, title: project.title, revision: project.revision, nodeCount: project.data.nodes.length, nodes: project.data.nodes.map(nodeSummary), connections: project.data.connections };
     }
 
@@ -694,8 +697,8 @@ export async function runAgentTool(ctx: ToolContext, name: string, args: Record<
         const type = text(args, "type") || "text";
         if (!NODE_SPECS[type]) throw fail(`不支持的节点类型：${type}`);
         // 引用的图片先解析出来再进事务：越权或不存在时直接报错，不会先建出一个空壳节点。
-        const [reference] = text(args, "storageKey") ? await resolveFiles(ctx.userId, [text(args, "storageKey")]) : [];
-        return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+        const [reference] = text(args, "storageKey") ? await resolveFiles(ctx.projectOwnerId, [text(args, "storageKey")]) : [];
+        return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
             const metadata: Record<string, unknown> = {};
             if (text(args, "content")) metadata.content = text(args, "content");
             if (text(args, "prompt")) metadata.prompt = text(args, "prompt");
@@ -716,7 +719,7 @@ export async function runAgentTool(ctx: ToolContext, name: string, args: Record<
 
     if (name === "update_node") {
         const nodeId = text(args, "nodeId");
-        return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+        return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
             const node = data.nodes.find((item) => item.id === nodeId);
             if (!node) throw fail(`节点不存在：${nodeId}`);
             if (text(args, "title")) node.title = text(args, "title");
@@ -737,7 +740,7 @@ export async function runAgentTool(ctx: ToolContext, name: string, args: Record<
 
     if (name === "delete_node") {
         const nodeId = text(args, "nodeId");
-        return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+        return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
             if (!data.nodes.some((item) => item.id === nodeId)) throw fail(`节点不存在：${nodeId}`);
             data.nodes = data.nodes.filter((item) => item.id !== nodeId);
             // 悬空连线会让前端渲染出指向空气的箭头，必须一并清掉。
@@ -754,7 +757,7 @@ export async function runAgentTool(ctx: ToolContext, name: string, args: Record<
         const dx = num(args, "dx") || 0;
         const dy = num(args, "dy") || 0;
         if (!dx && !dy) throw fail("横纵偏移量至少要给一个");
-        return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+        return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
             const nodes = nodeIds.map((id) => {
                 const node = data.nodes.find((item) => item.id === id);
                 if (!node) throw fail(`节点不存在：${id}`);
@@ -773,7 +776,7 @@ export async function runAgentTool(ctx: ToolContext, name: string, args: Record<
         if (!nodeIds.length) throw fail("请指定要调整归属的节点");
         if (nodeIds.length > MAX_BATCH_NODES) throw fail(`一次最多调整 ${MAX_BATCH_NODES} 个节点`);
         const groupId = text(args, "groupId");
-        return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+        return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
             if (groupId && !data.nodes.some((item) => item.id === groupId && item.type === "group")) throw fail(`组节点不存在：${groupId}`);
             if (groupId && nodeIds.includes(groupId)) throw fail("组节点不能放进它自己");
             const nodes = nodeIds.map((id) => {
@@ -795,7 +798,7 @@ export async function runAgentTool(ctx: ToolContext, name: string, args: Record<
     if (name === "connect_nodes") {
         const fromNodeId = text(args, "fromNodeId");
         const toNodeId = text(args, "toNodeId");
-        return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+        return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
             if (fromNodeId === toNodeId) throw fail("不能把节点连到自己");
             for (const id of [fromNodeId, toNodeId]) if (!data.nodes.some((item) => item.id === id)) throw fail(`节点不存在：${id}`);
             const existing = data.connections.find((item) => item.fromNodeId === fromNodeId && item.toNodeId === toNodeId);
@@ -809,7 +812,7 @@ export async function runAgentTool(ctx: ToolContext, name: string, args: Record<
     if (name === "disconnect_nodes") {
         const fromNodeId = text(args, "fromNodeId");
         const toNodeId = text(args, "toNodeId");
-        return updateProjectCanvas(ctx.userId, ctx.projectId, (data) => {
+        return updateProjectCanvas(ctx.projectOwnerId, ctx.projectId, (data) => {
             const before = data.connections.length;
             data.connections = data.connections.filter((item) => !(item.fromNodeId === fromNodeId && item.toNodeId === toNodeId));
             if (before === data.connections.length) throw fail("这两个节点之间没有连线");

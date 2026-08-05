@@ -13,6 +13,7 @@ import { useAgentStore } from "@/stores/use-agent-store";
 import { useMissingCanvasNodeIds } from "@/stores/canvas/use-canvas-store";
 import { useCloudAgentStore } from "@/stores/use-cloud-agent-store";
 import { useIsServerMode, useServerStore } from "@/stores/use-server-store";
+import { useShareStore } from "@/stores/use-share-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { AgentChatMessage, AgentPendingToolCard, AgentToolGroup, AgentWorkingMessage } from "./agent-chat-message";
 import { AgentModeSwitch } from "./agent-mode-switch";
@@ -38,8 +39,10 @@ export function CloudAgentPanel() {
     const closePanel = useAgentStore((state) => state.closePanel);
     const [tab, setTab] = useState<CloudAgentTab>("chat");
 
-    const { projectId, sessions, sessionId, sessionModel, messages, status, pendingAction, resolving, error, loading, sending, attachments } = useCloudAgentStore(
+    const { channel, anonymous, projectId, sessions, sessionId, sessionModel, messages, status, pendingAction, resolving, error, loading, sending, attachments } = useCloudAgentStore(
         useShallow((state) => ({
+            channel: state.channel,
+            anonymous: state.anonymous,
             projectId: state.projectId,
             sessions: state.sessions,
             sessionId: state.sessionId,
@@ -62,6 +65,9 @@ export function CloudAgentPanel() {
     const openSession = useCloudAgentStore((state) => state.openSession);
     const deleteSession = useCloudAgentStore((state) => state.deleteSession);
     const refreshSessions = useCloudAgentStore((state) => state.refreshSessions);
+    const shareReady = useShareStore((state) => state.status === "ready" && state.fullCanvas && state.role === "editor" && Boolean(state.guestToken));
+    const shareOwnerPays = useShareStore((state) => state.ownerPays);
+    const ready = channel === "share" ? shareReady : isServerMode;
 
     const running = status === "running";
     // 等确认时循环并没有结束：不能发新消息，但中止按钮要留着，用户随时可以直接收工。
@@ -137,7 +143,7 @@ export function CloudAgentPanel() {
 
     // 计费口径是「每发一条消息扣一次」：一条消息触发多少轮思考与工具调用都不再额外扣，文案必须说清楚，别让用户以为还按轮算。
     const billingHint = messageCost
-        ? `系统模型按「每条消息」扣费：发一条消息扣 ${messageCost} 点，这条消息触发的多轮思考与工具调用都不再额外扣点（单次最多 ${maxRounds} 轮）。`
+        ? `${channel === "share" && shareOwnerPays ? "此分享由房主支付。" : ""}系统模型按「每条消息」扣费：发一条消息扣 ${messageCost} 点，这条消息触发的多轮思考与工具调用都不再额外扣点（单次最多 ${maxRounds} 轮）。`
         : "当前模型未配置算力点消耗，本次对话不扣点。";
 
     return (
@@ -156,7 +162,7 @@ export function CloudAgentPanel() {
                 }}
                 right={
                     <>
-                        <Button size="small" type="text" disabled={!isServerMode || busy} icon={<Plus className="size-3.5" />} onClick={newSession}>
+                        <Button size="small" type="text" disabled={!ready || busy} icon={<Plus className="size-3.5" />} onClick={newSession}>
                             新会话
                         </Button>
                         <Tooltip title="收起对话">
@@ -170,7 +176,7 @@ export function CloudAgentPanel() {
                 <div className="thin-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
                     <div className="flex items-center justify-between gap-2 text-sm" style={{ color: theme.node.muted }}>
                         <span>{sessions.length ? `${sessions.length} 个会话` : "当前画布还没有会话"}</span>
-                        <Button size="small" type="text" icon={<RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} />} disabled={!isServerMode || loading} onClick={() => void refreshSessions()}>
+                        <Button size="small" type="text" icon={<RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} />} disabled={!ready || loading} onClick={() => void refreshSessions()}>
                             刷新
                         </Button>
                     </div>
@@ -230,7 +236,7 @@ export function CloudAgentPanel() {
                                     ),
                                 )
                             ) : (
-                                <CloudAgentIntro theme={theme} model={model} ready={isServerMode && Boolean(projectId)} />
+                                <CloudAgentIntro theme={theme} model={model} ready={ready && Boolean(projectId)} />
                             )}
                             {pendingAction ? (
                                 <AgentPendingToolCard {...cloudPendingCard(pendingAction)} theme={theme} deciding={resolving} onApprove={() => void resolvePending(true)} onReject={() => void resolvePending(false)} />
@@ -247,15 +253,22 @@ export function CloudAgentPanel() {
                         </div>
                     ) : null}
 
+                    {channel === "share" && anonymous ? (
+                        <div className="mx-4 mb-1 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs leading-5" style={{ borderColor: theme.node.stroke, color: theme.node.muted }}>
+                            <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+                            <span>匿名访客的 Agent 历史保存在当前浏览器，清理浏览器数据或换设备后可能丢失，建议登录后使用。</span>
+                        </div>
+                    ) : null}
+
                     <div className="flex items-center justify-center gap-3 px-4 pt-1 text-[11px] tabular-nums" style={{ color: theme.node.muted }}>
                         <Tooltip title={billingHint}>
                             <span className="cursor-help underline decoration-dotted underline-offset-2">每条消息 {messageCost} 点</span>
                         </Tooltip>
-                        <span style={credits < messageCost ? { color: "#dc2626" } : undefined}>余额 {credits} 点</span>
+                        {channel === "share" && shareOwnerPays ? <span>由房主支付</span> : <span style={credits < messageCost ? { color: "#dc2626" } : undefined}>余额 {credits} 点</span>}
                     </div>
 
                     <CloudAgentComposer
-                        disabled={!isServerMode || !projectId}
+                        disabled={!ready || !projectId}
                         sending={busy}
                         placeholder={awaiting ? "上面有一条请求在等你确认，处理完才能继续对话" : projectId ? "让系统模型帮你读取或修改当前画布，可以把画布节点拖进来作为引用" : "请先打开一个画布"}
                         theme={theme}

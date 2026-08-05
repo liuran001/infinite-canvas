@@ -51,7 +51,12 @@ syncRouter.get(
             // 无条件删会把那条还活着的记录抹掉，用户在别人画布上消失到下一次心跳为止。
             removeProjectPresence(ownerId, projectId, clientId, PRESENCE_SOURCE_HTTP);
         };
-        const unsubscribe = subscribeProject(ownerId, projectId, (event) => stream.push(event), { shareId: context.guest?.shareId, clientId, close: () => res.end() });
+        const unsubscribe = subscribeProject(ownerId, projectId, (event) => stream.push(event), {
+            shareId: context.guest?.shareId,
+            clientId,
+            principalId: context.guest?.actorId || context.user?.id || "",
+            close: () => res.end(),
+        });
         req.on("close", release);
         let access;
         try {

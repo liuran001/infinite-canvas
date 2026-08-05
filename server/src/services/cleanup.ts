@@ -27,7 +27,9 @@ export async function releaseFiles(userId: string, data: string) {
         ...assets.map((row) => row.data || ""),
         ...messages.map((row) => `${row.content || ""}\n${row.toolResult || ""}\n${JSON.stringify(row.references || [])}`),
     ].join("\n"));
-    jobs.forEach((job) => [...(job.inputFileIds || []), ...(job.outputFileIds || [])].forEach((id) => kept.add(id)));
+    // 生成产出由 GenerationOutput 单独保留物理引用，不再用 StoredFile 占着用户云空间。
+    // 这里仅保留仍作为任务输入的文件；产出离开画布/素材后可以释放云空间，但历史缩略图照常可见。
+    jobs.forEach((job) => (job.inputFileIds || []).forEach((id) => kept.add(id)));
     messages.forEach((message) => (message.attachments || []).forEach((id) => kept.add(id)));
     for (const id of ids) if (!kept.has(id)) await deleteFile(id, userId).catch(() => undefined);
 }

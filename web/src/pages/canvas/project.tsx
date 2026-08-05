@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
+import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Bot, CloudOff, Group, Loader2, Users, Video } from "lucide-react";
+import { Bot, CloudOff, Download, Group, Home, Loader2, LogIn, PanelLeftClose, PanelLeftOpen, Puzzle, Redo2, Save, Settings2, Undo2, Upload, Users, Video } from "lucide-react";
 import { saveAs } from "file-saver";
 
 import { ensureGenerationBillingConsent, generateAudio, generateImages, generateText, generateVideo, isGenerationReady, resumeImages, resumeMedia, resumeText, storeGeneratedImage } from "@/services/api/generation";
@@ -19,7 +19,7 @@ import { useAssetStore } from "@/stores/use-asset-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { cropDataUrl, splitDataUrl, upscaleDataUrl } from "@/lib/canvas/canvas-image-data";
 import { fitNodeSize, nodeSizeFromRatio } from "@/lib/canvas/canvas-node-size";
-import { App, Button, Modal } from "antd";
+import { App, Button, Modal, Tooltip } from "antd";
 import { NODE_DEFAULT_SIZE, getNodeSpec } from "@/constant/canvas";
 import { ActiveConnectionPath, ConnectionPath } from "@/components/canvas/canvas-connections";
 import { CanvasConfigComposer } from "@/components/canvas/canvas-config-composer";
@@ -54,7 +54,7 @@ import { createPresenceReporter, watchProject } from "@/services/project-realtim
 import { createSharePresenceReporter, flushShareProject, pushShareProject, watchShareProject } from "@/services/share-sync";
 import { mergeProjectSnapshots } from "@/services/project-merge";
 import { useProjectPresenceStore } from "@/stores/use-project-presence-store";
-import { useShareStore } from "@/stores/use-share-store";
+import { useShareReadOnly, useShareStore } from "@/stores/use-share-store";
 import type { ServerJob, ServerProjectPresence } from "@/services/api/server";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
@@ -250,6 +250,9 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
     const sharedCloning = useShareStore((state) => shared && state.cloning);
     const sharedDisplayName = useShareStore((state) => (shared ? state.displayName : ""));
     const sharedAnonymous = useShareStore((state) => shared && state.anonymous);
+    const sharedAgentIdentity = useShareStore((state) => (shared ? `${state.shareId}:${state.actorId}` : ""));
+    const shareReadOnly = useShareReadOnly();
+    const sharedReadOnly = shared && shareReadOnly;
     const projectId = shared ? sharedProject?.id || "" : params.id || "";
     const localAgentConnected = useAgentStore((state) => state.connected);
     const localAgentActivity = useAgentStore((state) => state.activity);
@@ -304,7 +307,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
     const consumeCloudReferenceReveal = useCloudAgentStore((state) => state.consumeReferenceReveal);
     const isServerModeReady = useIsServerMode();
     const serverToken = useServerStore((state) => state.token);
-    const cloudAgentEnabled = useServerStore((state) => !shared && Boolean(state.settings?.agent.enabled));
+    const cloudAgentEnabled = useServerStore((state) => Boolean(state.settings?.agent.enabled));
     const ownedPresence = useProjectPresenceStore((state) => (!shared && state.projectId === projectId ? state.members : EMPTY_PRESENCE));
     const remotePresence = shared ? sharedMembers : ownedPresence;
     const appliedCanvasReloadRef = useRef(0);
@@ -798,13 +801,9 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
     // 云端 Agent 的会话按画布归属，进入画布就绑定：面板没打开也会挂上事件流，
     // agent 在后台改画布时画面才能实时刷新。登录态与服务端配置是异步就绪的，就绪后要再绑一次。
     useEffect(() => {
-        if (shared) {
-            bindCloudAgentProject("");
-            return;
-        }
         if (!projectLoaded) return;
-        bindCloudAgentProject(projectId);
-    }, [bindCloudAgentProject, cloudAgentEnabled, isServerModeReady, projectId, projectLoaded, shared]);
+        bindCloudAgentProject(projectId, shared ? "share" : "account");
+    }, [bindCloudAgentProject, cloudAgentEnabled, isServerModeReady, projectId, projectLoaded, shared, sharedAgentIdentity]);
 
     // 离开画布就解绑并断开事件流，免得在别的页面对着上一张画布继续发指令；回来会重新绑定并补齐进度。
     useEffect(() => () => useCloudAgentStore.getState().bindProject(""), []);
@@ -3395,9 +3394,10 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
         <main className="flex h-full min-h-0 overflow-hidden" style={{ background: theme.canvas.background, color: theme.node.text }}>
             <CanvasSidePanel nodes={nodes} selectedNodeIds={selectedNodeIds} onFocusNode={focusNode} onPreviewNode={setPreviewNodeId} onInsertAsset={handleAssetInsert} showAssets={!shared || Boolean(serverToken)} />
             <section className="relative min-w-0 flex-1 overflow-hidden">
-                {shared ? <SharedCanvasTopBar title={currentProject?.title || "未命名画布"} titleDraft={titleDraft} isTitleEditing={titleEditing} onTitleDraftChange={setTitleDraft} onStartTitleEditing={startTitleEditing} onFinishTitleEditing={finishTitleEditing} onCancelTitleEditing={() => setTitleEditing(false)} canUndo={historyState.canUndo} canRedo={historyState.canRedo} viewers={remotePresence.length + 1} viewerName={sharedDisplayName} anonymous={sharedAnonymous} allowClone={sharedAllowClone} cloning={sharedCloning} agentOpen={agentPanelOpen} onClone={() => void cloneSharedProject()} onLogin={() => useServerStore.getState().setLoginOpen(true)} onHome={() => navigate("/")} onExport={exportCurrentProject} onImport={() => handleUploadRequest()} onOpenConfig={() => openConfigDialog(false)} onOpenPlugins={() => setPluginManagerOpen(true)} onUndo={undoCanvas} onRedo={redoCanvas} onToggleAgent={toggleAgentPanel} /> : (
+                {shared ? <SharedCanvasTopBar title={currentProject?.title || "未命名画布"} titleDraft={titleDraft} isTitleEditing={titleEditing} onTitleDraftChange={setTitleDraft} onStartTitleEditing={startTitleEditing} onFinishTitleEditing={finishTitleEditing} onCancelTitleEditing={() => setTitleEditing(false)} canUndo={historyState.canUndo} canRedo={historyState.canRedo} viewers={remotePresence.length + 1} viewerName={sharedDisplayName} anonymous={sharedAnonymous} readOnly={Boolean(sharedReadOnly)} allowClone={sharedAllowClone} cloning={sharedCloning} agentOpen={agentPanelOpen} onClone={() => void cloneSharedProject()} onLogin={() => useServerStore.getState().setLoginOpen(true)} onHome={() => navigate("/")} onExport={exportCurrentProject} onImport={() => handleUploadRequest()} onOpenConfig={() => openConfigDialog(false)} onOpenPlugins={() => setPluginManagerOpen(true)} onUndo={undoCanvas} onRedo={redoCanvas} onToggleAgent={toggleAgentPanel} /> : (
                     <CanvasTopBar
                         title={currentProject?.title || "未命名画布"}
+                        viewers={remotePresence.length + 1}
                         titleDraft={titleDraft}
                         isTitleEditing={titleEditing}
                         onTitleDraftChange={setTitleDraft}
@@ -3546,9 +3546,10 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                     ) : null}
                 </InfiniteCanvas>
 
-                <CanvasNodeHoverToolbar
+                    <CanvasNodeHoverToolbar
                     node={isNodeDragging || isNodeResizing || nodeImageSettingsOpen ? null : toolbarNode}
                     viewport={viewport}
+                    readOnly={Boolean(sharedReadOnly)}
                     extraTools={toolbarNode ? buildNodeToolbarItems(toolbarNode) : undefined}
                     onKeep={keepNodeToolbar}
                     onLeave={hideNodeToolbar}
@@ -3574,7 +3575,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                     onDelete={(node) => deleteNodes(new Set([node.id]))}
                 />
 
-                <CanvasToolbar
+                {!sharedReadOnly ? <CanvasToolbar
                     selectedCount={selectedNodeIds.size}
                     canUndo={historyState.canUndo}
                     canRedo={historyState.canRedo}
@@ -3595,7 +3596,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                     onDeselect={deselectCanvas}
                     onBackgroundModeChange={setBackgroundMode}
                     onShowImageInfoChange={setShowImageInfo}
-                />
+                /> : null}
 
                 {isMiniMapOpen ? <Minimap nodes={nodes} viewport={viewport} viewportSize={size} onViewportChange={setViewport} /> : null}
 
@@ -3604,6 +3605,11 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                 {contextMenu ? (
                     <CanvasNodeContextMenu
                         menu={contextMenu}
+                        readOnly={Boolean(sharedReadOnly)}
+                        node={contextMenu.type === "node" ? nodesRef.current.find((item) => item.id === contextMenu.nodeId) : undefined}
+                        onInfo={() => contextMenu.type === "node" && setInfoNodeId(contextMenu.nodeId)}
+                        onDownload={() => contextMenu.type === "node" && downloadNodeImage(nodesRef.current.find((item) => item.id === contextMenu.nodeId)!)}
+                        onViewImage={() => contextMenu.type === "node" && setPreviewNodeId(contextMenu.nodeId)}
                         onClose={() => setContextMenu(null)}
                         onDuplicate={() => {
                             if (contextMenu.type !== "node") return;
@@ -3691,6 +3697,7 @@ function SharedCanvasTopBar({
     viewers,
     viewerName,
     anonymous,
+    readOnly,
     allowClone,
     cloning,
     agentOpen,
@@ -3717,6 +3724,7 @@ function SharedCanvasTopBar({
     viewers: number;
     viewerName: string;
     anonymous: boolean;
+    readOnly: boolean;
     allowClone: boolean;
     cloning: boolean;
     agentOpen: boolean;
@@ -3747,16 +3755,19 @@ function SharedCanvasTopBar({
         return () => document.removeEventListener("pointerdown", close, true);
     }, [isTitleEditing, onFinishTitleEditing]);
 
-    const actionClass = "rounded-lg px-2.5 py-1.5 text-xs font-medium transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/10";
+    const actionClass = "grid size-8 place-items-center rounded-lg transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/10";
+    const action = (label: string, icon: ReactNode, onClick: () => void, options?: { disabled?: boolean; active?: boolean }) => (
+        <Tooltip title={label}>
+            <button type="button" className={actionClass} aria-label={label} aria-pressed={options?.active} disabled={options?.disabled} onClick={onClick}>
+                {icon}
+            </button>
+        </Tooltip>
+    );
     return (
-        <div className="pointer-events-none absolute left-0 right-0 top-0 z-50 flex h-16 items-center justify-between gap-3 px-3">
+        <div className="pointer-events-none absolute left-0 right-0 top-0 z-50 flex h-16 items-center justify-between gap-3 pl-1 pr-4">
             <div className="pointer-events-auto flex min-w-0 items-center gap-2">
-                <button type="button" className={actionClass} onClick={onHome}>
-                    首页
-                </button>
-                <button type="button" className={actionClass} onClick={toggleSidePanel}>
-                    {sidePanelOpen ? "收起侧栏" : "展开侧栏"}
-                </button>
+                {action(sidePanelOpen ? "收起面板" : "展开面板", sidePanelOpen ? <PanelLeftClose className="size-4" /> : <PanelLeftOpen className="size-4" />, toggleSidePanel)}
+                {action("返回首页", <Home className="size-4" />, onHome)}
                 <div ref={titleRef} className="min-w-0">
                     {isTitleEditing ? (
                         <input
@@ -3771,7 +3782,7 @@ function SharedCanvasTopBar({
                             className="max-w-[280px] bg-transparent p-0 text-lg font-semibold outline-none"
                         />
                     ) : (
-                        <button type="button" className="max-w-[280px] truncate border-b border-dashed border-transparent text-left text-lg font-semibold transition hover:border-current" onDoubleClick={onStartTitleEditing} title="双击修改画布名称">
+                        <button type="button" className="max-w-[280px] truncate border-b border-dashed border-transparent text-left text-lg font-semibold transition hover:border-current" onDoubleClick={readOnly ? undefined : onStartTitleEditing} title={readOnly ? title : "双击修改画布名称"}>
                             {title}
                         </button>
                     )}
@@ -3794,15 +3805,15 @@ function SharedCanvasTopBar({
                 ) : null}
             </div>
             <div className="pointer-events-auto flex items-center gap-1" style={{ color: theme.node.text }}>
-                <button type="button" className={actionClass} disabled={!canUndo} onClick={onUndo}>撤销</button>
-                <button type="button" className={actionClass} disabled={!canRedo} onClick={onRedo}>重做</button>
-                <button type="button" className={actionClass} onClick={onImport}>导入素材</button>
-                <button type="button" className={actionClass} onClick={onOpenConfig}>偏好</button>
-                <button type="button" className={actionClass} onClick={onOpenPlugins}>插件</button>
-                <button type="button" className={actionClass} onClick={onExport}>导出</button>
-                <button type="button" className={actionClass} aria-pressed={agentOpen} onClick={onToggleAgent}><Bot className="mr-1 inline size-3.5" />Agent</button>
-                {anonymous ? <button type="button" className={actionClass} onClick={onLogin}>登录</button> : null}
-                {allowClone ? <button type="button" className={actionClass} disabled={cloning} onClick={onClone}>{cloning ? "保存中…" : "保存到我的账号"}</button> : null}
+                {!readOnly ? action("撤销", <Undo2 className="size-4" />, onUndo, { disabled: !canUndo }) : null}
+                {!readOnly ? action("重做", <Redo2 className="size-4" />, onRedo, { disabled: !canRedo }) : null}
+                {!readOnly ? action("导入素材", <Upload className="size-4" />, onImport) : null}
+                {action("偏好设置", <Settings2 className="size-4" />, onOpenConfig)}
+                {!readOnly ? action("插件", <Puzzle className="size-4" />, onOpenPlugins) : null}
+                {action("导出画布", <Download className="size-4" />, onExport)}
+                {action("打开 Agent", <Bot className="size-4" />, onToggleAgent, { active: agentOpen })}
+                {anonymous ? action("登录", <LogIn className="size-4" />, onLogin) : null}
+                {allowClone ? action(cloning ? "正在保存到我的账号" : "保存到我的账号", cloning ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />, onClone, { disabled: cloning }) : null}
             </div>
         </div>
     );

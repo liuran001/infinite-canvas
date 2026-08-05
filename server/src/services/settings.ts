@@ -70,7 +70,13 @@ export type PublicSetting = {
         allowCustomChannel: boolean;
     };
     /** requireInvite 打开后，密码注册与第三方登录建号都必须带有效邀请码；前端据此决定要不要显示邀请码输入框。 */
-    auth: { allowRegister: boolean; requireInvite: boolean; linuxDo: { enabled: boolean } };
+    auth: {
+        allowRegister: boolean;
+        requireInvite: boolean;
+        linuxDo: { enabled: boolean };
+        /** 三个认证入口分别开关；siteKey 可公开给浏览器，Secret 只存在 private。 */
+        turnstile: { siteKey: string; loginEnabled: boolean; registerEnabled: boolean; oauthCompleteEnabled: boolean };
+    };
     /** defaultQuota 是新账号的云空间上限（字节），已有账号不受影响。 */
     storage: { remoteEnabled: boolean; defaultQuota: number };
     /**
@@ -92,12 +98,25 @@ export type PublicSetting = {
     agent: { enabled: boolean; model: string; titleModel: string; maxRounds: number; searchEnabled: boolean };
 };
 
+export type GenerationHistorySetting = {
+    /** 每个云空间所有者最多保留多少条终态任务，0 表示不限。 */
+    totalLimit: number;
+    /** 历史图片的系统保留天数，0 表示不按时间清理。 */
+    imageRetentionDays: number;
+    /** 历史图片的系统保留条数，0 表示不按条数清理。 */
+    imageRetentionCount: number;
+    /** min 命中任一上限即清理，max 必须同时超过两个已配置上限。 */
+    imageRetentionStrategy: "min" | "max";
+};
+
 export type PrivateSetting = {
     channels: ModelChannel[];
     promptSync: { enabled: boolean; cron: string };
-    auth: { linuxDo: { clientId: string; clientSecret: string } };
+    auth: { linuxDo: { clientId: string; clientSecret: string }; turnstile: { secretKey: string } };
     /** 联网搜索配置，只有管理员能看；services 里的 apiKey 与渠道密钥一样读取时脱敏、留空表示保持不变。 */
     search: { enabled: boolean; maxResults: number; services: SearchService[] };
+    /** 生成历史只由平台管理员配置，不下发给普通用户。 */
+    generationHistory: GenerationHistorySetting;
 };
 
 export type Settings = { public: PublicSetting; private: PrivateSetting };
@@ -168,15 +187,30 @@ function normalizeSearchService(service: Partial<SearchService>): SearchService 
     };
 }
 
+function nonNegativeInteger(value: unknown, fallback: number) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 function normalizePrivate(setting: Partial<PrivateSetting> | undefined): PrivateSetting {
+    const history = setting?.generationHistory;
     return {
         channels: (setting?.channels || []).map(normalizeChannel),
         promptSync: { enabled: setting?.promptSync?.enabled !== false, cron: setting?.promptSync?.cron?.trim() || "0 4 * * *" },
-        auth: { linuxDo: { clientId: setting?.auth?.linuxDo?.clientId?.trim() || "", clientSecret: setting?.auth?.linuxDo?.clientSecret || "" } },
+        auth: {
+            linuxDo: { clientId: setting?.auth?.linuxDo?.clientId?.trim() || "", clientSecret: setting?.auth?.linuxDo?.clientSecret || "" },
+            turnstile: { secretKey: setting?.auth?.turnstile?.secretKey || "" },
+        },
         search: {
             enabled: setting?.search?.enabled !== false,
             maxResults: Math.min(20, Math.max(1, Number(setting?.search?.maxResults) || 5)),
             services: (setting?.search?.services || []).map(normalizeSearchService),
+        },
+        generationHistory: {
+            totalLimit: nonNegativeInteger(history?.totalLimit, 0),
+            imageRetentionDays: nonNegativeInteger(history?.imageRetentionDays, 30),
+            imageRetentionCount: nonNegativeInteger(history?.imageRetentionCount, 100),
+            imageRetentionStrategy: history?.imageRetentionStrategy === "max" ? "max" : "min",
         },
     };
 }
@@ -215,6 +249,12 @@ function normalizePublic(setting: Partial<PublicSetting> | undefined, privateSet
             // 默认关闭：这是给「先攒一批码再放开」准备的开关，默认打开会让全新部署直接注册不进来。
             requireInvite: setting?.auth?.requireInvite === true,
             linuxDo: { enabled: Boolean(setting?.auth?.linuxDo?.enabled) },
+            turnstile: {
+                siteKey: setting?.auth?.turnstile?.siteKey?.trim() || "",
+                loginEnabled: setting?.auth?.turnstile?.loginEnabled === true,
+                registerEnabled: setting?.auth?.turnstile?.registerEnabled === true,
+                oauthCompleteEnabled: setting?.auth?.turnstile?.oauthCompleteEnabled === true,
+            },
         },
         storage: {
             remoteEnabled: setting?.storage?.remoteEnabled !== false,
@@ -278,7 +318,10 @@ function hideSecrets(settings: Settings): Settings {
         private: {
             ...settings.private,
             channels: settings.private.channels.map((channel) => ({ ...channel, apiKey: "" })),
-            auth: { linuxDo: { ...settings.private.auth.linuxDo, clientSecret: "" } },
+            auth: {
+                linuxDo: { ...settings.private.auth.linuxDo, clientSecret: "" },
+                turnstile: { ...settings.private.auth.turnstile, secretKey: "" },
+            },
             search: { ...settings.private.search, services: settings.private.search.services.map((service) => ({ ...service, apiKey: "" })) },
         },
     };
@@ -296,6 +339,7 @@ function keepSecrets(next: Settings, saved: Settings): Settings {
         return { ...channel, apiKey: matched?.apiKey || "" };
     });
     const clientSecret = next.private.auth.linuxDo.clientSecret.trim() || saved.private.auth.linuxDo.clientSecret;
+    const turnstileSecret = next.private.auth.turnstile.secretKey.trim() || saved.private.auth.turnstile.secretKey;
     // 多条搜索服务要按条目对应补密钥：先按「服务商+显示名」认人，认不出来再退回同一位置，否则调整顺序就会把 key 串到别人身上。
     const services = next.private.search.services.map((service, index) => {
         if (service.apiKey.trim()) return service;
@@ -304,7 +348,15 @@ function keepSecrets(next: Settings, saved: Settings): Settings {
     });
     return {
         public: next.public,
-        private: { ...next.private, channels, auth: { linuxDo: { ...next.private.auth.linuxDo, clientSecret } }, search: { ...next.private.search, services } },
+        private: {
+            ...next.private,
+            channels,
+            auth: {
+                linuxDo: { ...next.private.auth.linuxDo, clientSecret },
+                turnstile: { ...next.private.auth.turnstile, secretKey: turnstileSecret },
+            },
+            search: { ...next.private.search, services },
+        },
     };
 }
 
@@ -331,6 +383,10 @@ export async function saveSettings(input: Partial<Settings>) {
     // 补回「留空表示不变」的密钥后要再归一化一次：
     // agent.searchEnabled 是从搜索 key 推导出来的，先补 key 再算才不会被误判成未配置。
     const merged = normalizeSettings(keepSecrets(normalizeSettings(patched), saved));
+    const turnstile = merged.public.auth.turnstile;
+    if (turnstile.loginEnabled || turnstile.registerEnabled || turnstile.oauthCompleteEnabled) {
+        if (!turnstile.siteKey || !merged.private.auth.turnstile.secretKey) throw fail("开启验证码前请同时配置 Turnstile Site Key 和 Secret Key");
+    }
     const table = repo(Setting);
     await table.save([
         { key: "public", value: JSON.stringify(merged.public), updatedAt: now() },

@@ -1,6 +1,6 @@
 import { Modal } from "antd";
 
-import { serverApiUrl } from "@/services/api/server";
+import { expireAccountSession, serverApiUrl } from "@/services/api/server";
 import { teamApi, type TeamRole } from "@/services/api/teams";
 import { decodeSseFrames, parseSseJson } from "@/services/sse-frames";
 import { subscribeRealtime } from "@/services/realtime/connection";
@@ -96,7 +96,7 @@ async function openStream(teamId: string, onEvent: (event: TeamRealtimeEvent) =>
         throw new Error("团队实时连接失败：无法连接服务端，请检查网络");
     });
     if (response.status === 401) {
-        useServerStore.getState().clearSession();
+        expireAccountSession();
         useServerStore.getState().setLoginOpen(true);
         throw new TeamStreamError("登录状态已失效，请重新登录", 401);
     }

@@ -3,9 +3,9 @@ import { createHash } from "node:crypto";
 import { In, MoreThan } from "typeorm";
 
 import { repo } from "../db/data-source";
-import { PhysicalBlob, StoredFile } from "../db/entities";
+import { GenerationOutput, PhysicalBlob, StoredFile } from "../db/entities";
 import { now } from "../lib/errors";
-import { getObject } from "./storage";
+import { deleteObject, getObject } from "./storage";
 
 /** 分批大小。存量库可能有几十万行，全表 find() 会在启动时把整张表读进内存。 */
 const PAGE_SIZE = 500;
@@ -75,6 +75,7 @@ async function insertBlobFrom(file: StoredFile) {
             path: file.path,
             refCount: 0,
             state: "active",
+            deleteToken: "",
             pendingSince: "",
             createdAt: file.createdAt || now(),
         } as PhysicalBlob)
@@ -102,7 +103,7 @@ async function backfillChecksum(file: StoredFile) {
 }
 
 /**
- * 旧 files 表到 file_blobs 的保数据迁移。只新增和回填，不改 fileId/path，也不删除落选对象。
+ * 旧 files 表到 file_blobs 的保数据迁移。不改 fileId；所有逻辑行经 checksum 指向唯一物理对象。
  * refCount 每次都按实际引用绝对重算，因此中途退出后重跑不会重复累加。
  */
 export async function migratePhysicalBlobs() {
@@ -111,7 +112,14 @@ export async function migratePhysicalBlobs() {
     const deferred = new Set<string>();
 
     await eachFilePage(async (page) => {
-        for (const file of page) if (!file.checksum) await backfillChecksum(file);
+        for (const file of page) {
+            if (!file.checksum) await backfillChecksum(file);
+            // 新去重作用域上线前的团队文件默认是空串；只补团队行，解散后刻意保留的 dedupeKey 不能覆盖。
+            if (file.teamId && !file.dedupeKey) {
+                file.dedupeKey = file.teamId;
+                await repo(StoredFile).update({ id: file.id }, { dedupeKey: file.dedupeKey });
+            }
+        }
         const checksums = [...new Set(page.map((file) => file.checksum))];
         // 一次查出本批已有的 blob，避免每行一次 exists 查询。
         const existing = new Map((await blobs.findBy({ checksum: In(checksums) })).map((blob) => [blob.checksum, blob]));
@@ -139,13 +147,31 @@ export async function migratePhysicalBlobs() {
 
     await eachFilePage(async (page) => {
         const checksums = [...new Set(page.map((file) => file.checksum))];
-        const covered = new Set((await blobs.findBy({ checksum: In(checksums) })).map((blob) => blob.checksum));
+        const physical = await blobs.findBy({ checksum: In(checksums) });
+        const covered = new Set(physical.map((blob) => blob.checksum));
         const orphan = page.find((file) => !covered.has(file.checksum));
         if (orphan) throw new Error(`文件迁移校验失败：${orphan.id} 没有物理对象记录`);
     });
+
+    // 全量校验成功后才回收同 checksum 的落选旧对象。StoredFile.path 保留作审计/重试，实际读取始终走
+    // PhysicalBlob；下次启动会再次尝试失败的删除，因此临时 S3 故障不会变成永久泄漏。
+    const cleaned = new Set<string>();
+    await eachFilePage(async (page) => {
+        const physical = new Map((await blobs.findBy({ checksum: In([...new Set(page.map((file) => file.checksum))]) })).map((blob) => [blob.checksum, blob]));
+        for (const file of page) {
+            const winner = physical.get(file.checksum);
+            if (!winner || (winner.path === file.path && winner.storage === file.storage)) continue;
+            const key = `${file.storage}:${file.path}`;
+            if (cleaned.has(key)) continue;
+            cleaned.add(key);
+            // 极端脏数据下另一个 checksum 可能仍把这个 path 当赢家；宁可保留，也绝不能误删它。
+            if (await blobs.exist({ where: { path: file.path, storage: file.storage } })) continue;
+            await deleteObject(file.path, file.storage).catch((error) => console.warn(`历史重复物理对象回收失败 ${key}:`, error));
+        }
+    });
 }
 
-/** 按 files 的实际行数绝对重算 refCount，修正任何来源的漂移。 */
+/** 按云空间文件 + 未清除历史媒体的实际行数绝对重算 refCount，修正任何来源的漂移。 */
 export async function reconcileBlobRefCounts() {
     const blobs = repo(PhysicalBlob);
     let cursor = "";
@@ -153,19 +179,29 @@ export async function reconcileBlobRefCounts() {
         const page: PhysicalBlob[] = await blobs.find({ where: cursor ? { checksum: MoreThan(cursor) } : {}, order: { checksum: "ASC" }, take: PAGE_SIZE });
         if (!page.length) return;
         const checksums = page.map((blob) => blob.checksum);
-        const counted = await repo(StoredFile)
+        const countedFiles = await repo(StoredFile)
             .createQueryBuilder("file")
             .select("file.checksum", "checksum")
             .addSelect("COUNT(1)", "total")
             .where("file.checksum IN (:...checksums)", { checksums })
             .groupBy("file.checksum")
             .getRawMany<{ checksum: string; total: string | number }>();
-        const counts = new Map(counted.map((row) => [row.checksum, Number(row.total) || 0]));
+        const countedHistory = await repo(GenerationOutput)
+            .createQueryBuilder("output")
+            .select("output.checksum", "checksum")
+            .addSelect("COUNT(1)", "total")
+            .where("output.checksum IN (:...checksums) AND output.clearedAt = :clearedAt", { checksums, clearedAt: "" })
+            .groupBy("output.checksum")
+            .getRawMany<{ checksum: string; total: string | number }>();
+        const counts = new Map<string, number>();
+        for (const row of [...countedFiles, ...countedHistory]) counts.set(row.checksum, (counts.get(row.checksum) || 0) + (Number(row.total) || 0));
         for (const blob of page) {
+            // deleting 可能有另一个实例正在删 path；对账不能越过删除令牌把它改回 active。
+            if (blob.state === "deleting") continue;
             const count = counts.get(blob.checksum) || 0;
             const target = count
-                ? { refCount: count, state: "active" as const, pendingSince: "" }
-                : { refCount: 0, state: "pending_delete" as const, pendingSince: blob.pendingSince || now() };
+                ? { refCount: count, state: "active" as const, deleteToken: "", pendingSince: "" }
+                : { refCount: 0, state: "pending_delete" as const, deleteToken: "", pendingSince: blob.pendingSince || now() };
             // 稳定态下绝大多数行无需写库，跳过可以让重启对账在大库上接近纯读。
             if (blob.refCount === target.refCount && blob.state === target.state && blob.pendingSince === target.pendingSince) continue;
             await blobs.update({ checksum: blob.checksum }, target);

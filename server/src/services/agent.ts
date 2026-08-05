@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { MoreThan, Not } from "typeorm";
 
-import { repo } from "../db/data-source";
+import { repo, serialTransaction } from "../db/data-source";
 import { AgentMessage, AgentSession, type AgentMessageRole, type AgentPendingAction, type AgentSessionStatus } from "../db/entities";
 import { fail, newId, NOT_FOUND, now, SafeError } from "../lib/errors";
 import { readUpstreamSse, upstreamJson, upstreamStream } from "../lib/upstream";
@@ -13,6 +13,8 @@ import { getAgentGenerationPreference } from "./preferences";
 import { searchConfig } from "./search";
 import { buildChannelUrl, modelCost, modelSupportsVision, publicSettings, selectModelChannel, type ModelChannel, type PublicSetting } from "./settings";
 import { readProjectCanvas, renameProjectCanvas } from "./sync";
+import { revalidateRunningAgentSession, type AgentScope } from "./agent-access";
+import { requireActiveAccounts } from "./account-fence";
 
 /** 用户从画布拖进面板的节点引用。只带 ID / 类型 / 标题，内容让模型自己按需去取。 */
 export type AgentMessageReference = { nodeId: string; type: string; title: string; storageKey?: string };
@@ -68,6 +70,7 @@ const running = new Map<string, AbortController>();
 const sessions = () => repo(AgentSession);
 const messages = () => repo(AgentMessage);
 const busKey = (userId: string, sessionId: string) => `${userId}:${sessionId}`;
+const streamConnections = new Set<{ userId: string; shareId: string; close: () => void }>();
 
 function toSessionView(row: AgentSession): AgentSessionView {
     return {
@@ -98,10 +101,47 @@ function toMessageView(row: AgentMessage): AgentMessageView {
     };
 }
 
-export function subscribeAgentSession(userId: string, sessionId: string, listener: (event: AgentEvent) => void) {
+export function subscribeAgentSession(userId: string, sessionId: string, listener: (event: AgentEvent) => void, onClose?: () => void, shareId = "") {
     const key = busKey(userId, sessionId);
     bus.on(key, listener);
-    return () => void bus.off(key, listener);
+    const connection = onClose ? { userId, shareId, close: onClose } : null;
+    if (connection) streamConnections.add(connection);
+    return () => {
+        bus.off(key, listener);
+        if (connection) streamConnections.delete(connection);
+    };
+}
+
+export function disconnectAgentSubscribers(userId: string) {
+    let closed = 0;
+    for (const connection of [...streamConnections]) {
+        if (connection.userId !== userId) continue;
+        streamConnections.delete(connection);
+        closed += 1;
+        try {
+            connection.close();
+        } catch (error) {
+            console.warn("关闭账号 Agent 连接失败：", error);
+        }
+    }
+    return closed;
+}
+
+/** 分享策略变化或链接撤销时，Agent SSE 也必须和画布 SSE 一样立即断开并重新鉴权。 */
+export function disconnectAgentShareSubscribers(shareId: string) {
+    if (!shareId) return 0;
+    let closed = 0;
+    for (const connection of [...streamConnections]) {
+        if (connection.shareId !== shareId) continue;
+        streamConnections.delete(connection);
+        closed += 1;
+        try {
+            connection.close();
+        } catch (error) {
+            console.warn("关闭已撤销分享的 Agent 连接失败：", error);
+        }
+    }
+    return closed;
 }
 
 async function loadSession(userId: string, sessionId: string) {
@@ -146,8 +186,8 @@ async function appendMessage(session: AgentSession, role: AgentMessageRole, patc
     return row;
 }
 
-export async function listAgentSessions(userId: string, projectId: string) {
-    const rows = await sessions().find({ where: { userId, deleted: false, ...(projectId ? { projectId } : {}) }, order: { updatedAt: "DESC" }, take: 200 });
+export async function listAgentSessions(userId: string, projectId: string, shareId?: string) {
+    const rows = await sessions().find({ where: { userId, deleted: false, ...(projectId ? { projectId } : {}), ...(shareId !== undefined ? { shareId } : {}) }, order: { updatedAt: "DESC" }, take: 200 });
     return rows.map(toSessionView);
 }
 
@@ -168,43 +208,51 @@ function resolveAgentModel(settings: PublicSetting, preferred: string) {
 }
 
 /** 会话必须绑定一个存在的画布，否则工具改不到任何东西。 */
-export async function createAgentSession(userId: string, input: { sessionId: string; projectId: string; title: string; model: string }) {
+export async function createAgentSession(userId: string, input: { sessionId: string; projectId: string; title: string; model: string }, scope?: AgentScope) {
     const settings = await publicSettings();
     if (!settings.agent.enabled || !settings.capabilities.text) throw fail("画布 Agent 未开放");
     const projectId = input.projectId.trim();
     if (!projectId) throw fail("缺少画布项目 ID");
-    await readProjectCanvas(userId, projectId);
+    await readProjectCanvas(scope?.projectOwnerId || userId, projectId);
     // 画布已经按 userId 核对过，这里按它的持久归属固化付费方，同一会话所有轮次都沿用它。
-    const payer = await payerOfProject(userId, projectId);
+    const payer = scope?.payer || await payerOfProject(userId, projectId);
 
     const model = resolveAgentModel(settings, input.model);
     if (!model) throw fail("系统未配置 Agent 使用的文本模型");
     const sessionId = input.sessionId.trim() || newId("agent");
-    const saved = await sessions().findOneBy({ userId, sessionId });
-    if (saved && !saved.deleted) return toSessionView(saved);
-    // 复用已删会话的 ID 时要先清掉旧消息，否则 seq 从 1 重新开始会和残留记录撞主键。
-    if (saved) await messages().delete({ userId, sessionId });
-
-    const row = await sessions().save({
-        userId,
-        sessionId,
-        projectId,
-        title: input.title.trim() || "新会话",
-        status: "idle",
-        model,
-        error: "",
-        pendingAction: null,
-        rounds: 0,
-        autoRenamed: false,
-        lastSeq: 0,
-        deleted: false,
-        payerKind: payer.kind,
-        payerTeamId: payer.kind === "team" ? payer.teamId : "",
-        payerLogId: "",
-        payerCredits: 0,
-        createdAt: saved?.createdAt || now(),
-        updatedAt: now(),
-    } as AgentSession);
+    const projectOwnerId = scope?.projectOwnerId || userId;
+    const payerUserId = scope?.payerUserId || userId;
+    const row = await serialTransaction(async (manager) => {
+        await requireActiveAccounts(manager, [userId, projectOwnerId, payerUserId]);
+        const table = manager.getRepository(AgentSession);
+        const saved = await table.findOneBy({ userId, sessionId });
+        if (saved && !saved.deleted) return saved;
+        // 复用已删会话的 ID 时要先清掉旧消息，否则 seq 从 1 重新开始会和残留记录撞主键。
+        if (saved) await manager.getRepository(AgentMessage).delete({ userId, sessionId });
+        return table.save({
+            userId,
+            sessionId,
+            projectId,
+            projectOwnerId,
+            shareId: scope?.shareId || "",
+            payerUserId,
+            title: input.title.trim() || "新会话",
+            status: "idle",
+            model,
+            error: "",
+            pendingAction: null,
+            rounds: 0,
+            autoRenamed: false,
+            lastSeq: 0,
+            deleted: false,
+            payerKind: payer.kind,
+            payerTeamId: payer.kind === "team" ? payer.teamId : "",
+            payerLogId: "",
+            payerCredits: 0,
+            createdAt: saved?.createdAt || now(),
+            updatedAt: now(),
+        } as AgentSession);
+    });
     return toSessionView(row);
 }
 
@@ -238,6 +286,16 @@ export async function abortAgentSession(userId: string, sessionId: string) {
         await patchSession(session, { status: "idle", error: "", pendingAction: null });
     }
     return toSessionView(session);
+}
+
+/** 注销账号前打断该账号自己的历史，以及写入其画布的分享访客会话，并等待推理循环退出。 */
+export async function stopAgentSessionsForAccount(userId: string, timeoutMs = 30_000) {
+    const rows = await sessions().find({ where: [{ userId }, { projectOwnerId: userId }] });
+    rows.forEach((row) => running.get(busKey(row.userId, row.sessionId))?.abort());
+    const deadline = Date.now() + timeoutMs;
+    while (rows.some((row) => running.has(busKey(row.userId, row.sessionId))) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    if (rows.some((row) => running.has(busKey(row.userId, row.sessionId)))) throw fail("仍有 Agent 任务正在结束，请稍后重试注销");
+    return rows;
 }
 
 function systemPrompt(projectId: string, extra: string, access: AgentToolAccess, remainingRounds: number, maxRounds: number) {
@@ -515,7 +573,7 @@ async function runLoop(session: AgentSession, signal: AbortSignal) {
         // 先把这一轮记账再调模型：中途崩了也不会白送一轮，恢复后剩余轮数仍然是对的。
         await patchSession(session, { rounds: session.rounds + 1 });
         const history = await loadHistory(session.userId, session.sessionId);
-        const images = await loadContextImages(session.userId, history, access.vision);
+        const images = await loadContextImages(session.projectOwnerId || session.userId, history, access.vision);
         const reply = await callModel(channel, session.model, system, history, images, tools, signal);
         if (reply.content) await appendMessage(session, "assistant", { content: reply.content });
         if (!reply.toolCalls.length) {
@@ -527,10 +585,13 @@ async function runLoop(session: AgentSession, signal: AbortSignal) {
         }
 
         for (const call of reply.toolCalls) {
+            // 分享策略可能在模型思考期间被房主修改。每个工具都必须在真正执行前回库重验，
+            // 否则旧循环会继续修改房主画布，生成类工具还会沿用旧付款方扣点。
+            const currentScope = await revalidateRunningAgentSession(session);
             const args = JSON.stringify(call.args);
             // 先占好 seq 再执行：工具跑得慢时前端也能立刻看到「正在调用哪个工具」。
             const row = await appendMessage(session, "tool", { toolName: call.name, toolArgs: args });
-            const result = await runAgentTool({ userId: session.userId, projectId: session.projectId, sessionId: session.sessionId, seq: row.seq, access, prefs, state, signal }, call.name, call.args).then(
+            const result = await runAgentTool({ userId: session.userId, actorId: session.userId, projectOwnerId: currentScope?.projectOwnerId || session.projectOwnerId || session.userId, payerUserId: currentScope?.payerUserId || session.payerUserId || session.userId, shareId: currentScope?.shareId || session.shareId || "", projectId: session.projectId, sessionId: session.sessionId, seq: row.seq, access, prefs, state, signal }, call.name, call.args).then(
                 (value) => JSON.stringify({ ok: true, data: value ?? null }),
                 // 工具报错不终止循环，把错误回灌给模型，让它自己换个做法或如实告诉用户。
                 (error: unknown) => JSON.stringify({ ok: false, error: error instanceof SafeError ? error.message : "工具执行失败" }),
@@ -640,7 +701,18 @@ async function runSession(session: AgentSession, model: string) {
  * 处理用户对待确认请求的答复。批准就接着跑，拒绝就正常收尾。
  * 两种请求共用这一个出口：它们的交互是同一套，分开写两个接口只会让前端各对接一遍。
  */
-export async function resolveAgentSession(userId: string, sessionId: string, approved: boolean) {
+async function applyAgentScope(session: AgentSession, scope: AgentScope) {
+    if (scope.actorId !== session.userId || scope.shareId !== session.shareId || scope.projectOwnerId !== (session.projectOwnerId || session.userId)) throw fail("会话不存在", 404, NOT_FOUND);
+    const patch = {
+        payerUserId: scope.payerUserId,
+        payerKind: scope.payer.kind,
+        payerTeamId: scope.payer.kind === "team" ? scope.payer.teamId : "",
+    } satisfies Partial<AgentSession>;
+    Object.assign(session, patch);
+    await sessions().update({ userId: session.userId, sessionId: session.sessionId }, patch);
+}
+
+export async function resolveAgentSession(userId: string, sessionId: string, approved: boolean, scope?: AgentScope | null) {
     const session = await loadSession(userId, sessionId);
     const action = session.pendingAction;
     if (session.status !== "awaiting" || !action) throw fail("当前没有待确认的请求");
@@ -652,7 +724,9 @@ export async function resolveAgentSession(userId: string, sessionId: string, app
     }
 
     if (action.type === "rename_canvas") {
-        await renameProjectCanvas(userId, session.projectId, action.title);
+        // 待确认可能挂很久；批准时再验一次，不能拿创建确认卡时的旧编辑权改名。
+        await revalidateRunningAgentSession(session, false);
+        await renameProjectCanvas(session.projectOwnerId || userId, session.projectId, action.title);
         await appendMessage(session, "assistant", { content: `已把画布标题改成「${action.title}」。` });
         // 轮数不重置：改个标题不该顺带送一整轮预算，接着用剩下的额度把原来的事做完。
         await patchSession(session, { status: "running", error: "", pendingAction: null });
@@ -662,12 +736,18 @@ export async function resolveAgentSession(userId: string, sessionId: string, app
     }
 
     // 续跑是用户明确要求的新一段执行，所以按当前模型单价重新扣一次点；余额不够就明确拒绝，不偷偷放行。
+    if (session.shareId && !scope) throw shareAccessChangedForContinue();
+    if (scope) await applyAgentScope(session, scope);
     const credits = await modelCost(session.model);
     await chargeSession(session, session.model, credits);
     await appendMessage(session, "assistant", { content: "好的，继续执行。" });
     await patchSession(session, { status: "running", error: "", pendingAction: null, rounds: 0 });
     void runSession(session, session.model);
     return toSessionView(session);
+}
+
+function shareAccessChangedForContinue() {
+    return fail("分享权限或付款策略已变化，请刷新后重试", 403, "AGENT_SHARE_ACCESS_CHANGED");
 }
 
 /**
@@ -749,7 +829,7 @@ async function generateSessionTitle(session: AgentSession, content: string) {
  * clientMessageId 是幂等键：断网重发同一个键只会拿回已存在的那条消息，不会重复执行、重复扣费。
  * 计费口径是「按消息扣一次」：在真正开始执行之前按当前模型的单价扣一次，之后这条消息触发多少轮都不再扣。
  */
-export async function sendAgentMessage(userId: string, sessionId: string, input: { clientMessageId: string; content: string; model: string; attachmentIds: string[]; references: AgentMessageReference[] }) {
+export async function sendAgentMessage(userId: string, sessionId: string, input: { clientMessageId: string; content: string; model: string; attachmentIds: string[]; references: AgentMessageReference[] }, scope?: AgentScope | null) {
     const clientMessageId = input.clientMessageId.trim();
     if (!clientMessageId) throw fail("缺少消息幂等键");
     const rawContent = input.content.trim();
@@ -764,16 +844,20 @@ export async function sendAgentMessage(userId: string, sessionId: string, input:
     if (session.status === "running") throw fail("当前会话正在执行中，请等待完成或先中止");
     // 等确认时也不能插新消息：那条待确认请求属于上一段执行，被顶掉之后用户点同意就没有东西可接着跑了。
     if (session.status === "awaiting") throw fail("当前会话正在等待你确认，请先处理确认请求或中止");
+    if (scope) await applyAgentScope(session, scope);
     // 用户这次选了就按用户的来，没选就沿用会话上一轮用的模型，不再无条件按管理员配置对齐——
     // 那样会把用户在面板上的选择冲掉。模型被下线的情况由 resolveAgentModel 兜底回落到默认。
     // 模型只在这里定一次，跑到一半改选择也只对下一轮生效，当前这轮用的还是发消息时确定的那个。
     const model = resolveAgentModel(settings, input.model || session.model);
     if (!model) throw fail("系统未配置 Agent 使用的文本模型");
 
-    const attachments = await resolveAttachments(userId, input.attachmentIds);
+    // 分享会话的历史主体仍是访客 actorId，但附件与节点都实际归房主画布所有。
+    // 用 actorId 回库会把房主空间里的合法分享附件误判成「不存在」，节点引用也读不到画布。
+    const projectOwnerId = session.projectOwnerId || userId;
+    const attachments = await resolveAttachments(projectOwnerId, input.attachmentIds);
     // 图片附件必须配视觉模型，否则上游会直接报一串看不懂的错；宁可在这里明确拒绝，也不要静默把图丢掉。
     if (attachments.length && !modelSupportsVision(settings, model)) throw fail("当前模型不支持识别图片，请换一个标注了「支持视觉」的模型再发图");
-    const { content, references } = await resolveReferences(userId, session.projectId, rawContent, input.references);
+    const { content, references } = await resolveReferences(projectOwnerId, session.projectId, rawContent, input.references);
 
     // 扣费在真正开始执行之前：余额不足就直接拒绝，连循环都不启动。
     // 付费方取会话创建时固化的那个，不按当前团队成员关系重算：一段会话中途换池子付款是对不上账的。

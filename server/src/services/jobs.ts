@@ -1,14 +1,16 @@
 import { EventEmitter } from "node:events";
-import { In, MoreThan, Not } from "typeorm";
+import { In, LessThan, MoreThan, Not } from "typeorm";
 
 import { config } from "../config";
-import { repo } from "../db/data-source";
+import { repo, serialTransaction } from "../db/data-source";
 import { Job, StoredFile, type JobKind, type JobStatus } from "../db/entities";
 import { isUniqueViolation } from "../lib/db-errors";
 import { fail, newId, now, SafeError } from "../lib/errors";
 import { charge, payerOfJob, payerOfProject, receiptOfJob, refund } from "./billing";
 import { listFiles, publicFileUrl, saveFile, saveFileFromUrl } from "./files";
 import { createVideoTask, fileToDataUrl, generateAudio, generateImages, generateText, pollVideoTask, type GenerationParams } from "./generation";
+import { archiveJobOutputsWithManager, generationOutputViews } from "./generation-history";
+import { requireActiveAccounts } from "./account-fence";
 import { storageTeamOfProject } from "./project-team";
 import { modelCost, publicSettings, selectModelChannel } from "./settings";
 
@@ -39,7 +41,7 @@ export type JobView = {
     model: string;
     progress: number;
     error: string;
-    outputs: Array<{ id: string; kind: string; mimeType: string; bytes: number; width: number; height: number; durationMs: number }>;
+    outputs: Array<{ id: string; kind: string; mimeType: string; bytes: number; width: number; height: number; durationMs: number; cleared: boolean }>;
     /** 文本任务已经生成出来的内容，中途断开也能凭它拿回已生成的那一半。 */
     text: string;
     context: Record<string, unknown>;
@@ -69,6 +71,7 @@ const TEXT_FLUSH_CHARS = 400;
 /** 补齐时一次最多回放多少个任务，和 listJobs 保持同一个上限。 */
 const CATCH_UP_LIMIT = 200;
 const runningJobs = new Map<string, AbortController>();
+const streamConnections = new Set<{ userId: string; close: () => void }>();
 /** 正在生成的文本任务的最新累积内容。内存里的这份比库里新，订阅时优先用它，避免刚订上就少一段。 */
 const runningTexts = new Map<string, string>();
 /** 账号任务按用户、分享任务按分享链接分发。没人订阅时事件丢弃也不影响正确性：任务本身照常落库。 */
@@ -106,8 +109,6 @@ function nextJobSeq(userId: string, shareId = "") {
 }
 
 export async function toJobView(job: Job): Promise<JobView> {
-    const outputs = job.outputFileIds?.length ? await repo(StoredFile).findBy({ id: In(job.outputFileIds) }) : [];
-    const byId = new Map(outputs.map((file) => [file.id, file]));
     return {
         id: job.id,
         clientJobId: job.clientJobId,
@@ -116,10 +117,7 @@ export async function toJobView(job: Job): Promise<JobView> {
         model: job.model,
         progress: job.progress,
         error: job.error || "",
-        outputs: (job.outputFileIds || [])
-            .map((id) => byId.get(id))
-            .filter((file): file is StoredFile => Boolean(file))
-            .map((file) => ({ id: file.id, kind: file.kind, mimeType: file.mimeType, bytes: Number(file.bytes), width: file.width, height: file.height, durationMs: file.durationMs })),
+        outputs: await generationOutputViews(job),
         text: currentJobText(job),
         context: job.context || {},
         createdAt: job.createdAt,
@@ -165,7 +163,7 @@ export async function createJob(userId: string, input: JobInput) {
 
     let job: Job;
     try {
-        job = await jobs().save({
+        job = jobs().create({
             id: newId("job"),
             userId,
             storageUserId: input.storageUserId || userId,
@@ -194,6 +192,10 @@ export async function createJob(userId: string, input: JobInput) {
             updatedAt: now(),
             finishedAt: "",
         } as Job);
+        await serialTransaction(async (manager) => {
+            await requireActiveAccounts(manager, [input.storageUserId || userId, input.payerUserId || userId, userId]);
+            await manager.getRepository(Job).insert(job as never);
+        });
     } catch (error) {
         // 并发重试会同时通过上面的预查，最终由唯一索引裁掉一笔。输家回读赢家即可；
         // 若撞的是主键等其它唯一约束，按幂等键查不到记录，就把原始故障继续抛出。
@@ -226,6 +228,43 @@ export async function listJobs(userId: string, statuses: JobStatus[], since: str
     }).then((items) => (since ? items.filter((item) => item.updatedAt > since) : items));
 }
 
+type JobListCursor = { updatedAt: string; id: string };
+
+function decodeJobListCursor(value: string): JobListCursor | null {
+    if (!value) return null;
+    try {
+        const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as unknown;
+        if (!Array.isArray(parsed) || parsed.length !== 2 || typeof parsed[0] !== "string" || typeof parsed[1] !== "string" || !parsed[0] || !parsed[1]) throw new Error();
+        return { updatedAt: parsed[0], id: parsed[1] };
+    } catch {
+        throw fail("分页游标无效");
+    }
+}
+
+function encodeJobListCursor(job: Job) {
+    return Buffer.from(JSON.stringify([job.updatedAt, job.id]), "utf8").toString("base64url");
+}
+
+/**
+ * 历史列表用 updatedAt + id 组成稳定游标。同一毫秒完成多条任务时，id 负责打破平局；
+ * 多取一条只用于判断是否还有下一页，不会把 SSE 的回放上限与历史分页耦合起来。
+ */
+export async function listJobsPage(userId: string, statuses: JobStatus[], before: string, limit: number, shareId = "") {
+    const scopes = shareId ? [jobScopeWhere(userId, shareId)] : accountJobScopes(userId);
+    const statusScopes = statuses.length ? scopes.flatMap((scope) => statuses.map((status) => ({ ...scope, status }))) : scopes;
+    const cursor = decodeJobListCursor(before);
+    const where = cursor
+        ? statusScopes.flatMap((scope) => [
+              { ...scope, updatedAt: LessThan(cursor.updatedAt) },
+              { ...scope, updatedAt: cursor.updatedAt, id: LessThan(cursor.id) },
+          ])
+        : statusScopes;
+    const rows = await jobs().find({ where, order: { updatedAt: "DESC", id: "DESC" }, take: limit + 1 });
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit);
+    return { items, nextBefore: hasMore ? encodeJobListCursor(items[items.length - 1]) : "" };
+}
+
 export async function cancelJob(userId: string, id: string, shareId = "") {
     // 分享内仍只允许最初发起者取消；账号通道额外允许画布所有者停止写入自己画布的分享任务。
     const job = await jobs().findOne({
@@ -242,6 +281,27 @@ export async function cancelJob(userId: string, id: string, shareId = "") {
     return job;
 }
 
+/**
+ * 账号注销前停止所有由该账号发起、或写入该账号云空间的任务，并等后台协程真正退出。
+ * 只把数据库改成 canceled 就立刻删行会留下竞态：协程可能随后又保存一个产出文件，形成无人可见的孤儿对象。
+ */
+export async function stopJobsForAccount(userId: string, timeoutMs = 30_000) {
+    const rows = await jobs()
+        .createQueryBuilder("job")
+        .where("job.userId = :userId OR job.storageUserId = :userId", { userId })
+        .getMany();
+    const active = rows.filter((row) => row.status === "pending" || row.status === "running");
+    await Promise.all(
+        active.map((row) =>
+            cancelJob(userId, row.id).catch(() => cancelJob(row.userId, row.id, row.shareId).catch(() => undefined)),
+        ),
+    );
+    const deadline = Date.now() + timeoutMs;
+    while (active.some((row) => runningJobs.has(row.id)) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    if (active.some((row) => runningJobs.has(row.id))) throw fail("仍有生成任务正在结束，请稍后重试注销");
+    return rows;
+}
+
 /** 文本任务已经生成出来的内容。内存里那份比库里新，正在跑的任务优先取它。 */
 function currentJobText(job: Job) {
     return runningTexts.get(job.id) ?? job.text ?? "";
@@ -252,10 +312,30 @@ function currentJobText(job: Job) {
  * 只开一条按用户订阅的流而不是每个任务一条：浏览器对同源只给 6 个并发连接，
  * 同时跑几个生成就会把连接池占满，页面其它请求都会被卡住。
  */
-export function subscribeJobs(userId: string, listener: (event: JobEvent) => void, shareId = "") {
+export function subscribeJobs(userId: string, listener: (event: JobEvent) => void, shareId = "", onClose?: () => void) {
     const key = jobScopeKey(userId, shareId);
     jobBus.on(key, listener);
-    return () => void jobBus.off(key, listener);
+    const connection = onClose ? { userId, close: onClose } : null;
+    if (connection) streamConnections.add(connection);
+    return () => {
+        jobBus.off(key, listener);
+        if (connection) streamConnections.delete(connection);
+    };
+}
+
+export function disconnectJobSubscribers(userId: string) {
+    let closed = 0;
+    for (const connection of [...streamConnections]) {
+        if (connection.userId !== userId) continue;
+        streamConnections.delete(connection);
+        closed += 1;
+        try {
+            connection.close();
+        } catch (error) {
+            console.warn("关闭账号任务连接失败：", error);
+        }
+    }
+    return closed;
 }
 
 /**
@@ -279,14 +359,28 @@ export function listJobsSince(userId: string, sinceSeq: number, shareId = "") {
  * 取消发生在扣费之后时，取消那条路径手里的 job 快照还是扣费之前的，
  * 一次 save 就会把 payerLogId 与 credits 抹成空，那笔已经扣掉的钱从此没人退得了。
  */
-async function patchJobWhere(job: Job, where: Partial<Pick<Job, "status">>, patch: Partial<Job>) {
+async function patchJobWhere(job: Job, where: Partial<Pick<Job, "status">>, patch: Partial<Job>, archiveOutputs = false) {
     const seq = await nextJobSeq(job.userId, job.shareId);
     const next = { ...patch, updatedAt: now(), seq };
-    const result = await jobs().update({ id: job.id, ...where }, next as never);
+    let affected = false;
+    let checksums: string[] = [];
+    if (archiveOutputs) {
+        await serialTransaction(async (manager) => {
+            const result = await manager.getRepository(Job).update({ id: job.id, ...where }, next as never);
+            affected = Boolean(result.affected);
+            if (affected) checksums = await archiveJobOutputsWithManager(manager, { ...job, ...next } as Job, true);
+        });
+    } else {
+        affected = Boolean((await jobs().update({ id: job.id, ...where }, next as never)).affected);
+    }
     // 读回库里的真实行：并发路径改过的列也要带进内存，之后的判断才不会基于陈旧值。
     const latest = await jobs().findOneBy({ id: job.id });
     if (latest) Object.assign(job, latest);
-    if (!result.affected) return false;
+    if (!affected) return false;
+    // 历史引用已与终态同事务提交；refCount 是可重建缓存，提交后异步对账即可，不能因对账瞬时失败把已成功任务改判失败。
+    for (const checksum of checksums) {
+        void import("./blob-gc").then(({ reconcileBlobReferences }) => reconcileBlobReferences(checksum)).catch((error) => console.error(`reconcile archived output ${checksum} failed:`, error));
+    }
     // 先落库再广播：订阅方收到的快照一定已经能从库里读到，断线重连按 seq 补齐时不会出现「推过但库里没有」的空档。
     const event = { type: "job", seq: job.seq, job: await toJobView(job) } satisfies JobEvent;
     jobBus.emit(jobScopeKey(job.userId, job.shareId), event);
@@ -299,8 +393,8 @@ async function patchJob(job: Job, patch: Partial<Job>) {
 }
 
 /** 任务状态机的 CAS：只有仍处于 expected 时才允许写入下一状态或终态附加数据。 */
-function patchJobStatus(job: Job, expected: JobStatus, patch: Partial<Job>) {
-    return patchJobWhere(job, { status: expected }, patch);
+function patchJobStatus(job: Job, expected: JobStatus, patch: Partial<Job>, archiveOutputs = false) {
+    return patchJobWhere(job, { status: expected }, patch, archiveOutputs);
 }
 
 function delay(ms: number, signal: AbortSignal) {
@@ -426,6 +520,7 @@ async function runJob(job: Job) {
     runningJobs.set(job.id, controller);
     const params = JSON.parse(job.params || "{}") as GenerationParams;
     const credits = (await modelCost(job.model, params.quality)) * Math.max(1, params.count || 1);
+    let producedOutputs: string[] = [];
     try {
         // tick 读到 pending 后，用户可能已经取消。CAS 失败就说明这份快照过期，不能继续扣费或调用上游。
         if (!(await patchJobStatus(job, "pending", { status: "running", progress: 10, text: "" }))) return;
@@ -447,20 +542,20 @@ async function runJob(job: Job) {
             await patchJob(job, { credits, payerKind: receipt.payer.kind, payerTeamId: receipt.payer.kind === "team" ? receipt.payer.teamId : "", payerLogId: receipt.logId });
         }
         const text = job.kind === "text" ? await runTextJob(job, controller.signal) : "";
-        const outputs = job.kind === "text" ? [] : job.kind === "video" ? await runVideoJob(job, controller.signal) : job.kind === "audio" ? await runAudioJob(job, controller.signal) : await runImageJob(job, controller.signal);
-        if (await patchJobStatus(job, "running", { status: "succeeded", progress: 100, outputFileIds: outputs, text, finishedAt: now(), error: "" })) return;
+        producedOutputs = job.kind === "text" ? [] : job.kind === "video" ? await runVideoJob(job, controller.signal) : job.kind === "audio" ? await runAudioJob(job, controller.signal) : await runImageJob(job, controller.signal);
+        if (await patchJobStatus(job, "running", { status: "succeeded", progress: 100, outputFileIds: producedOutputs, text, finishedAt: now(), error: "" }, true)) return;
         // 产物已经保存后才收到取消：状态保持 canceled，但文件不能变成没人引用的孤儿，
         // 已扣的点也必须在本次进程里结清，不能拖到下次重启扫描。
         if (job.status === "canceled") {
             const settled = await settleRefund(job);
             await patchJobStatus(job, "canceled", {
                 progress: 100,
-                outputFileIds: outputs,
+                outputFileIds: producedOutputs,
                 text,
                 ...(settled ? { credits: 0, payerLogId: "" } : {}),
                 error: settled ? "任务已取消" : "任务已取消（算力点返还失败，稍后会自动重试）",
                 finishedAt: job.finishedAt || now(),
-            });
+            }, true);
         }
     } catch (error) {
         // charge 的回执可能刚由事务写回，取消路径手里的对象也可能更旧；退款前先读真实行。
@@ -477,25 +572,27 @@ async function runJob(job: Job) {
         // 保留下来，下次启动的扫描会照着它再退一次（退款本身幂等，不会退成两笔）。
         const terminalPatch: Partial<Job> = {
             ...(settled ? { credits: 0, payerLogId: "" } : {}),
+            ...(producedOutputs.length ? { outputFileIds: producedOutputs } : {}),
             text: runningTexts.get(job.id) ?? job.text ?? "",
             error: canceled ? "任务已取消" : settled ? message : `${message}（算力点返还失败，稍后会自动重试）`,
             finishedAt: now(),
         };
+        const archiveOutputs = producedOutputs.length > 0;
         if (canceled) {
-            if (job.status === "canceled") await patchJobStatus(job, "canceled", terminalPatch);
-            else if (!(await patchJobStatus(job, "running", { status: "canceled", ...terminalPatch }))) {
+            if (job.status === "canceled") await patchJobStatus(job, "canceled", terminalPatch, archiveOutputs);
+            else if (!(await patchJobStatus(job, "running", { status: "canceled", ...terminalPatch }, archiveOutputs))) {
                 const latest = await jobs().findOneBy({ id: job.id });
                 if (latest?.status === "canceled") {
                     Object.assign(job, latest);
-                    await patchJobStatus(job, "canceled", terminalPatch);
+                    await patchJobStatus(job, "canceled", terminalPatch, archiveOutputs);
                 }
             }
-        } else if (!(await patchJobStatus(job, "running", { status: "failed", ...terminalPatch }))) {
+        } else if (!(await patchJobStatus(job, "running", { status: "failed", ...terminalPatch }, archiveOutputs))) {
             const latest = await jobs().findOneBy({ id: job.id });
             if (latest?.status === "canceled") {
                 Object.assign(job, latest);
                 // 失败与取消同时发生时取消先赢；退款已经完成，只把结算字段补到 canceled 行上。
-                await patchJobStatus(job, "canceled", { ...terminalPatch, error: settled ? "任务已取消" : "任务已取消（算力点返还失败，稍后会自动重试）" });
+                await patchJobStatus(job, "canceled", { ...terminalPatch, error: settled ? "任务已取消" : "任务已取消（算力点返还失败，稍后会自动重试）" }, archiveOutputs);
             }
         }
     } finally {

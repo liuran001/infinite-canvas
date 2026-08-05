@@ -91,7 +91,7 @@ export const useJobStore = create<JobStore>()(
                 // 单独查一次而不是和进行中的任务合并成一个请求：已结束的任务数量远多于在跑的，
                 // 混在一起会把仍在跑的任务挤出服务端的条数上限，反而丢掉更该恢复的进度。
                 const since = new Date(Date.now() - FINISHED_JOB_WINDOW_MS).toISOString();
-                const items = (await serverApi.jobs(["succeeded", "failed"], since).catch(() => ({ items: [] }))).items;
+                const items = (await serverApi.jobs(["succeeded", "failed"]).catch(() => ({ items: [], nextBefore: "" }))).items.filter((job) => job.updatedAt > since);
                 const previous = get().jobs;
                 return items.map((job) => toTrackedJob(job, previous[job.clientJobId]?.context));
             },

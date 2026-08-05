@@ -1,18 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { App, Button, Tooltip } from "antd";
+import { App, Button, Modal, Tooltip } from "antd";
 import { CloudOff, Eye, ImagePlus, Link2Off, Loader2, LogIn, Pencil, Save, Users } from "lucide-react";
+import { saveAs } from "file-saver";
 
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { ConnectionPath } from "@/components/canvas/canvas-connections";
 import { CanvasNode } from "@/components/canvas/canvas-node";
+import { CanvasNodeContextMenu } from "@/components/canvas/canvas-context-menu";
+import { CanvasNodeInfoModal } from "@/components/canvas/canvas-node-hover-toolbar";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { AgentPanel } from "@/components/agent/agent-panel";
 import { useNoIndexMeta } from "@/hooks/use-noindex-meta";
 import { InfiniteCanvasPage } from "@/pages/canvas/project";
 import { useShareBillingConsentPrompt } from "@/pages/share/use-share-billing-consent";
 import { canvasThemes } from "@/lib/canvas-theme";
-import { hydrateCanvasImages } from "@/lib/canvas/canvas-generation-helpers";
+import { audioExtension, hydrateCanvasImages, imageExtension } from "@/lib/canvas/canvas-generation-helpers";
 import { imageMetadata } from "@/lib/canvas/canvas-node-factory";
 import { fitNodeSize } from "@/lib/canvas/canvas-node-size";
 import { isHiddenBatchChild, isHiddenBatchConnectionEndpoint } from "@/lib/canvas/canvas-node-geometry";
@@ -25,7 +28,7 @@ import { useServerStore } from "@/stores/use-server-store";
 import { useShareStore } from "@/stores/use-share-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
-import { CanvasNodeType, type CanvasNodeData, type ViewportTransform } from "@/types/canvas";
+import { CanvasNodeType, type CanvasNodeData, type ContextMenuState, type ViewportTransform } from "@/types/canvas";
 
 /**
  * 独立的分享画布页 `/s/:token`。
@@ -60,6 +63,9 @@ export default function ShareCanvasPage() {
     const [viewport, setViewport] = useState<ViewportTransform>({ x: 0, y: 0, k: 1 });
     const [nodes, setNodes] = useState<CanvasNodeData[]>([]);
     const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(new Set());
+    const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+    const [infoNodeId, setInfoNodeId] = useState<string | null>(null);
+    const [previewNodeId, setPreviewNodeId] = useState<string | null>(null);
     const [isMiniMapOpen, setIsMiniMapOpen] = useState(false);
     const [uploading, setUploading] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -88,6 +94,8 @@ export default function ShareCanvasPage() {
 
     const connections = useMemo(() => project?.connections || [], [project]);
     const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+    const infoNode = infoNodeId ? nodeById.get(infoNodeId) || null : null;
+    const previewNode = previewNodeId ? nodeById.get(previewNodeId) || null : null;
     const visibleNodes = useMemo(() => nodes.filter((node) => !isHiddenBatchChild(node, nodes)), [nodes]);
     const remotePresenceByNodeId = useMemo(() => {
         const map = new Map<string, typeof members>();
@@ -252,6 +260,12 @@ export default function ShareCanvasPage() {
 
     const handleNodeMouseDown = useCallback((event: React.MouseEvent, nodeId: string) => {
         event.stopPropagation();
+        if (!editableRef.current) {
+            event.preventDefault();
+            setSelectedNodeIds(new Set([nodeId]));
+            setContextMenu({ type: "node", x: event.clientX, y: event.clientY, nodeId });
+            return;
+        }
         const next = new Set(event.shiftKey || event.metaKey || event.ctrlKey ? selectedRef.current : []);
         if (next.has(nodeId)) next.delete(nodeId);
         else next.add(nodeId);
@@ -263,6 +277,12 @@ export default function ShareCanvasPage() {
             startY: event.clientY,
             initial: nodesRef.current.filter((node) => next.has(node.id)).map((node) => ({ id: node.id, x: node.position.x, y: node.position.y })),
         };
+    }, []);
+
+    const downloadNode = useCallback((node: CanvasNodeData | undefined) => {
+        if (!node?.metadata?.content || (node.type !== CanvasNodeType.Image && node.type !== CanvasNodeType.Video && node.type !== CanvasNodeType.Audio)) return;
+        const extension = node.type === CanvasNodeType.Video ? "mp4" : node.type === CanvasNodeType.Audio ? audioExtension(node.metadata.mimeType) : imageExtension(node.metadata.content);
+        saveAs(node.metadata.content, `canvas-${node.type}-${node.id}.${extension}`);
     }, []);
 
     useEffect(() => {
@@ -303,6 +323,7 @@ export default function ShareCanvasPage() {
 
     const handleNodeResize = useCallback(
         (nodeId: string, width: number, height: number, position?: { x: number; y: number }) => {
+            if (!editableRef.current) return;
             setNodes((prev) => {
                 const next = prev.map((node) => (node.id === nodeId ? { ...node, width, height, position: position || node.position } : node));
                 nodesRef.current = next;
@@ -315,6 +336,7 @@ export default function ShareCanvasPage() {
 
     const handleContentChange = useCallback(
         (nodeId: string, content: string) => {
+            if (!editableRef.current) return;
             setNodes((prev) => {
                 const next = prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, content } } : node));
                 nodesRef.current = next;
@@ -327,6 +349,7 @@ export default function ShareCanvasPage() {
 
     const handleTitleChange = useCallback(
         (nodeId: string, title: string) => {
+            if (!editableRef.current) return;
             setNodes((prev) => {
                 const next = prev.map((node) => (node.id === nodeId ? { ...node, title } : node));
                 nodesRef.current = next;
@@ -385,7 +408,7 @@ export default function ShareCanvasPage() {
                 <div className="min-w-0 flex-1 overflow-hidden">
                     <InfiniteCanvasPage shared />
                 </div>
-                <AgentPanel forceLocal />
+                <AgentPanel />
             </div>
         );
 
@@ -426,8 +449,7 @@ export default function ShareCanvasPage() {
                     backgroundMode={project.backgroundMode || "lines"}
                     onViewportChange={setViewport}
                     onCanvasDeselect={() => setSelectedNodeIds(new Set())}
-                    // 只读时右键菜单整体不可用；可编辑时分享态也不开放右键菜单里的生成类操作，一律拦掉。
-                    onContextMenu={(event) => event.preventDefault()}
+                    onContextMenu={(event) => { event.preventDefault(); setContextMenu(null); }}
                     // 拖拽上传只在可编辑分享上挂；viewer 连 onDrop 都不接，拖进来的文件由浏览器默认处理。
                     onDrop={
                         editable
@@ -455,18 +477,15 @@ export default function ShareCanvasPage() {
                             })}
                     </svg>
 
-                    {/*
-                     * 只读的落点在交互层，而不是藏几个按钮：整层节点 pointer-events 关掉之后，
-                     * 拖拽、选中、缩放手柄、连线点、双击进编辑态、节点右键菜单一次性全部失效，
-                     * 平移与缩放仍然作用在外层容器上，照常可用。
-                     */}
-                    <div style={{ pointerEvents: editable ? undefined : "none" }}>
+                    {/* viewer 保留节点指针事件，用于打开只读菜单；按下不会进入拖拽，编辑访客仍走原交互。 */}
+                    <div>
                         {/* 缩放起止在这里是空实现：那对回调只用来临时藏掉跟随节点的浮层工具条，而分享页没有工具条。 */}
                         {visibleNodes.map((node) => (
                             <CanvasNode
                                 key={node.id}
                                 data={node}
                                 scale={viewport.k}
+                                readOnly={!editable}
                                 remoteEditors={remotePresenceByNodeId.get(node.id) || []}
                                 isSelected={selectedNodeIds.has(node.id)}
                                 isRelated={false}
@@ -486,7 +505,12 @@ export default function ShareCanvasPage() {
                                 onResizeEnd={() => undefined}
                                 onContentChange={handleContentChange}
                                 onTitleChange={handleTitleChange}
-                                onContextMenu={(event) => event.preventDefault()}
+                                onContextMenu={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    setSelectedNodeIds(new Set([node.id]));
+                                    setContextMenu({ type: "node", x: event.clientX, y: event.clientY, nodeId: node.id });
+                                }}
                             />
                         ))}
                     </div>
@@ -502,6 +526,41 @@ export default function ShareCanvasPage() {
                     isMiniMapOpen={isMiniMapOpen}
                     onToggleMiniMap={() => setIsMiniMapOpen((value) => !value)}
                 />
+                {contextMenu ? (
+                    <CanvasNodeContextMenu
+                        menu={contextMenu}
+                        readOnly
+                        node={contextMenu.type === "node" ? nodesRef.current.find((item) => item.id === contextMenu.nodeId) : undefined}
+                        onClose={() => setContextMenu(null)}
+                        onDuplicate={() => undefined}
+                        onDelete={() => undefined}
+                        onInfo={() => {
+                            if (contextMenu.type === "node") setInfoNodeId(contextMenu.nodeId);
+                            setContextMenu(null);
+                        }}
+                        onDownload={() => {
+                            if (contextMenu.type === "node") downloadNode(nodesRef.current.find((item) => item.id === contextMenu.nodeId));
+                            setContextMenu(null);
+                        }}
+                        onViewImage={() => {
+                            if (contextMenu.type === "node") setPreviewNodeId(contextMenu.nodeId);
+                            setContextMenu(null);
+                        }}
+                    />
+                ) : null}
+                {/* 只读节点菜单只提供节点信息、下载和查看大图，不暴露任何画布编辑动作。 */}
+                <CanvasNodeInfoModal node={infoNode} open={Boolean(infoNode)} onClose={() => setInfoNodeId(null)} />
+                <Modal
+                    title="查看大图"
+                    open={Boolean(previewNode?.metadata?.content)}
+                    centered
+                    footer={null}
+                    width="auto"
+                    onCancel={() => setPreviewNodeId(null)}
+                    styles={{ body: { padding: 0, display: "flex", justifyContent: "center", alignItems: "center", maxHeight: "80vh" } }}
+                >
+                    {previewNode?.metadata?.content ? <img src={previewNode.metadata.content} alt={previewNode.title || "图片"} style={{ maxWidth: "100%", maxHeight: "80vh", objectFit: "contain" }} /> : null}
+                </Modal>
             </section>
         </main>
     );
@@ -532,6 +591,7 @@ function ShareTopBar({
     const syncState = useShareStore((state) => state.syncState);
     const syncError = useShareStore((state) => state.syncError);
     const streamStatus = useShareStore((state) => state.streamStatus);
+    const actionClass = "grid size-8 place-items-center rounded-lg transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/10";
 
     return (
         <header className="z-50 flex h-14 shrink-0 items-center justify-between gap-3 border-b px-4" style={{ borderColor: theme.toolbar.border, background: theme.toolbar.panel }}>
@@ -571,16 +631,18 @@ function ShareTopBar({
                     </span>
                 </Tooltip>
                 {editable ? (
-                    <Tooltip title="也可以直接粘贴或把图片拖进画布">
-                        <Button icon={<ImagePlus className="size-4" />} loading={uploading} onClick={onUpload}>
-                            上传图片
-                        </Button>
+                    <Tooltip title={uploading ? "正在上传图片" : "上传图片，也可以直接粘贴或拖入画布"}>
+                        <button type="button" className={actionClass} aria-label="上传图片" disabled={uploading} onClick={onUpload}>
+                            {uploading ? <Loader2 className="size-4 animate-spin" /> : <ImagePlus className="size-4" />}
+                        </button>
                     </Tooltip>
                 ) : null}
                 {allowClone ? (
-                    <Button type="primary" icon={<Save className="size-4" />} loading={cloning} onClick={onClone}>
-                        保存到我的账号
-                    </Button>
+                    <Tooltip title={cloning ? "正在保存到我的账号" : "保存到我的账号"}>
+                        <button type="button" className={actionClass} aria-label="保存到我的账号" disabled={cloning} onClick={onClone}>
+                            {cloning ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+                        </button>
+                    </Tooltip>
                 ) : null}
             </div>
         </header>

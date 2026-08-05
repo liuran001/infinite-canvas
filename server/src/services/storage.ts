@@ -10,6 +10,7 @@ export type ObjectRange = { start: number; end: number };
 export type ObjectBody = { stream: Readable; bytes: number };
 
 const localRoot = path.join(config.dataDir, "files");
+const OBJECT_DELETE_TIMEOUT_MS = 30_000;
 
 function s3Client() {
     if (!config.s3.bucket) throw fail("未配置 S3_BUCKET，无法使用对象存储");
@@ -64,5 +65,5 @@ export async function deleteObject(key: string, storage: FileStorage = configure
         return;
     }
     const [{ client }, { DeleteObjectCommand }] = await Promise.all([s3Client(), import("@aws-sdk/client-s3")]);
-    await client.send(new DeleteObjectCommand({ Bucket: config.s3.bucket, Key: s3Key(key) }));
+    await client.send(new DeleteObjectCommand({ Bucket: config.s3.bucket, Key: s3Key(key) }), { abortSignal: AbortSignal.timeout(OBJECT_DELETE_TIMEOUT_MS) });
 }

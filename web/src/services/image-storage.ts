@@ -50,6 +50,18 @@ export function resolveImageUrl(storageKey?: string, fallback = "") {
     return fileId ? serverFileUrl(fileId) : fallback;
 }
 
+/** 历史记录仍在时文件直链可继续读取；保留策略真正清掉媒体后才返回不存在。网络异常不误判为已清理。 */
+export async function isStoredMediaCleared(storageKey?: string) {
+    const fileId = serverFileIdOf(storageKey);
+    if (!fileId) return false;
+    try {
+        const response = await fetch(serverFileUrl(fileId), { method: "HEAD", cache: "no-store" });
+        return response.status === 404 || response.status === 410;
+    } catch {
+        return false;
+    }
+}
+
 export async function getImageBlob(storageKey: string) {
     const fileId = serverFileIdOf(storageKey);
     if (!fileId) return null;

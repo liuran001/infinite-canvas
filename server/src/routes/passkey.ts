@@ -3,10 +3,17 @@ import { Router } from "express";
 import { handle, ok } from "../lib/response";
 import { requireUser, userAuth } from "../middleware/auth";
 import { deletePasskey, listPasskeys, passkeyLoginOptions, passkeyLoginVerify, passkeyRegisterOptions, passkeyRegisterVerify, renamePasskey } from "../services/passkey";
+import { verifyTurnstile } from "../services/turnstile";
 
 export const passkeyRouter = Router();
 
-passkeyRouter.post("/auth/passkey/login/options", handle(async (req, res) => ok(res, await passkeyLoginOptions(req, String(req.body?.username || "")))));
+passkeyRouter.post(
+    "/auth/passkey/login/options",
+    handle(async (req, res) => {
+        await verifyTurnstile("login", String(req.body?.captchaToken || ""), req.ip || "");
+        ok(res, await passkeyLoginOptions(req, String(req.body?.username || "")));
+    }),
+);
 
 passkeyRouter.post("/auth/passkey/login/verify", handle(async (req, res) => ok(res, await passkeyLoginVerify(req, String(req.body?.flowId || ""), req.body?.response))));
 

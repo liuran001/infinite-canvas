@@ -1,5 +1,5 @@
 import { repo } from "../db/data-source";
-import { Project, ProjectShare } from "../db/entities";
+import { Project, ProjectShare, User } from "../db/entities";
 import { fail, SHARE_READ_ONLY } from "../lib/errors";
 import { shareUsable, type GuestSession } from "./project-share";
 
@@ -38,6 +38,12 @@ async function shareAccess(guest: GuestSession, projectId: string, permission: P
     if (guest.projectId !== projectId) throw notFound();
     const share = await repo(ProjectShare).findOneBy({ id: guest.shareId });
     if (!share || share.projectId !== projectId || !shareUsable(share)) throw notFound();
+    // 房主一进入 deleting/finalizing/deleted，旧 guest JWT 也必须立即失效；取消注销恢复 active 后
+    // 同一条仍启用的分享会自然恢复，无需破坏分享配置。
+    if (!(await repo(User).exist({ where: { id: share.ownerId, status: "active" } }))) throw notFound();
+    const accountId = (guest.accountId || "").trim();
+    if (accountId ? guest.anonymous || guest.actorId !== accountId : !guest.anonymous) throw notFound();
+    if (accountId !== share.ownerId && accountId && !(await repo(User).exist({ where: { id: accountId, status: "active" } }))) throw notFound();
     if (guest.anonymous && !share.allowAnonymous) throw notFound();
     const project = await liveProject(share.ownerId, projectId);
     const role = share.role === "editor" && guest.anonymous && (!share.ownerPays || !share.allowAnonymousEdit) ? "viewer" : share.role;

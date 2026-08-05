@@ -66,9 +66,13 @@ export default function AdminSettingsPage() {
     const patchTeam = (value: Partial<ServerSettings["team"]>) => setDraft((current) => current && { ...current, public: { ...current.public, team: { ...current.public.team, ...value } } });
     const patchPrivate = (value: Partial<AdminSettings["private"]>) => setDraft((current) => current && { ...current, private: { ...current.private, ...value } });
     const patchSearch = (value: Partial<AdminSettings["private"]["search"]>) => setDraft((current) => current && { ...current, private: { ...current.private, search: { ...current.private.search, ...value } } });
+    const patchGenerationHistory = (value: Partial<AdminSettings["private"]["generationHistory"]>) =>
+        setDraft((current) => current && { ...current, private: { ...current.private, generationHistory: { ...(current.private.generationHistory || { totalLimit: 0, imageRetentionDays: 30, imageRetentionCount: 100, imageRetentionStrategy: "min" }), ...value } } });
 
     const { channels, promptSync, search } = draft.private;
+    const generationHistory = draft.private.generationHistory || { totalLimit: 0, imageRetentionDays: 30, imageRetentionCount: 100, imageRetentionStrategy: "min" as const };
     const { modelChannel, auth, storage, capabilities, agent } = draft.public;
+    const turnstile = auth.turnstile || { siteKey: "", loginEnabled: false, registerEnabled: false, oauthCompleteEnabled: false };
     /*
      * teams 这一节要兜底。旧版本服务端、以及新旧滚动升级期间，公开配置里根本没有它，
      * 直接解构会让整个系统设置页白屏——管理员连回去改配置的入口都没了。
@@ -363,11 +367,11 @@ export default function AdminSettingsPage() {
                 <div className="mt-4 grid gap-4 md:grid-cols-2">
                     <label className="block">
                         <span className="mb-1 block text-sm font-medium">Linux.do Client ID</span>
-                        <Input value={draft.private.auth.linuxDo.clientId} onChange={(event) => patchPrivate({ auth: { linuxDo: { ...draft.private.auth.linuxDo, clientId: event.target.value } } })} placeholder="OAuth 应用的 Client ID" />
+                        <Input value={draft.private.auth.linuxDo.clientId} onChange={(event) => patchPrivate({ auth: { ...draft.private.auth, linuxDo: { ...draft.private.auth.linuxDo, clientId: event.target.value } } })} placeholder="OAuth 应用的 Client ID" />
                     </label>
                     <label className="block">
                         <span className="mb-1 block text-sm font-medium">Linux.do Client Secret</span>
-                        <Input.Password value={draft.private.auth.linuxDo.clientSecret} onChange={(event) => patchPrivate({ auth: { linuxDo: { ...draft.private.auth.linuxDo, clientSecret: event.target.value } } })} placeholder="留空表示不修改" />
+                        <Input.Password value={draft.private.auth.linuxDo.clientSecret} onChange={(event) => patchPrivate({ auth: { ...draft.private.auth, linuxDo: { ...draft.private.auth.linuxDo, clientSecret: event.target.value } } })} placeholder="留空表示不修改" />
                     </label>
                 </div>
                 <div className="mt-4 rounded-lg bg-stone-100 px-3 py-2.5 dark:bg-white/5">
@@ -378,6 +382,38 @@ export default function AdminSettingsPage() {
                     <span className="block text-xs text-stone-500">
                         在 Linux.do 的 OAuth 应用里把回调地址填成这个。地址取自当前访问的域名，如果站点通过反向代理对外提供服务，请确认这里显示的就是用户实际访问的地址，并与服务端 <code>PUBLIC_BASE_URL</code> 保持一致。
                     </span>
+                </div>
+                <div className="mt-5 border-t border-stone-200 pt-4 dark:border-stone-800">
+                    <h3 className="text-sm font-semibold">Cloudflare Turnstile</h3>
+                    <p className="mt-0.5 text-xs text-stone-500">三个入口可分别开启。浏览器只拿 Site Key，提交后仍由服务端使用 Secret 向 Cloudflare 复核。</p>
+                    <div className="mt-3 grid gap-4 md:grid-cols-2">
+                        <label className="block">
+                            <span className="mb-1 block text-sm font-medium">Site Key</span>
+                            <Input value={turnstile.siteKey} onChange={(event) => patchAuth({ turnstile: { ...turnstile, siteKey: event.target.value } })} placeholder="0x4AAAA..." />
+                        </label>
+                        <label className="block">
+                            <span className="mb-1 block text-sm font-medium">Secret Key</span>
+                            <Input.Password
+                                value={draft.private.auth.turnstile?.secretKey || ""}
+                                onChange={(event) => patchPrivate({ auth: { ...draft.private.auth, turnstile: { secretKey: event.target.value } } })}
+                                placeholder="留空表示不修改"
+                            />
+                        </label>
+                    </div>
+                    <div className="mt-4 grid gap-3 md:grid-cols-3">
+                        <div className="flex items-center gap-2">
+                            <Switch checked={turnstile.loginEnabled} onChange={(loginEnabled) => patchAuth({ turnstile: { ...turnstile, loginEnabled } })} />
+                            <span className="text-sm">密码登录</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <Switch checked={turnstile.registerEnabled} onChange={(registerEnabled) => patchAuth({ turnstile: { ...turnstile, registerEnabled } })} />
+                            <span className="text-sm">密码注册</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <Switch checked={turnstile.oauthCompleteEnabled} onChange={(oauthCompleteEnabled) => patchAuth({ turnstile: { ...turnstile, oauthCompleteEnabled } })} />
+                            <span className="text-sm">第三方注册补邀请码</span>
+                        </div>
+                    </div>
                 </div>
             </section>
 
@@ -396,6 +432,40 @@ export default function AdminSettingsPage() {
                         <InputNumber className="w-full" min={0} precision={0} suffix="个" value={team.maxPerUser} onChange={(value) => patchTeam({ maxPerUser: Math.max(0, Number(value) || 0) })} />
                         {/* 0 的语义跟着服务端走（teams.ts 里 limit > 0 才判），这里的提示必须和它一致，否则管理员填 0 会得到与预期相反的结果。 */}
                         <span className="mt-1 block text-xs text-stone-500">默认 5；只限制自己创建的团队，被别人邀请加入的不计入。填 0 表示不限。</span>
+                    </label>
+                </div>
+            </section>
+
+            <section className={sectionClass}>
+                <h2 className="text-sm font-semibold">生成历史</h2>
+                <p className="mt-0.5 text-xs text-stone-500">历史媒体与用户云空间分开计数；用户仍保留在云空间里的文件不会被这里的策略删除。</p>
+                <div className="mt-3 grid gap-4 md:grid-cols-2">
+                    <label className="block">
+                        <span className="mb-1 block text-sm font-medium">每个所有者的总历史条数</span>
+                        <InputNumber className="w-full" min={0} precision={0} suffix="条" value={generationHistory.totalLimit} onChange={(value) => patchGenerationHistory({ totalLimit: Math.max(0, Number(value) || 0) })} />
+                        <span className="mt-1 block text-xs text-stone-500">默认 0，表示不限制；超过后删除最早的整条生成历史，但不会删除仍在云空间中的文件。</span>
+                    </label>
+                    <label className="block">
+                        <span className="mb-1 block text-sm font-medium">图片保留判定</span>
+                        <Select
+                            className="w-full"
+                            value={generationHistory.imageRetentionStrategy}
+                            options={[
+                                { value: "min", label: "取最小值（任一条件超出即清理）" },
+                                { value: "max", label: "取最大值（两个条件都超出才清理）" },
+                            ]}
+                            onChange={(imageRetentionStrategy) => patchGenerationHistory({ imageRetentionStrategy })}
+                        />
+                    </label>
+                    <label className="block">
+                        <span className="mb-1 block text-sm font-medium">历史图片保留时间</span>
+                        <InputNumber className="w-full" min={0} precision={0} suffix="天" value={generationHistory.imageRetentionDays} onChange={(value) => patchGenerationHistory({ imageRetentionDays: Math.max(0, Number(value) || 0) })} />
+                        <span className="mt-1 block text-xs text-stone-500">默认 30 天；填 0 表示不按时间限制。</span>
+                    </label>
+                    <label className="block">
+                        <span className="mb-1 block text-sm font-medium">历史图片保留条数</span>
+                        <InputNumber className="w-full" min={0} precision={0} suffix="条" value={generationHistory.imageRetentionCount} onChange={(value) => patchGenerationHistory({ imageRetentionCount: Math.max(0, Number(value) || 0) })} />
+                        <span className="mt-1 block text-xs text-stone-500">默认 100 条；填 0 表示不按条数限制。只有用户已从云空间删除的图片才会被自动清理。</span>
                     </label>
                 </div>
             </section>

@@ -10,6 +10,7 @@ import { storageOfTeam, usedBytesOfTeam, usedBytesOfTeams } from "./quota";
 import { publicSettings } from "./settings";
 import { assertCanManageMember, canTeamAction, requireTeamRole } from "./team-access";
 import { closeTeamConnectionsOf, publishTeamMember } from "./team-realtime";
+import { requireActiveAccountForMembership } from "./account-deletion";
 
 export type TeamInput = {
     name?: unknown;
@@ -90,6 +91,7 @@ export async function createTeam(userId: string, input: TeamInput) {
         updatedAt: now(),
     });
     await serialTransaction(async (manager) => {
+        await requireActiveAccountForMembership(manager, userId);
         await manager.getRepository(Team).insert(team);
         await manager.getRepository(TeamMember).insert({
             teamId: team.id,

@@ -4,6 +4,7 @@ import { handle, ok, parseQuery } from "../lib/response";
 import { adminAuth } from "../middleware/auth";
 import { deleteAsset, listAssets, saveAsset } from "../services/assets";
 import { deletePrompt, deletePromptCategory, deletePrompts, listPromptCategories, listPrompts, refreshPromptSyncScheduler, savePrompt, savePromptCategory, syncPromptCategory, syncRemotePromptCategories } from "../services/prompts";
+import { cleanupGenerationHistory } from "../services/generation-history";
 import { adminSettings, fetchChannelModels, saveSettings, testChannelModel } from "../services/settings";
 
 export const adminRouter = Router();
@@ -17,6 +18,8 @@ adminRouter.post(
         const settings = await saveSettings(req.body || {});
         // 提示词定时同步的 cron 存在系统设置里，保存后立即按新配置重建任务。
         await refreshPromptSyncScheduler();
+        // 缩短保留策略后立即执行一次；放宽策略不会恢复已经按旧策略清掉的媒体。
+        await cleanupGenerationHistory();
         ok(res, settings);
     }),
 );
