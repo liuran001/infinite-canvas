@@ -38,7 +38,7 @@ export function fetchPrompts({ keyword = "", tag = [], category = ALL_PROMPTS_OP
     return serverRequest<PromptListResponse>(`/prompts?${params}`, {}, "获取提示词失败");
 }
 
-export function formatPromptDate(value: string) {
+export function formatPromptDate(value: string, locale?: string) {
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? "" : new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+    return Number.isNaN(date.getTime()) ? "" : new Intl.DateTimeFormat(locale, { year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
 }

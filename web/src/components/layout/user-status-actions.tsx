@@ -1,7 +1,8 @@
 import { useEffect, useState, type CSSProperties } from "react";
-import { App, Dropdown, Progress, Typography, type MenuProps } from "antd";
-import { Keyboard, LogIn, LogOut, Puzzle, Settings2, Shield, UserRound } from "lucide-react";
+import { App, Dropdown, Progress, Tooltip, Typography, type MenuProps } from "antd";
+import { BookOpen, Keyboard, LogIn, LogOut, Puzzle, Settings2, Shield, UserRound } from "lucide-react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 
 import { AccountSettingsModal } from "@/components/layout/account-settings-modal";
 import { formatBytes } from "@/lib/image-utils";
@@ -9,6 +10,8 @@ import { serverApi } from "@/services/api/server";
 import { AnimatedThemeToggler } from "@/components/ui/animated-theme-toggler";
 import { GitHubLink } from "@/components/layout/github-link";
 import { VersionReleaseModal } from "@/components/layout/version-release-modal";
+import { DOCS_URL } from "@/constant/env";
+import { changeAppLocale, type AppLocale } from "@/i18n";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { useConfigStore } from "@/stores/use-config-store";
 import { useServerStore } from "@/stores/use-server-store";
@@ -23,6 +26,7 @@ type UserStatusActionsProps = {
 
 export function UserStatusActions({ showConfig = true, variant = "default", onOpenShortcuts, onOpenPlugins }: UserStatusActionsProps) {
     const { message } = App.useApp();
+    const { i18n, t } = useTranslation();
     const navigate = useNavigate();
     const [searchParams, setSearchParams] = useSearchParams();
     const [accountOpen, setAccountOpen] = useState(false);
@@ -33,10 +37,13 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
     const user = useServerStore((state) => state.user);
     const setLoginOpen = useServerStore((state) => state.setLoginOpen);
     const canvasTheme = canvasThemes[theme];
-    const naturalIconClass = "inline-flex size-7 shrink-0 items-center justify-center text-stone-600 transition hover:text-stone-950 dark:text-stone-300 dark:hover:text-white [&_svg]:size-4";
+    const naturalIconClass = "inline-flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-stone-600 transition-colors hover:bg-black/5 hover:text-stone-950 dark:text-stone-300 dark:hover:bg-white/10 dark:hover:text-white [&_svg]:size-4";
     const iconStyle: CSSProperties | undefined = variant === "canvas" ? { color: canvasTheme.node.text } : undefined;
     const bound = searchParams.get("bound");
     const authError = searchParams.get("error");
+    const locale = i18n.resolvedLanguage as AppLocale;
+    const nextLocale = locale === "zh-CN" ? "en-US" : "zh-CN";
+    const languageLabel = t("topNav.switchLanguage", { language: t(nextLocale === "zh-CN" ? "locale.zhCN" : "locale.enUS") });
 
     // Linux.do 绑定回调会带着结果回到发起绑定的页面，提示后立刻清掉查询参数。
     useEffect(() => {
@@ -94,16 +101,24 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
     return (
         <div className="inline-flex shrink-0 items-center gap-1">
             {onOpenPlugins ? (
-                <button type="button" className={naturalIconClass} style={iconStyle} onClick={onOpenPlugins} aria-label="节点插件" title="节点插件">
+                <button type="button" className={naturalIconClass} style={iconStyle} onClick={onOpenPlugins} aria-label={t("topNav.plugins")} title={t("topNav.plugins")}>
                     <Puzzle className="size-4" />
                 </button>
             ) : null}
+            <a href={DOCS_URL} target="_blank" rel="noopener noreferrer" className={naturalIconClass} style={iconStyle} aria-label={t("topNav.docs")} title={t("topNav.docs")}>
+                <BookOpen className="size-4" />
+            </a>
             {showConfig ? (
-                <button type="button" className={naturalIconClass} style={iconStyle} onClick={() => openConfigDialog(false)} aria-label="偏好设置" title="偏好设置">
+                <button type="button" className={naturalIconClass} style={iconStyle} onClick={() => openConfigDialog(false)} aria-label={t("navigation.config")} title={t("navigation.config")}>
                     <Settings2 className="size-4" />
                 </button>
             ) : null}
-            <AnimatedThemeToggler theme={theme} onThemeChange={setTheme} className={naturalIconClass} style={iconStyle} aria-label={theme === "dark" ? "切换到浅色主题" : "切换到深色主题"} title={theme === "dark" ? "切换到浅色主题" : "切换到深色主题"} />
+            <Tooltip title={languageLabel} mouseEnterDelay={0.2}>
+                <button type="button" className={`${naturalIconClass} text-[11px] font-semibold tracking-tight`} style={iconStyle} onClick={() => void changeAppLocale(nextLocale)} aria-label={languageLabel}>
+                    {locale === "zh-CN" ? "中" : "EN"}
+                </button>
+            </Tooltip>
+            <AnimatedThemeToggler theme={theme} onThemeChange={setTheme} className={naturalIconClass} style={iconStyle} aria-label={t(theme === "dark" ? "topNav.lightTheme" : "topNav.darkTheme")} title={t(theme === "dark" ? "topNav.lightTheme" : "topNav.darkTheme")} />
             {variant === "canvas" ? null : (
                 <>
                     <VersionReleaseModal style={iconStyle} />
@@ -111,7 +126,7 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
                 </>
             )}
             {onOpenShortcuts ? (
-                <button type="button" className={naturalIconClass} style={iconStyle} onClick={onOpenShortcuts} aria-label="快捷键" title="快捷键">
+                <button type="button" className={naturalIconClass} style={iconStyle} onClick={onOpenShortcuts} aria-label={t("topNav.shortcuts")} title={t("topNav.shortcuts")}>
                     <Keyboard className="size-4" />
                 </button>
             ) : null}

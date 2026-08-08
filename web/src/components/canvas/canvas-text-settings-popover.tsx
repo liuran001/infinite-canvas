@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { Settings2 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { CanvasSurfaceButton } from "@/components/canvas/canvas-surface-button";
 import { reasoningEffortLabel, TextSettingsPanel } from "@/components/text-settings-panel";
@@ -16,6 +17,7 @@ type CanvasTextSettingsPopoverProps = {
 };
 
 export function CanvasTextSettingsPopover({ config, onConfigChange, buttonClassName, placement = "topLeft" }: CanvasTextSettingsPopoverProps) {
+    const { t } = useTranslation();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const buttonRef = useRef<HTMLSpanElement>(null);
     const panelRef = useRef<HTMLDivElement>(null);
@@ -47,7 +49,7 @@ export function CanvasTextSettingsPopover({ config, onConfigChange, buttonClassN
         <>
             <span ref={buttonRef} className="inline-flex min-w-0">
                 <CanvasSurfaceButton theme={theme} surface="node" size="small" className={buttonClassName || "!h-8 !max-w-[170px] !justify-start !rounded-full !px-2.5"} icon={<Settings2 className="size-3.5" />} onClick={() => setOpen((current) => !current)}>
-                    <span className="truncate">推理 · {reasoningEffortLabel(config.reasoningEffort)}</span>
+                    <span className="truncate">{t("canvas.controls.reasoning")} · {reasoningEffortLabel(config.reasoningEffort)}</span>
                 </CanvasSurfaceButton>
             </span>
             {panel}

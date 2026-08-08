@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useState } from "react";
 import { Cpu, Zap } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
@@ -20,13 +21,15 @@ type ModelPickerProps = {
     onMissingConfig?: () => void;
 };
 
-export function ModelPicker({ config, value, onChange, capability, className, fullWidth = false, placeholder = "选择模型", disabled, ariaLabel, onMissingConfig }: ModelPickerProps) {
+export function ModelPicker({ config, value, onChange, capability, className, fullWidth = false, placeholder, disabled, ariaLabel, onMissingConfig }: ModelPickerProps) {
+    const { t } = useTranslation();
     const pickerId = useId();
     const [open, setOpen] = useState(false);
     // 服务器模式下模型来自服务端，订阅它才能在配置拉回来后重新计算选项。
     const serverModels = useServerStore((state) => state.settings?.modelChannel.models);
     const options = useMemo(() => Array.from(new Set(selectableModelsByCapability(config, capability).filter((model): model is string => Boolean(model)))), [capability, config, serverModels]);
     const current = value || "";
+    const pickerPlaceholder = placeholder || t("settingsPanels.model.select");
 
     useEffect(() => {
         const closeOtherPicker = (event: Event) => {
@@ -59,10 +62,10 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
                 onMouseDown={(event) => event.stopPropagation()}
                 onPointerDown={(event) => event.stopPropagation()}
                 aria-label={ariaLabel}
-                title={current ? modelOptionLabel(config, current) : placeholder}
+                title={current ? modelOptionLabel(config, current) : pickerPlaceholder}
             >
                 <ModelIcon model={current} />
-                <span className="canvas-model-picker-text min-w-0 flex-1 truncate text-left">{current ? modelOptionLabel(config, current) : placeholder}</span>
+                <span className="canvas-model-picker-text min-w-0 flex-1 truncate text-left">{current ? modelOptionLabel(config, current) : pickerPlaceholder}</span>
             </SelectTrigger>
             <SelectContent
                 data-canvas-no-zoom

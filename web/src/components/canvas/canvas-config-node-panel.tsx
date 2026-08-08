@@ -2,6 +2,7 @@ import type { CSSProperties, ReactNode } from "react";
 import { useEffect } from "react";
 import { Image as ImageIcon, LoaderCircle, MessageSquare, Music2, Play, Settings2, Square, Video, Zap } from "lucide-react";
 import { Button, Segmented } from "antd";
+import { useTranslation } from "react-i18next";
 
 import { ModelPicker } from "@/components/model-picker";
 import { defaultConfig, generationCreditCost, resolveModelForCapability, useConfigStore, useEffectiveConfig, useEnabledCapabilities, type AiConfig } from "@/stores/use-config-store";
@@ -12,13 +13,6 @@ import { CanvasAudioSettingsPopover, type CanvasAudioSettingKey } from "./canvas
 import { CanvasVideoSettingsPopover } from "./canvas-video-settings-popover";
 import { CanvasTextSettingsPopover } from "./canvas-text-settings-popover";
 import type { CanvasGenerationMode, CanvasNodeData, CanvasNodeMetadata } from "@/types/canvas";
-
-const modeOptions: Array<{ value: CanvasGenerationMode; label: ReactNode }> = [
-    { value: "image", label: <ModeLabel icon={<ImageIcon className="size-3.5" />} text="生图" /> },
-    { value: "text", label: <ModeLabel icon={<MessageSquare className="size-3.5" />} text="文本" /> },
-    { value: "video", label: <ModeLabel icon={<Video className="size-3.5" />} text="视频" /> },
-    { value: "audio", label: <ModeLabel icon={<Music2 className="size-3.5" />} text="音频" /> },
-];
 
 function ModeLabel({ icon, text }: { icon: ReactNode; text: string }) {
     return (
@@ -40,10 +34,17 @@ type CanvasConfigNodePanelProps = {
 };
 
 export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigChange, onGenerate, onStop, onComposerToggle }: CanvasConfigNodePanelProps) {
+    const { t } = useTranslation();
     const globalConfig = useEffectiveConfig();
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const capabilities = useEnabledCapabilities();
+    const modeOptions: Array<{ value: CanvasGenerationMode; label: ReactNode }> = [
+        { value: "image", label: <ModeLabel icon={<ImageIcon className="size-3.5" />} text={t("canvas.configNode.image")} /> },
+        { value: "text", label: <ModeLabel icon={<MessageSquare className="size-3.5" />} text={t("canvas.configNode.text")} /> },
+        { value: "video", label: <ModeLabel icon={<Video className="size-3.5" />} text={t("canvas.configNode.video")} /> },
+        { value: "audio", label: <ModeLabel icon={<Music2 className="size-3.5" />} text={t("canvas.configNode.audio")} /> },
+    ];
     const availableModes = modeOptions.filter((option) => capabilities[option.value]);
     const savedMode = node.metadata?.generationMode || "image";
     // 对应能力被隐藏时回落到第一个可用模式，避免节点停在选不到模型的模式上。
@@ -63,20 +64,20 @@ export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigC
     return (
         <div className="flex h-full w-full cursor-move flex-col px-3 pb-3 pt-7 text-sm" style={{ color: theme.node.text }} onWheel={(event) => event.stopPropagation()}>
             <div className="mb-2 flex items-center justify-between gap-3">
-                <div className="shrink-0 text-sm font-semibold">生成配置</div>
+                <div className="shrink-0 text-sm font-semibold">{t("canvas.configNode.title")}</div>
                 <div className="cursor-default" onMouseDown={(event) => event.stopPropagation()}>
                     <Segmented size="small" className="canvas-config-mode !rounded-md !p-0.5" value={mode} onChange={(value) => onConfigChange(node.id, { generationMode: value as CanvasGenerationMode })} options={availableModes} />
                 </div>
             </div>
 
             <div className="mb-2 flex flex-wrap gap-1.5">
-                <InputChip label="提示词" value={`${inputSummary.textCount} 个`} style={chipStyle} />
-                <InputChip label="参考图" value={`${inputSummary.imageCount} 张`} style={chipStyle} />
-                {capabilities.video ? <InputChip label="参考视频" value={`${inputSummary.videoCount} 个`} style={chipStyle} /> : null}
-                {capabilities.audio ? <InputChip label="参考音频" value={`${inputSummary.audioCount} 个`} style={chipStyle} /> : null}
+                <InputChip label={t("canvas.configNode.prompt")} value={t("canvas.configNode.items", { count: inputSummary.textCount })} style={chipStyle} />
+                <InputChip label={t("canvas.configNode.references")} value={t("canvas.configNode.images", { count: inputSummary.imageCount })} style={chipStyle} />
+                {capabilities.video ? <InputChip label={t("canvas.configNode.videoReferences")} value={t("canvas.configNode.items", { count: inputSummary.videoCount })} style={chipStyle} /> : null}
+                {capabilities.audio ? <InputChip label={t("canvas.configNode.audioReferences")} value={t("canvas.configNode.items", { count: inputSummary.audioCount })} style={chipStyle} /> : null}
                 <button type="button" className="inline-flex h-7 cursor-pointer items-center gap-1 rounded-md border px-2 text-[11px]" style={chipStyle} onMouseDown={(event) => event.stopPropagation()} onClick={onComposerToggle}>
                     <Settings2 className="size-3.5" />
-                    组装提示词
+                    {t("canvas.configNode.compose")}
                 </button>
             </div>
 
@@ -127,12 +128,12 @@ export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigC
                         <>
                             <LoaderCircle className="size-4 animate-spin" />
                             <Square className="size-3.5 fill-current" />
-                            <span>停止</span>
+                            <span>{t("canvas.configNode.stop")}</span>
                         </>
                     ) : (
                         <>
                             <Play className="size-4" />
-                            <span>开始生成</span>
+                            <span>{t("canvas.configNode.generate")}</span>
                             {generationCost ? (
                                 <span className="inline-flex items-center gap-0.5 opacity-70">
                                     <Zap className="size-3.5" />

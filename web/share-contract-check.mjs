@@ -139,6 +139,8 @@ const pluginHost = read("pages/canvas/hooks/use-plugin-host.tsx");
 const agentPanel = read("components/agent/agent-panel.tsx");
 const agentModeSwitch = read("components/agent/agent-mode-switch.tsx");
 const localAgentPanel = read("components/agent/local-agent-panel.tsx");
+const localAgentSend = block(localAgentPanel, "const sendPrompt = async () => {", "const stopTurn = async () => {");
+const canvasImageData = read("lib/canvas/canvas-image-data.ts");
 check("完整画布工作区可被分享页复用", /export function InfiniteCanvasPage\(\{ shared = false \}/.test(projectPage), "InfiniteCanvasPage 还不是可注入分享运行时的公共工作区");
 check("fullCanvas 分享进入完整工作区", /if \(fullCanvas\)[\s\S]{0,500}?<InfiniteCanvasPage shared/.test(sharePage), "分享页没有按 fullCanvas 切换到完整工作区");
 check("完整分享工作区保存到 share store", /shared[\s\S]*pushShareProject\(/.test(projectPage), "分享工作区仍可能把项目写进 useCanvasStore");
@@ -147,12 +149,24 @@ check("完整分享工作区上传走 guest 通道", /uploadShareImage/.test(pro
 check("完整分享工作区隐藏所有者操作", /shared \? <SharedCanvasTopBar/.test(projectPage), "分享工作区仍显示新建、删除或管理分享等所有者操作");
 check("分享会话续期同步完整权限", /fullCanvas:\s*session\.fullCanvas/.test(shareSession) && /ownerPays:\s*session\.ownerPays/.test(shareSession) && /allowAnonymousEdit:\s*session\.allowAnonymousEdit/.test(shareSession), "续期只更新了令牌，权限收回不能立即生效");
 check("分享完整工作区恢复进行中任务", /shareApi\.jobs\(guestToken/.test(projectPage) && /resumeCanvasJob\(job\)/.test(projectPage), "刷新会把仍在运行的分享任务误标成中断");
-check("分享任务恢复按节点只取最新任务", /seenJobNodes\.has\(nodeId\)/.test(projectPage), "同一节点的历史任务会与当前任务同时恢复并互相覆盖");
-check("已打开协作者持续接管新增分享任务", /shareJobByNodeRef/.test(projectPage) && /loadingShareNodeKey/.test(projectPage) && /window\.setInterval\(recoverShareJobs/.test(projectPage), "只有首次打开时恢复分享任务，远程新出现的 loading 节点会一直卡住");
-check("动态接管只排除真正活跃的等待流程", /generationRequestsRef\.current\.has\(nodeId\)/.test(projectPage) && !/locallyTrackedJobIds/.test(projectPage), "持久化的旧任务记录会永久阻止后续接管");
+const shareJobSelection = block(projectPage, "function trackedShareCanvasJobs", "function canvasJobNode");
+const shareJobMatching = block(projectPage, "function canvasJobImageId", "function isResumableCanvasJob");
+const dynamicShareRecovery = block(projectPage, "const recoverShareJobs = async", "void recoverShareJobs();");
+const resumedImageJob = block(projectPage, 'if (job.kind === "image")', "const media = await resumeMedia");
+const deleteBatchImage = block(projectPage, "const deleteBatchImage = useCallback", "const retryBatchImage");
+check("分享图片任务按 clientJobId 精确匹配槽位", /seenClientJobIds\.has\(job\.clientJobId\)/.test(shareJobSelection) && /image\.id === job\.clientJobId/.test(shareJobMatching), "同一节点的多个图片槽位没有按各自幂等键恢复");
+check("已打开协作者持续接管新增分享图片槽位", /shareJobByRequestRef/.test(projectPage) && /loadingShareNodeKey/.test(projectPage) && /canvasJobRequestKey\(nodesRef\.current, job\)/.test(dynamicShareRecovery) && /window\.setInterval\(recoverShareJobs/.test(projectPage), "远程新出现的 loading 槽位不会被持续接管");
+check("动态接管只排除真正活跃的等待流程", /generationRequestsRef\.current\.has\(requestKey\)/.test(dynamicShareRecovery) && /generationRequestsRef\.current\.has\(nodeId\)/.test(dynamicShareRecovery) && !/locallyTrackedJobIds/.test(projectPage), "本机正在等待整根节点时会重复接管槽位任务，或持久化旧记录会永久阻止接管");
 check("恢复任务按 jobId fencing 并接入取消", /jobId\?: string/.test(projectPage) && /isCurrentCanvasJob/.test(projectPage) && /startGenerationRequest\([^;]*job\.jobId/.test(projectPage), "旧任务晚到仍可能覆盖新任务，或恢复中的任务无法取消");
-check("恢复批量任务会结算批次根节点和来源节点", /settleRecoveredGenerationAncestors/.test(projectPage) && /batchRootId/.test(block(projectPage, "const resumeCanvasJob = useCallback", "const confirmStopGeneration")), "发起者离页后只回填子节点，批次根节点或配置节点会永久停在 loading");
-check("恢复批量任务只让首个成功结果占据根节点", /!batchRoot\?\.metadata\?\.primaryImageId/.test(block(projectPage, "const resumeCanvasJob = useCallback", "const confirmStopGeneration")), "并发恢复的后续子任务会反复覆盖批次根节点");
+check("单节点多图恢复会结算根节点和来源节点", /item\.metadata\?\.images\?\.map/.test(resumedImageJob) && /settleRecoveredGenerationAncestors\(next, connectionsRef\.current, nodeId\)/.test(resumedImageJob) && !/batchRootId/.test(resumedImageJob), "图片槽位恢复后没有结算所属图片节点及其来源节点");
+check("单节点多图恢复只让首个成功结果占据主图", /const makePrimary = !item\.metadata\?\.content \|\| !item\.metadata\?\.primaryImageId \|\| item\.metadata\.primaryImageId === imageId/.test(resumedImageJob) && /primaryImageId: makePrimary \? imageId : item\.metadata\?\.primaryImageId/.test(resumedImageJob), "并发恢复的后续图片槽位会反复覆盖主图");
+check(
+    "删除多图主图同步顶层媒体字段",
+    /const primaryImage = item\.metadata\?\.primaryImageId === imageId \? images\[0\] : undefined/.test(deleteBatchImage) &&
+        ["content", "storageKey", "naturalWidth", "naturalHeight", "bytes", "mimeType"].every((field) => new RegExp(`${field}: primaryImage\\.${field}`).test(deleteBatchImage)) &&
+        /primaryImageId: primaryImage\?\.id/.test(deleteBatchImage),
+    "新主图只替换了 primaryImageId，下载、素材、编辑和生成参考仍会读到已删图片",
+);
 check("分享完整工作区挂载自费确认", /useShareBillingConsentPrompt\(\)/.test(sharePage), "扣点操作前没有可用的自费确认弹窗");
 check("登录协作者显示个人资产而匿名继续隐藏", /showAssets=\{!shared \|\| Boolean\(serverToken\)\}/.test(projectPage) && /\{!shared \|\| serverToken \? <AssetPickerModal/.test(projectPage), "登录协作者看不到个人资产，或匿名访客错误获得账号资产入口");
 check("协作者插入个人图片前复制到房主空间", /uploadShareImage\(payload\.dataUrl \|\| resolveImageUrl\(payload\.storageKey\)\)/.test(projectPage), "个人图片 fileId 被直接写进房主画布，其他协作者无法读取");
@@ -209,6 +223,8 @@ check("分享页本地 Agent 禁止链接参数自动连接", /const restricted 
 check("分享页本地 Agent 必须本页手动授权连接", /manualConnectionRef/.test(localAgentPanel) && /restricted && !manualConnectionRef\.current/.test(localAgentPanel) && /manualConnectionRef\.current = true/.test(localAgentPanel), "分享页会继承旧页面的 enabled 状态自动连接并上报画布");
 check("分享页本地 Agent 屏蔽账号级工具与页面跳转", /restricted && \(isSiteTool\(payload\.name\) \|\| payload\.name === "site_navigate"\)/.test(localAgentPanel), "分享 Agent 仍可读取账号资产、工作台或跳离当前分享画布");
 check("本地 Agent 产物按分享通道复制", /uploadCanvasAgentImage/.test(localAgentPanel) && /uploadShareImage/.test(localAgentPanel) && /share\.fullCanvas/.test(localAgentPanel), "本地 Agent 插入的图片仍落在协作者个人空间，房主和其他协作者无法读取");
+check("本地 Agent 画布引用预处理失败会复位发送态", /try \{[\s\S]{0,1200}?resolveCanvasReferenceImages[\s\S]{0,1200}?createMessageAttachmentMetadata\(image\)[\s\S]{0,500}?\} catch \(error\) \{[\s\S]{0,300}?sending: false[\s\S]{0,400}?addMessage/.test(localAgentSend), "画布引用生成消息预览失败后会永久停在发送中且没有错误提示");
+check("画布图片加载失败会显式拒绝", /new Promise<HTMLImageElement>\(\(resolve, reject\)/.test(canvasImageData) && /image\.onerror\s*=\s*\(\)\s*=>\s*reject\(new Error\(/.test(canvasImageData), "图片解码失败时 Promise 会永久挂起");
 
 console.log("Agent 入口路由契约");
 const appTopNav = read("components/layout/app-top-nav.tsx");

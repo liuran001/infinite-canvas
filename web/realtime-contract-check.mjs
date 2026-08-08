@@ -172,12 +172,14 @@ check("分享 ready 过滤自己的 presence", /clientId !== shareClientId/.test
 check("分享按 revision 去重后再拉取", /revision > lastRevision|revision <= lastRevision/.test(shareSync));
 check("分享忽略自己写入的事件", /writerClientId === shareClientId/.test(shareSync));
 check("分享保留 SSE 降级", /shareProjectStream\(/.test(shareSync) && /watchShareProjectViaSse/.test(shareSync));
-check("分享连续失败才启用 SSE", /onDegrade: \(\) => \{[\s\S]{0,200}?startFallback\(\)/.test(shareSync));
+const shareOnDegrade = (/onDegrade: \(\) => \{([\s\S]*?)\n\s*\},\n\s*onRecover:/.exec(shareSync) || [])[1] || "";
+const shareOnTerminal = (/onTerminal: \(failure\) => \{([\s\S]*?)\n\s*\},\n\s*\}\);/.exec(shareSync) || [])[1] || "";
+check("分享连续失败才启用 SSE", /refreshShareSession\(\)\.finally\(startFallback\)/.test(shareOnDegrade));
 check("分享 ready 后停止 SSE 降级", /onRecover: stopFallback/.test(shareSync) && /onReady[\s\S]{0,400}?stopFallback\(\)/.test(shareSync));
 // 撤销是终态：服务端会主动断开这条频道，但降级成只读也走同一条路径，
 // 直接判失效会把「你现在只能看」误报成「链接没了」。重新鉴权一次才分得清。
-check("撤销后重新鉴权而不是直接判失效", /onTerminal: \(failure\) => \{[\s\S]*?startFallback\(\);\s*\n\s*\},/.test(shareSync), "撤销与降级走同一条断流路径，直接判失效会把「变只读」误报成「链接没了」");
-check("确证失效才进 gone 终态", /markGone\(/.test(shareSync) && /FORBIDDEN|PROJECT_NOT_FOUND/.test(shareSync));
+check("撤销后重新鉴权而不是直接判失效", /refreshShareSession\(\)\.finally\(startFallback\)/.test(shareOnTerminal) && /failure\.code === "REVOKED"/.test(shareOnTerminal) === false, "撤销与降级走同一条断流路径，直接判失效会把「变只读」误报成「链接没了」");
+check("确证失效才进 gone 终态", /failure\.code === "PROJECT_NOT_FOUND" \|\| failure\.code === "NOT_FOUND"/.test(shareOnTerminal) && /markGone\(/.test(shareOnTerminal));
 check("分享 presence 优先 WebSocket 且保留 HTTP", /subscription\.presence\(|presence\(\{/.test(shareSync) && /shareApi\.updatePresence\(/.test(shareSync));
 // 「有订阅对象」不等于「这一帧发出去了」：不看返回值就直接 return，会让访客在降级窗口里彻底隐身。
 check("分享 presence 只在发送成功时跳过 HTTP", /sharePresence\.get\(projectId\)\?\.presence\(\{[^)]*\}\)\) return;/.test(shareSync), "share-sync 没有按 presence() 的返回值决定是否回落 HTTP");

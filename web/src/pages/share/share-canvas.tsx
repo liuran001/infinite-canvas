@@ -18,7 +18,6 @@ import { canvasThemes } from "@/lib/canvas-theme";
 import { audioExtension, hydrateCanvasImages, imageExtension } from "@/lib/canvas/canvas-generation-helpers";
 import { imageMetadata } from "@/lib/canvas/canvas-node-factory";
 import { fitNodeSize } from "@/lib/canvas/canvas-node-size";
-import { isHiddenBatchChild, isHiddenBatchConnectionEndpoint } from "@/lib/canvas/canvas-node-geometry";
 import { IMAGE_FILE_ACCEPT, isImageFile } from "@/lib/image-transcode";
 import { shareApi, isShareGone } from "@/services/api/share";
 import { uploadShareImage } from "@/services/share-upload";
@@ -66,6 +65,7 @@ export default function ShareCanvasPage() {
     const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
     const [infoNodeId, setInfoNodeId] = useState<string | null>(null);
     const [previewNodeId, setPreviewNodeId] = useState<string | null>(null);
+    const [expandedImageNodeId, setExpandedImageNodeId] = useState<string | null>(null);
     const [isMiniMapOpen, setIsMiniMapOpen] = useState(false);
     const [uploading, setUploading] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -96,7 +96,6 @@ export default function ShareCanvasPage() {
     const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
     const infoNode = infoNodeId ? nodeById.get(infoNodeId) || null : null;
     const previewNode = previewNodeId ? nodeById.get(previewNodeId) || null : null;
-    const visibleNodes = useMemo(() => nodes.filter((node) => !isHiddenBatchChild(node, nodes)), [nodes]);
     const remotePresenceByNodeId = useMemo(() => {
         const map = new Map<string, typeof members>();
         members.forEach((member) => member.nodeIds.forEach((nodeId) => map.set(nodeId, [...(map.get(nodeId) || []), member])));
@@ -285,6 +284,12 @@ export default function ShareCanvasPage() {
         saveAs(node.metadata.content, `canvas-${node.type}-${node.id}.${extension}`);
     }, []);
 
+    const downloadBatchImage = useCallback((node: CanvasNodeData, imageId: string) => {
+        const image = node.metadata?.images?.find((item) => item.id === imageId);
+        if (!image?.content) return;
+        saveAs(image.content, `canvas-image-${node.id}-${image.id}.${imageExtension(image.content)}`);
+    }, []);
+
     useEffect(() => {
         if (!editable) return;
         const move = (event: MouseEvent) => {
@@ -446,6 +451,7 @@ export default function ShareCanvasPage() {
                 <InfiniteCanvas
                     containerRef={containerRef}
                     viewport={viewport}
+                    tool="pan"
                     backgroundMode={project.backgroundMode || "lines"}
                     onViewportChange={setViewport}
                     onCanvasDeselect={() => setSelectedNodeIds(new Set())}
@@ -467,7 +473,7 @@ export default function ShareCanvasPage() {
                             .filter((connection) => {
                                 const from = nodeById.get(connection.fromNodeId);
                                 const to = nodeById.get(connection.toNodeId);
-                                return Boolean(from && to && !isHiddenBatchConnectionEndpoint(from, nodes) && !isHiddenBatchConnectionEndpoint(to, nodes));
+                                return Boolean(from && to);
                             })
                             .map((connection) => {
                                 const from = nodeById.get(connection.fromNodeId);
@@ -480,7 +486,7 @@ export default function ShareCanvasPage() {
                     {/* viewer 保留节点指针事件，用于打开只读菜单；按下不会进入拖拽，编辑访客仍走原交互。 */}
                     <div>
                         {/* 缩放起止在这里是空实现：那对回调只用来临时藏掉跟随节点的浮层工具条，而分享页没有工具条。 */}
-                        {visibleNodes.map((node) => (
+                        {nodes.map((node) => (
                             <CanvasNode
                                 key={node.id}
                                 data={node}
@@ -494,7 +500,7 @@ export default function ShareCanvasPage() {
                                 isConnecting={false}
                                 showPanel={false}
                                 showImageInfo={Boolean(project.showImageInfo)}
-                                batchCount={0}
+                                batchExpanded={expandedImageNodeId === node.id}
                                 groupChildCount={0}
                                 onMouseDown={handleNodeMouseDown}
                                 onHoverStart={() => undefined}
@@ -505,6 +511,8 @@ export default function ShareCanvasPage() {
                                 onResizeEnd={() => undefined}
                                 onContentChange={handleContentChange}
                                 onTitleChange={handleTitleChange}
+                                onToggleBatch={(nodeId) => setExpandedImageNodeId((current) => (current === nodeId ? null : nodeId))}
+                                onDownloadBatchImage={downloadBatchImage}
                                 onContextMenu={(event) => {
                                     event.preventDefault();
                                     event.stopPropagation();

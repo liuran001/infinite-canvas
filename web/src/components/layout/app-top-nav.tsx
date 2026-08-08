@@ -1,5 +1,6 @@
 import { Menu } from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 
 import { navigationTools, type NavigationToolSlug } from "@/constant/navigation-tools";
 import { useNavigationTools } from "@/hooks/use-navigation-tools";
@@ -10,6 +11,7 @@ import { cn } from "@/lib/utils";
 import { useState } from "react";
 
 export function AppTopNav() {
+    const { t } = useTranslation();
     const { pathname } = useLocation();
     const [mobileNavOpen, setMobileNavOpen] = useState(false);
     const visibleTools = useNavigationTools();
@@ -31,15 +33,15 @@ export function AppTopNav() {
                                         WebkitMask: "url(/logo.svg) center / contain no-repeat",
                                     }}
                                 />
-                                <span className="text-base font-medium">无限画布</span>
+                                <span className="text-base font-medium">{t("meta.title")}</span>
                             </Link>
 
                             <button
                                 type="button"
                                 className="ml-3 inline-flex size-8 shrink-0 items-center justify-center text-stone-600 transition hover:text-stone-950 md:hidden dark:text-stone-300 dark:hover:text-white"
                                 onClick={() => setMobileNavOpen(true)}
-                                aria-label="打开导航菜单"
-                                title="导航菜单"
+                                aria-label={t("topNav.openMenu")}
+                                title={t("topNav.menu")}
                             >
                                 <Menu className="size-5" />
                             </button>
@@ -60,7 +62,7 @@ export function AppTopNav() {
                                             )}
                                         >
                                             <Icon className="size-4" />
-                                            <span className="truncate">{tool.label}</span>
+                                            <span className="truncate">{t(`navigation.${tool.slug}`, { defaultValue: tool.label })}</span>
                                         </Link>
                                     );
                                 })}
