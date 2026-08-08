@@ -288,7 +288,7 @@ export default {
             zoom: "缩放画布",
             zoomSlider: "缩放滑杆",
             preciseZoom: "精确调整缩放",
-            boxSelect: "框选多个节点",
+            boxSelect: "按当前工具移动画布或框选节点",
             addSelection: "追加选择节点",
             selectAll: "全选节点",
             copyPaste: "复制 / 粘贴节点，或粘贴剪切板文本/图片",

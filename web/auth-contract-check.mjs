@@ -16,6 +16,7 @@ const api = read("services/api/server.ts");
 const localData = read("services/account-local-data.ts");
 const teamRealtime = read("services/team-realtime.ts");
 const modal = read("components/layout/login-modal.tsx");
+const userStatusActions = read("components/layout/user-status-actions.tsx");
 const retryLabel = modal.lastIndexOf("重新登录");
 const retryBlock = retryLabel < 0 ? "" : modal.slice(Math.max(0, retryLabel - 500), retryLabel + 40);
 
@@ -30,6 +31,9 @@ check("补邀请码页重新登录会回到验证码登录框", /setLoginOpen\(t
 check("会话失效前保留账号 ID 用于清理本地数据", /const ownerId = useServerStore\.getState\(\)\.user\?\.id \|\| "";[\s\S]{0,180}?clearSession\(\);[\s\S]{0,260}?clearCurrentAccountLocalData\(ownerId\)/.test(api));
 check("账号本地资产同时清理 IndexedDB 与降级 localStorage", /ACCOUNT_STORE_KEYS\.forEach\(\(key\) => localStorage\.removeItem\(key\)\)/.test(localData) && /ACCOUNT_STORE_KEYS\.map\(\(key\) => localforage\.removeItem\(key\)\)/.test(localData));
 check("团队实时鉴权失效复用账号清理流程", /if \(response\.status === 401\) \{\s*expireAccountSession\(\);/.test(teamRealtime));
+
+console.log("用户顶栏入口契约");
+check("顶栏不重新引入文档按钮", !/<a[^>]*href=\{DOCS_URL\}/.test(userStatusActions) && !/<BookOpen\b/.test(userStatusActions));
 
 console.log(`\n通过 ${pass}，失败 ${fail}`);
 process.exit(fail ? 1 : 0);

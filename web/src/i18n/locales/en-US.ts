@@ -288,7 +288,7 @@ export default {
             zoom: "Zoom canvas",
             zoomSlider: "Zoom slider",
             preciseZoom: "Adjust zoom precisely",
-            boxSelect: "Select multiple nodes",
+            boxSelect: "Pan the canvas or box-select nodes with the active tool",
             addSelection: "Add nodes to selection",
             selectAll: "Select all nodes",
             copyPaste: "Copy/paste nodes or paste clipboard text/images",

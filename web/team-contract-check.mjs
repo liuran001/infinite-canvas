@@ -235,6 +235,15 @@ check("昵称允许留空并回落到用户名", /displayName \|\| user\?\.usern
 check("昵称字段保留表单标签", /<Form\.Item name="displayName" label="昵称"/.test(accountModal), "移除重复标题时把昵称字段本身的可见标签也删掉了");
 check("昵称字段不重复显示分区标题", !/>昵称<\/div>/.test(accountModal), "分区标题和表单标签都写了昵称，弹窗里会连续显示两行昵称");
 
+console.log("画布选择与拖动契约");
+
+const canvasProject = read("pages/canvas/project.tsx");
+const infiniteCanvas = read("components/canvas/infinite-canvas.tsx");
+check("画布默认使用移动工具", /useState<"select" \| "pan">\("pan"\)/.test(canvasProject), "进入画布后仍默认框选，空白处拖动不能直接移动视图");
+check("移动工具只在空白处接管左键", /event\.button === 0 && \(isSpacePressed \|\| \(isBackgroundClick && activeTool === "pan"\)\)/.test(infiniteCanvas), "移动模式会吞掉节点点击或节点拖动");
+check("Ctrl 临时切换选择与移动", /event\.ctrlKey \? \(tool === "select" \? "pan" : "select"\) : tool/.test(infiniteCanvas), "按住 Ctrl 没有临时切换当前工具");
+check("空格始终临时移动画布", /isSpacePressed \? "pan" : isControlPressed/.test(infiniteCanvas), "选择模式下按空格没有稳定切到移动画布");
+
 console.log("画布按钮的 hover 契约");
 
 // 这几条是「以后不会再犯」的机械保证，不是对某几个按钮的抽查。
