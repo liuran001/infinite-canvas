@@ -20,3 +20,6 @@ web/ui-check-*.png
 
 # oh-my-claudecode 运行时状态，不入库
 .omc/
+
+# Claude Code 生成的临时工作树，不入库
+.claude/worktrees/

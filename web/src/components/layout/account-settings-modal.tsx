@@ -120,21 +120,18 @@ export function AccountSettingsModal({ open, onClose }: { open: boolean; onClose
             </div>
 
             {user ? (
-                <>
-                    <div className="mt-5 text-sm font-semibold">昵称</div>
-                    <Form form={profileForm} layout="vertical" className="mt-3" requiredMark={false} disabled={savingProfile} onFinish={submitProfile}>
-                        {/*
-                         * 用户名不给改：它是登录凭据，也是流水、邀请记录里定位到人的锚点，改掉之后那些历史记录会指向一个不存在的名字。
-                         * 昵称允许留空——全站显示处都写成 displayName || username，空值会自然回落到用户名，不会出现无名氏。
-                         */}
-                        <Form.Item name="displayName" label="昵称" extra={`留空则显示用户名「${user.username}」。用户名不可修改。`} className="mb-3">
-                            <Input maxLength={DISPLAY_NAME_MAX} showCount placeholder="想让别人怎么称呼你" />
-                        </Form.Item>
-                        <Button type="primary" htmlType="submit" loading={savingProfile}>
-                            保存昵称
-                        </Button>
-                    </Form>
-                </>
+                <Form form={profileForm} layout="vertical" className="mt-5" requiredMark={false} disabled={savingProfile} onFinish={submitProfile}>
+                    {/*
+                     * 用户名不给改：它是登录凭据，也是流水、邀请记录里定位到人的锚点，改掉之后那些历史记录会指向一个不存在的名字。
+                     * 昵称允许留空——全站显示处都写成 displayName || username，空值会自然回落到用户名，不会出现无名氏。
+                     */}
+                    <Form.Item name="displayName" label="昵称" extra={`留空则显示用户名「${user.username}」。用户名不可修改。`} className="mb-3">
+                        <Input maxLength={DISPLAY_NAME_MAX} showCount placeholder="想让别人怎么称呼你" />
+                    </Form.Item>
+                    <Button type="primary" htmlType="submit" loading={savingProfile}>
+                        保存昵称
+                    </Button>
+                </Form>
             ) : null}
 
             {storage ? (
