@@ -9,7 +9,7 @@
   <a href="https://render.com/deploy?repo=https://github.com/liuran001/infinite-canvas"><img src="https://img.shields.io/badge/Render-Deploy-46e3b7?style=flat-square&logo=render&logoColor=111111" alt="Deploy to Render"></a>
   <a href="https://github.com/liuran001/infinite-canvas"><img src="https://img.shields.io/github/stars/liuran001/infinite-canvas?style=flat-square&logo=github" alt="GitHub stars"></a>
   <a href="https://github.com/liuran001/infinite-canvas/tags"><img src="https://img.shields.io/github/v/tag/liuran001/infinite-canvas?style=flat-square&label=version" alt="Version"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-f97316?style=flat-square" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-f97316?style=flat-square" alt="License"></a>
   <a href="https://vite.dev/"><img src="https://img.shields.io/badge/Vite-7-646cff?style=flat-square&logo=vite&logoColor=white" alt="Vite"></a>
   <a href="https://reactrouter.com/"><img src="https://img.shields.io/badge/React_Router-7-ca4245?style=flat-square&logo=reactrouter&logoColor=white" alt="React Router"></a>
 </p>
@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/content/docs/overview/quick-start.mdx">快速开始</a> · <a href="docs/content/docs/overview/features.mdx">功能介绍</a> · <a href="docs/content/docs/overview/server-mode.mdx">部署与使用</a> · <a href="docs/content/docs/overview/render.mdx">Render 部署</a> · <a href="docs/content/docs/overview/docker.mdx">Docker 部署</a> · <a href="docs/content/docs/canvas/canvas-node-manual.mdx">画布节点操作手册</a> · <a href="docs/content/docs/canvas/canvas-shortcuts.mdx">画布快捷键</a> · <a href="CLA.md">贡献者协议</a> · <a href="SECURITY.md">漏洞提交</a> · <a href="docs/content/docs/progress/todo.mdx">待办事项</a> · <a href="canvas-agent/README.md">本地 Canvas Agent</a> · <a href="plugins/infinite-canvas">Codex app 插件</a>
+  <a href="docs/content/docs/overview/quick-start.mdx">快速开始</a> · <a href="docs/content/docs/overview/features.mdx">功能介绍</a> · <a href="docs/content/docs/overview/server-mode.mdx">部署与使用</a> · <a href="docs/content/docs/overview/render.mdx">Render 部署</a> · <a href="docs/content/docs/overview/docker.mdx">Docker 部署</a> · <a href="docs/content/docs/canvas/canvas-node-manual.mdx">画布节点操作手册</a> · <a href="docs/content/docs/canvas/canvas-shortcuts.mdx">画布快捷键</a> · <a href="SECURITY.md">漏洞提交</a> · <a href="docs/content/docs/progress/todo.mdx">待办事项</a> · <a href="canvas-agent/README.md">本地 Canvas Agent</a> · <a href="plugins/infinite-canvas">Codex app 插件</a>
 </p>
 
 无限画布是一款面向图片创作的开源工作台。它把画布编排、AI 图片生成、参考图编辑、对话助手、提示词库和素材沉淀放在同一个界面里，适合用来探索视觉方案并连续迭代图片结果。
@@ -142,11 +142,7 @@ docker compose up -d
 
 ## 开源协议
 
-本项目使用 GNU Affero General Public License v3.0，见 [LICENSE](LICENSE)。
-
-你可以在遵守 AGPL-3.0 的前提下自由使用、复制、修改和分发本项目。如果你分发修改后的版本，或将其作为网站、SaaS 等网络服务提供给他人使用，需要向对应用户公开基于本项目形成的完整源代码，继续使用 AGPL-3.0 协议，并保留原项目的作者、版权、许可证和来源说明。
-
-本项目禁止未经授权的闭源商用。如果你希望将无限画布用于商业项目，请尊重开源，遵循 AGPL-3.0 协议，继续开源基于本项目修改或开发的对应代码，回馈开源社区；如果无法公开对应代码，请联系作者购买商业授权后闭源使用。
+本项目使用 [MIT License](LICENSE)。任何人都可以免费使用、复制、修改、分发、再授权和商业使用本项目，也可以用于闭源产品。
 
 ## Star History
 
