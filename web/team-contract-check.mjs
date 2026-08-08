@@ -232,7 +232,7 @@ check("昵称有长度上限", /maxLength=\{DISPLAY_NAME_MAX\}/.test(accountModa
 // 弹窗不销毁表单，上次改了一半又关掉的草稿会留着，下次打开看到的就不是账号真正的昵称。
 check("每次打开用当前昵称重置表单", /if \(open\) profileForm\.setFieldsValue/.test(accountModal), "上次没保存的草稿会留在输入框里，看着像是账号的真实昵称");
 check("昵称允许留空并回落到用户名", /displayName \|\| user\?\.username/.test(accountModal), "空昵称没有回落，界面上会出现无名氏");
-check("昵称字段保留表单标签", /<Form\.Item name="displayName" label="昵称"/.test(accountModal), "移除重复标题时把昵称字段本身的可见标签也删掉了");
+check("昵称字段保留表单标签", /<Form\.Item name="displayName" label=\{t\("account\.profile\.displayName"\)\}/.test(accountModal), "移除重复标题时把昵称字段本身的可见标签也删掉了");
 check("昵称字段不重复显示分区标题", !/>昵称<\/div>/.test(accountModal), "分区标题和表单标签都写了昵称，弹窗里会连续显示两行昵称");
 
 console.log("画布选择与拖动契约");

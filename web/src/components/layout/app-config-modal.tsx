@@ -1,4 +1,5 @@
 import { App, Button, Form, Input, Modal, Select, Switch } from "antd";
+import { useTranslation } from "react-i18next";
 
 import { imageAspectOptions, imageQualityOptions } from "@/components/image-settings-panel";
 import { ModelPicker } from "@/components/model-picker";
@@ -9,14 +10,14 @@ import { useServerStore } from "@/stores/use-server-store";
 type ModelGroup = {
     capability: ModelCapability;
     modelKey: "imageModel" | "videoModel" | "textModel" | "audioModel";
-    defaultLabel: string;
+    labelKey: string;
 };
 
 const modelGroups: ModelGroup[] = [
-    { capability: "image", modelKey: "imageModel", defaultLabel: "默认生图模型" },
-    { capability: "video", modelKey: "videoModel", defaultLabel: "默认视频模型" },
-    { capability: "text", modelKey: "textModel", defaultLabel: "默认文本模型" },
-    { capability: "audio", modelKey: "audioModel", defaultLabel: "默认音频模型" },
+    { capability: "image", modelKey: "imageModel", labelKey: "config.preferences.models.image" },
+    { capability: "video", modelKey: "videoModel", labelKey: "config.preferences.models.video" },
+    { capability: "text", modelKey: "textModel", labelKey: "config.preferences.models.text" },
+    { capability: "audio", modelKey: "audioModel", labelKey: "config.preferences.models.audio" },
 ];
 
 function normalizeImageCount(value: string) {
@@ -25,11 +26,12 @@ function normalizeImageCount(value: string) {
 
 /** 透明背景在生图里是个开关，但这里和其它偏好一样用下拉，免得一排下拉里夹一个开关显得突兀。 */
 const agentBackgroundOptions = [
-    { value: "", label: "默认背景" },
-    { value: "transparent", label: "透明背景" },
+    { value: "", labelKey: "config.preferences.background.default" },
+    { value: "transparent", labelKey: "config.preferences.background.transparent" },
 ];
 
 export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: boolean }) {
+    const { t } = useTranslation();
     const config = useConfigStore((state) => state.config);
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const setConfigDialogOpen = useConfigStore((state) => state.setConfigDialogOpen);
@@ -43,24 +45,24 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
             <Form layout="vertical" requiredMark={false}>
                 {visibleGroups.length ? (
                     <>
-                        <div className="mb-2 text-sm font-semibold">默认模型</div>
-                        <div className="mb-1 text-xs text-stone-500">可选模型由管理员在服务端配置，这里只决定各类生成默认用哪个。</div>
+                        <div className="mb-2 text-sm font-semibold">{t("config.preferences.defaultModels")}</div>
+                        <div className="mb-1 text-xs text-stone-500">{t("config.preferences.defaultModelsDescription")}</div>
                         <div className="mb-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                             {visibleGroups.map((group) => (
-                                <Form.Item key={group.modelKey} label={group.defaultLabel} className="mb-0">
+                                <Form.Item key={group.modelKey} label={t(group.labelKey)} className="mb-0">
                                     <ModelPicker config={config} value={config[group.modelKey]} onChange={(model) => updateConfig(group.modelKey, model)} capability={group.capability} fullWidth />
                                 </Form.Item>
                             ))}
                             {/* 画布 Agent 的默认模型单列一项：它决定新会话起手用哪个模型，也决定按轮计费的单价，和一次性生成的默认模型不是一回事。 */}
                             {agentEnabled ? (
-                                <Form.Item label="Agent 默认模型" extra="画布右侧「系统模型」新建会话时使用，留空跟随管理员配置。" className="mb-0">
-                                    <ModelPicker config={config} value={config.agentModel} onChange={(model) => updateConfig("agentModel", model)} capability="text" ariaLabel="选择 Agent 默认模型" fullWidth />
+                                <Form.Item label={t("config.preferences.agent.model")} extra={t("config.preferences.agent.modelDescription")} className="mb-0">
+                                    <ModelPicker config={config} value={config.agentModel} onChange={(model) => updateConfig("agentModel", model)} capability="text" ariaLabel={t("config.preferences.agent.selectModel")} fullWidth />
                                 </Form.Item>
                             ) : null}
                         </div>
                     </>
                 ) : (
-                    <div className="mb-4 rounded-lg border border-stone-200 p-3 text-xs text-stone-500 dark:border-stone-800">服务端还没有配置可用模型，请联系管理员在管理后台添加模型渠道。</div>
+                    <div className="mb-4 rounded-lg border border-stone-200 p-3 text-xs text-stone-500 dark:border-stone-800">{t("config.preferences.noModelsDetailed")}</div>
                 )}
                 {/*
                  * Agent 自己调生成工具时用的默认参数。模型多半只想得起写提示词，尺寸、画质、张数一概不传，
@@ -68,21 +70,21 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
                  */}
                 {agentEnabled ? (
                     <>
-                        <div className="mb-2 text-sm font-semibold">Agent 生成默认设置</div>
-                        <div className="mb-1 text-xs text-stone-500">「系统模型」调用生成工具时，模型自己没指定的参数按这里补齐；和上面的工作台默认分开，互不影响。</div>
+                        <div className="mb-2 text-sm font-semibold">{t("config.preferences.agent.generationDefaults")}</div>
+                        <div className="mb-1 text-xs text-stone-500">{t("config.preferences.agent.generationDefaultsDescription")}</div>
                         <div className="mb-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                             {capabilities.image ? (
                                 <>
-                                    <Form.Item label="Agent 默认生图模型" className="mb-0">
-                                        <ModelPicker config={config} value={config.agentImageModel} onChange={(model) => updateConfig("agentImageModel", model)} capability="image" ariaLabel="选择 Agent 默认生图模型" fullWidth />
+                                    <Form.Item label={t("config.preferences.agent.imageModel")} className="mb-0">
+                                        <ModelPicker config={config} value={config.agentImageModel} onChange={(model) => updateConfig("agentImageModel", model)} capability="image" ariaLabel={t("config.preferences.agent.selectImageModel")} fullWidth />
                                     </Form.Item>
-                                    <Form.Item label="Agent 默认生图尺寸" className="mb-0">
+                                    <Form.Item label={t("config.preferences.agent.imageSize")} className="mb-0">
                                         <Select value={config.agentImageSize} options={imageAspectOptions} onChange={(value) => updateConfig("agentImageSize", value)} />
                                     </Form.Item>
-                                    <Form.Item label="Agent 默认生图画质" className="mb-0">
+                                    <Form.Item label={t("config.preferences.agent.imageQuality")} className="mb-0">
                                         <Select value={config.agentImageQuality} options={imageQualityOptions} onChange={(value) => updateConfig("agentImageQuality", value)} />
                                     </Form.Item>
-                                    <Form.Item label="Agent 默认生图张数" className="mb-0">
+                                    <Form.Item label={t("config.preferences.agent.imageCount")} className="mb-0">
                                         <Input
                                             type="number"
                                             min={1}
@@ -92,21 +94,21 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
                                             onBlur={(event) => updateConfig("agentImageCount", normalizeImageCount(event.target.value))}
                                         />
                                     </Form.Item>
-                                    <Form.Item label="Agent 默认生图背景" className="mb-0">
-                                        <Select value={config.agentImageBackground} options={agentBackgroundOptions} onChange={(value) => updateConfig("agentImageBackground", value)} />
+                                    <Form.Item label={t("config.preferences.agent.imageBackground")} className="mb-0">
+                                        <Select value={config.agentImageBackground} options={agentBackgroundOptions.map((option) => ({ value: option.value, label: t(option.labelKey) }))} onChange={(value) => updateConfig("agentImageBackground", value)} />
                                     </Form.Item>
                                 </>
                             ) : null}
-                            <Form.Item label="Agent 默认生文模型" extra="Agent 生成文本内容时使用，留空跟随管理员配置。" className="mb-0">
-                                <ModelPicker config={config} value={config.agentTextModel} onChange={(model) => updateConfig("agentTextModel", model)} capability="text" ariaLabel="选择 Agent 默认生文模型" fullWidth />
+                            <Form.Item label={t("config.preferences.agent.textModel")} extra={t("config.preferences.agent.textModelDescription")} className="mb-0">
+                                <ModelPicker config={config} value={config.agentTextModel} onChange={(model) => updateConfig("agentTextModel", model)} capability="text" ariaLabel={t("config.preferences.agent.selectTextModel")} fullWidth />
                             </Form.Item>
                         </div>
                     </>
                 ) : null}
-                <div className="mb-2 text-sm font-semibold">生成偏好</div>{" "}
+                <div className="mb-2 text-sm font-semibold">{t("config.preferences.generation")}</div>{" "}
                 <div className="grid gap-4 md:grid-cols-4">
                     {capabilities.image ? (
-                        <Form.Item label="画布默认生图张数" extra="新建画布生图和配置节点默认使用，单个节点仍可单独覆盖。" className="mb-4">
+                        <Form.Item label={t("config.preferences.canvasImageCount")} extra={t("config.preferences.canvasImageCountDescription")} className="mb-4">
                             <Input
                                 type="number"
                                 min={1}
@@ -119,13 +121,13 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
                     ) : null}
                     {capabilities.audio ? (
                         <>
-                            <Form.Item label="默认音频声音" className="mb-4">
+                            <Form.Item label={t("config.preferences.audioVoice")} className="mb-4">
                                 <Select value={config.audioVoice} options={audioVoiceOptions} onChange={(value) => updateConfig("audioVoice", value)} />
                             </Form.Item>
-                            <Form.Item label="默认音频格式" className="mb-4">
+                            <Form.Item label={t("config.preferences.audioFormat")} className="mb-4">
                                 <Select value={config.audioFormat} options={audioFormatOptions} onChange={(value) => updateConfig("audioFormat", value)} />
                             </Form.Item>
-                            <Form.Item label="默认音频语速" className="mb-4">
+                            <Form.Item label={t("config.preferences.audioSpeed")} className="mb-4">
                                 <Input
                                     type="number"
                                     min={0.25}
@@ -140,27 +142,27 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
                     ) : null}
                 </div>
                 {capabilities.audio ? (
-                    <Form.Item label="默认音频指令" className="mb-4">
-                        <Input.TextArea rows={2} value={config.audioInstructions} placeholder="例如：自然、温暖、适合旁白。" onChange={(event) => updateConfig("audioInstructions", event.target.value)} />
+                    <Form.Item label={t("config.preferences.audioInstructions")} className="mb-4">
+                        <Input.TextArea rows={2} value={config.audioInstructions} placeholder={t("config.preferences.audioInstructionsPlaceholder")} onChange={(event) => updateConfig("audioInstructions", event.target.value)} />
                     </Form.Item>
                 ) : null}
-                <Form.Item label="系统提示词" extra="会和管理员配置的全局提示词一起生效。" className="mb-0">
-                    <Input.TextArea rows={4} value={config.systemPrompt} placeholder="例如：你是一位擅长电影感写实摄影的视觉导演。" onChange={(event) => updateConfig("systemPrompt", event.target.value)} />
+                <Form.Item label={t("config.preferences.systemPrompt")} extra={t("config.preferences.systemPromptDescription")} className="mb-0">
+                    <Input.TextArea rows={4} value={config.systemPrompt} placeholder={t("config.preferences.systemPromptPlaceholder")} onChange={(event) => updateConfig("systemPrompt", event.target.value)} />
                 </Form.Item>
                 {/*
                  * 算力点归属。这个开关决定的是钱从谁的账上出，文案必须把两种结果都讲死：
                  * 只写「团队没钱时使用个人积分」的话，用户不会意识到关着的时候生成会直接失败，
                  * 开着的时候花的是他自己的钱。
                  */}
-                <div className="mt-6 mb-2 text-sm font-semibold">算力点</div>
-                <Form.Item label="团队积分用尽时改用个人积分" extra="关闭时：团队积分不够，这次生成直接失败，不会动你的个人积分。开启时：团队积分不够会改扣你自己的个人积分，这笔消费记在你个人账上，退款也退回个人。" className="mb-0">
-                    <Switch checked={config.billingFallbackToPersonal} aria-label="团队积分用尽时改用个人积分" onChange={(checked) => updateConfig("billingFallbackToPersonal", checked)} />
+                <div className="mt-6 mb-2 text-sm font-semibold">{t("config.preferences.credits")}</div>
+                <Form.Item label={t("config.preferences.billingFallback")} extra={t("config.preferences.billingFallbackDescription")} className="mb-0">
+                    <Switch checked={config.billingFallbackToPersonal} aria-label={t("config.preferences.billingFallback")} onChange={(checked) => updateConfig("billingFallbackToPersonal", checked)} />
                 </Form.Item>
             </Form>
             {showDoneButton ? (
                 <div className="mt-4 flex justify-end">
                     <Button type="primary" onClick={() => setConfigDialogOpen(false)}>
-                        完成
+                        {t("common.done")}
                     </Button>
                 </div>
             ) : null}
@@ -169,14 +171,15 @@ export function AppConfigPanel({ showDoneButton = false }: { showDoneButton?: bo
 }
 
 export function AppConfigModal() {
+    const { t } = useTranslation();
     const isConfigOpen = useConfigStore((state) => state.isConfigOpen);
     const setConfigDialogOpen = useConfigStore((state) => state.setConfigDialogOpen);
     return (
         <Modal
             title={
                 <div>
-                    <div className="text-lg font-semibold">偏好设置</div>
-                    <div className="mt-1 text-xs font-normal text-stone-500">默认模型与生成偏好</div>
+                    <div className="text-lg font-semibold">{t("config.title")}</div>
+                    <div className="mt-1 text-xs font-normal text-stone-500">{t("config.description")}</div>
                 </div>
             }
             open={isConfigOpen}
@@ -193,9 +196,10 @@ export function AppConfigModal() {
 /** 供画布等场景在缺少可用模型时提示用户。 */
 export function useConfigDialog() {
     const { message } = App.useApp();
+    const { t } = useTranslation();
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     return () => {
-        message.warning("服务端还没有配置可用模型，请联系管理员");
+        message.warning(t("config.preferences.noModels"));
         openConfigDialog(true);
     };
 }

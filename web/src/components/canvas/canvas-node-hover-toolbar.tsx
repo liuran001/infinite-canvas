@@ -160,8 +160,8 @@ export function CanvasNodeHoverToolbar({
     ];
     const readOnlyTools: ToolbarTool[] = [
         baseToolbarTools[0],
-        ...(hasImage || hasVideo || hasAudio ? [{ id: "download", title: hasAudio ? "下载音频" : hasVideo ? "下载视频" : "下载图片", label: "下载", icon: <Download className="size-4" />, onClick: () => onDownload(node) }] : []),
-        ...(hasImage ? [{ id: "viewImage", title: "查看大图", label: "查看大图", icon: <ImageIcon className="size-4" />, onClick: () => onViewImage(node) }] : []),
+        ...(hasImage || hasVideo || hasAudio ? [{ id: "download", title: t(hasAudio ? "canvas.nodeToolbar.downloadAudio" : hasVideo ? "canvas.nodeToolbar.downloadVideo" : "canvas.nodeToolbar.downloadImage"), label: t("common.download"), icon: <Download className="size-4" />, onClick: () => onDownload(node) }] : []),
+        ...(hasImage ? [{ id: "viewImage", title: t("canvas.imageTools.viewTitle"), label: t("canvas.imageTools.view"), icon: <ImageIcon className="size-4" />, onClick: () => onViewImage(node) }] : []),
     ];
     const toolbarTools = readOnly ? readOnlyTools : hasImage ? [...baseToolbarTools, ...nodeToolbarTools].filter((tool) => quickImageToolIdSet.has(tool.id as ImageQuickToolId)) : [...baseToolbarTools, ...nodeToolbarTools, ...extraTools];
     const selectableImageToolbarTools = [...baseToolbarTools, ...nodeToolbarTools].filter((tool) => tool.id !== "retry") as ImageToolbarSettingsTool[];

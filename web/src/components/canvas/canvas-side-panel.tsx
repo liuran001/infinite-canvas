@@ -107,9 +107,9 @@ export function CanvasSidePanel({ nodes, selectedNodeIds, onFocusNode, onPreview
                 data-canvas-no-zoom
             >
                 <div className="flex items-center gap-5 px-4 pt-3.5">
-                    <TabButton label="画布" active={tab === "canvas"} theme={theme} onClick={() => setTab("canvas")} />
-                    {showAssets ? <TabButton label="资产" active={tab === "assets"} theme={theme} onClick={() => setTab("assets")} /> : null}
-                    <TabButton label="提示词库" active={tab === "prompts"} theme={theme} onClick={() => setTab("prompts")} />
+                    <TabButton label={t("canvas.sidePanel.canvas")} active={tab === "canvas"} theme={theme} onClick={() => setTab("canvas")} />
+                    {showAssets ? <TabButton label={t("canvas.sidePanel.assets")} active={tab === "assets"} theme={theme} onClick={() => setTab("assets")} /> : null}
+                    <TabButton label={t("canvas.sidePanel.prompts")} active={tab === "prompts"} theme={theme} onClick={() => setTab("prompts")} />
                 </div>
                 <div className="mt-2 min-h-0 flex-1 overflow-hidden">
                     {tab === "canvas" ? (
@@ -142,13 +142,13 @@ function TabButton({ label, active, theme, onClick }: { label: string; active: b
 // 视频和音频节点只可能由对应生成产生，能力关闭后这两个筛选项就是噪音；
 // 图片和文本节点用户也会直接上传或手写，始终保留。
 const NODE_FILTER_OPTIONS = [
-    { label: "全部", value: "all" },
-    { label: "图片", value: CanvasNodeType.Image },
-    { label: "视频", value: CanvasNodeType.Video, capability: "video" as const },
-    { label: "文本", value: CanvasNodeType.Text },
-    { label: "音频", value: CanvasNodeType.Audio, capability: "audio" as const },
-    { label: "配置", value: CanvasNodeType.Config },
-    { label: "分组", value: CanvasNodeType.Group },
+    { label: "common.all", value: "all" },
+    { label: "canvas.sidePanel.filter.image", value: CanvasNodeType.Image },
+    { label: "canvas.sidePanel.filter.video", value: CanvasNodeType.Video, capability: "video" as const },
+    { label: "canvas.sidePanel.filter.text", value: CanvasNodeType.Text },
+    { label: "canvas.sidePanel.filter.audio", value: CanvasNodeType.Audio, capability: "audio" as const },
+    { label: "canvas.sidePanel.filter.config", value: CanvasNodeType.Config },
+    { label: "canvas.sidePanel.filter.group", value: CanvasNodeType.Group },
 ];
 
 function nodePreviewText(node: CanvasNodeData) {
@@ -216,7 +216,7 @@ function CanvasNodesTab({ nodes, selectedNodeIds, onFocusNode, onPreviewNode, th
                     <ListChecks className="size-3.5" />
                     {selectMode ? t("common.cancel") : t("canvas.sidePanel.select")}
                 </button>
-                {selectMode ? null : <Select size="small" variant="borderless" className="w-20" value={typeFilter} onChange={setTypeFilter} options={NODE_FILTER_OPTIONS.filter((option) => !option.capability || capabilities[option.capability])} />}
+                {selectMode ? null : <Select size="small" variant="borderless" className="w-20" value={typeFilter} onChange={setTypeFilter} options={NODE_FILTER_OPTIONS.filter((option) => !option.capability || capabilities[option.capability]).map((option) => ({ ...option, label: t(option.label) }))} />}
             </div>
             <div className="px-3 pb-2.5">
                 <Input size="small" allowClear prefix={<Search className="size-3.5 text-stone-400" />} placeholder={t("canvas.sidePanel.searchNodes")} value={keyword} onChange={(e) => setKeyword(e.target.value)} />
@@ -291,10 +291,10 @@ function CheckMark({ checked, theme }: { checked: boolean; theme: CanvasTheme })
 // Assets tab: collapsible type groups, tag filtering, and click-to-insert.
 // ---------------------------------------------------------------------------
 
-const ASSET_GROUPS: { kind: AssetKind; label: string; icon: typeof Square; capability?: "video" }[] = [
-    { kind: "image", label: "图片", icon: ImageIcon },
-    { kind: "video", label: "视频", icon: Video, capability: "video" },
-    { kind: "text", label: "文本", icon: FileText },
+const ASSET_GROUPS: { kind: AssetKind; icon: typeof Square; capability?: "video" }[] = [
+    { kind: "image", icon: ImageIcon },
+    { kind: "video", icon: Video, capability: "video" },
+    { kind: "text", icon: FileText },
 ];
 
 function buildInsertPayload(asset: Asset): InsertAssetPayload {
@@ -354,7 +354,7 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
         } catch (error) {
             console.error(error);
             // 云空间不足、文件过大等都是服务端给的中文文案，原样提示给用户。
-            message.error(error instanceof Error ? error.message : "添加失败，请重试");
+            message.error(error instanceof Error ? error.message : t("canvas.sidePanel.addFailed"));
         } finally {
             hide();
             setUploading(false);
@@ -498,7 +498,7 @@ const CanvasPromptsTab = memo(function CanvasPromptsTab({ onInsert, theme }: { o
                     </div>
                 ) : categoriesQuery.isError ? (
                     <button type="button" onClick={() => void categoriesQuery.refetch()} className="block w-full py-8 text-center text-xs text-red-500 opacity-80 transition hover:opacity-100">
-                        加载失败,点击重试
+                        {t("canvas.sidePanel.loadFailedRetry")}
                     </button>
                 ) : categories.length ? (
                     <div className="space-y-1">
@@ -516,7 +516,7 @@ const CanvasPromptsTab = memo(function CanvasPromptsTab({ onInsert, theme }: { o
                         ))}
                     </div>
                 ) : (
-                    <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无提示词" className="pt-12" />
+                    <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t("canvas.sidePanel.noPrompts")} className="pt-12" />
                 )}
             </div>
             <PromptDetailDialog prompt={detail} onClose={() => setDetail(null)} onCopy={(prompt) => void copyPrompt(prompt)} />
@@ -578,7 +578,7 @@ function PromptCategoryGroup({
                                     onClick={() => void query.fetchNextPage()}
                                     className="block w-full rounded-md py-2 text-center text-xs opacity-55 transition hover:bg-black/5 hover:opacity-100 disabled:cursor-not-allowed dark:hover:bg-white/10"
                                 >
-                                    {query.isFetchingNextPage ? "加载中…" : "加载更多"}
+                                    {query.isFetchingNextPage ? t("prompts.loading") : t("canvas.sidePanel.loadMore")}
                                 </button>
                             ) : null}
                         </div>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { App, Button, Tooltip } from "antd";
 import { CircleAlert, MessageSquare, PanelRightClose, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
 
 import { canvasThemes } from "@/lib/canvas-theme";
@@ -31,6 +32,8 @@ type CloudAgentTab = "chat" | "sessions";
  * 关页面、断网都不会中断服务端循环，重新进来靠 sinceSeq 补齐增量即可续上。
  */
 export function CloudAgentPanel() {
+    const { t, i18n } = useTranslation();
+    const resolvedLanguage = i18n.resolvedLanguage || i18n.language;
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { modal } = App.useApp();
     const isServerMode = useIsServerMode();
@@ -79,7 +82,7 @@ export function CloudAgentPanel() {
     const messageCost = modelCreditCost(model);
     const maxRounds = settings?.agent.maxRounds || 0;
     // 附件要进上下文，模型不支持视觉时上游会直接报一串看不懂的错；这里先明确挡住，服务端仍然会再校验一次。
-    const visionWarning = attachments.length && !settings?.modelChannel.models.some((item) => item.name === model && item.vision) ? "当前模型不支持识别图片，请换一个标注了「支持视觉」的模型，或先移除图片" : "";
+    const visionWarning = attachments.length && !settings?.modelChannel.models.some((item) => item.name === model && item.vision) ? t("agent.cloud.panel.visionWarning") : "";
     // 用户消息里的引用标记是给模型看的，展示时还原成可交互的标签；附件按文件 ID 直接取直链画缩略图。
     // 连续的工具调用先在这里合并成一组，一轮下来十几个工具只占一行，点开才展开完整调用列表。
     const timeline = useMemo(
@@ -93,15 +96,15 @@ export function CloudAgentPanel() {
                         entry.message.role === "user"
                             ? { ...entry.item, text: stripReferenceMarkers(entry.message.content), body: parts.some((part) => part.nodeId) ? <CloudAgentMessageText parts={parts} /> : undefined }
                             : entry.item,
-                    images: (entry.message.attachments || []).map((id) => ({ id, name: "图片", url: serverFileUrl(id), storageKey: serverStorageKey(id), width: 0, height: 0 })),
+                    images: (entry.message.attachments || []).map((id) => ({ id, name: t("agent.cloud.panel.imageAttachment"), url: serverFileUrl(id), storageKey: serverStorageKey(id), width: 0, height: 0 })),
                 };
             }),
-        [messages],
+        [messages, resolvedLanguage, t],
     );
     // 工具还在跑时那一组自己会显示「正在联网搜索」，再挂一条等待提示就是同一句话说两遍。
     const toolRunning = messages[messages.length - 1]?.role === "tool" && !messages[messages.length - 1]?.toolResult;
     // 等待提示按实际进度说话：在跑工具就报工具名，其余情况说「正在思考」。
-    const activity = useMemo(() => cloudAgentActivity(messages), [messages]);
+    const activity = useMemo(() => cloudAgentActivity(messages), [messages, resolvedLanguage]);
     // 服务端执行失败时会把同一句中文既写进对话又放进 session.error，对话里已经有了就不再重复弹一条。
     const showError = Boolean(error) && !messages.some((item) => item.role === "assistant" && item.content === error);
 
@@ -132,10 +135,10 @@ export function CloudAgentPanel() {
 
     const confirmDelete = (id: string, title: string) => {
         modal.confirm({
-            title: "删除会话？",
-            content: `「${title}」的对话记录会被删除，正在执行的任务也会一并中止。`,
-            okText: "删除",
-            cancelText: "取消",
+            title: t("agent.cloud.panel.deleteSessionTitle"),
+            content: t("agent.cloud.panel.deleteSessionContent", { title }),
+            okText: t("agent.cloud.panel.delete"),
+            cancelText: t("agent.cloud.panel.cancel"),
             okButtonProps: { danger: true },
             onOk: () => deleteSession(id),
         });
@@ -143,8 +146,8 @@ export function CloudAgentPanel() {
 
     // 计费口径是「每发一条消息扣一次」：一条消息触发多少轮思考与工具调用都不再额外扣，文案必须说清楚，别让用户以为还按轮算。
     const billingHint = messageCost
-        ? `${channel === "share" && shareOwnerPays ? "此分享由房主支付。" : ""}系统模型按「每条消息」扣费：发一条消息扣 ${messageCost} 点，这条消息触发的多轮思考与工具调用都不再额外扣点（单次最多 ${maxRounds} 轮）。`
-        : "当前模型未配置算力点消耗，本次对话不扣点。";
+        ? t(channel === "share" && shareOwnerPays ? "agent.cloud.billing.ownerMessageCost" : "agent.cloud.billing.messageCost", { cost: messageCost, maxRounds })
+        : t("agent.cloud.billing.free");
 
     return (
         <>
@@ -153,8 +156,8 @@ export function CloudAgentPanel() {
                 theme={theme}
                 leading={<AgentModeSwitch theme={theme} />}
                 items={[
-                    { value: "chat" as CloudAgentTab, label: "对话", icon: <MessageSquare className="size-3.5" /> },
-                    { value: "sessions" as CloudAgentTab, label: "会话", icon: <Sparkles className="size-3.5" />, count: sessions.length },
+                    { value: "chat" as CloudAgentTab, label: t("agent.cloud.panel.chat"), icon: <MessageSquare className="size-3.5" /> },
+                    { value: "sessions" as CloudAgentTab, label: t("agent.cloud.panel.sessions"), icon: <Sparkles className="size-3.5" />, count: sessions.length },
                 ]}
                 onChange={(next) => {
                     setTab(next);
@@ -163,9 +166,9 @@ export function CloudAgentPanel() {
                 right={
                     <>
                         <Button size="small" type="text" disabled={!ready || busy} icon={<Plus className="size-3.5" />} onClick={newSession}>
-                            新会话
+                            {t("agent.cloud.panel.newSession")}
                         </Button>
-                        <Tooltip title="收起对话">
+                        <Tooltip title={t("agent.cloud.panel.collapse")}>
                             <Button type="text" shape="circle" className="!h-8 !w-8 !min-w-8" style={{ color: theme.node.muted }} icon={<PanelRightClose className="size-4" />} onClick={closePanel} />
                         </Tooltip>
                     </>
@@ -175,9 +178,9 @@ export function CloudAgentPanel() {
             {tab === "sessions" ? (
                 <div className="thin-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
                     <div className="flex items-center justify-between gap-2 text-sm" style={{ color: theme.node.muted }}>
-                        <span>{sessions.length ? `${sessions.length} 个会话` : "当前画布还没有会话"}</span>
+                        <span>{sessions.length ? t("agent.cloud.panel.sessionCount", { count: sessions.length }) : t("agent.cloud.panel.emptySessions")}</span>
                         <Button size="small" type="text" icon={<RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} />} disabled={!ready || loading} onClick={() => void refreshSessions()}>
-                            刷新
+                            {t("agent.cloud.panel.refresh")}
                         </Button>
                     </div>
                     {sessions.map((session) => (
@@ -199,10 +202,16 @@ export function CloudAgentPanel() {
                             }}
                         >
                             <div className="min-w-0 flex-1">
-                                <div className="truncate text-sm font-medium leading-5">{session.title || "未命名会话"}</div>
+                                <div className="truncate text-sm font-medium leading-5">{session.title || t("agent.cloud.panel.untitledSession")}</div>
                                 <div className="truncate text-[11px] leading-4 opacity-65">
-                                    {session.status === "running" ? "执行中 · " : session.status === "awaiting" ? "等待确认 · " : session.status === "failed" ? `${session.error || "执行失败"} · ` : ""}
-                                    {new Date(session.updatedAt).toLocaleString()}
+                                    {session.status === "running"
+                                        ? `${t("agent.cloud.panel.running")} · `
+                                        : session.status === "awaiting"
+                                          ? `${t("agent.cloud.panel.awaiting")} · `
+                                          : session.status === "failed"
+                                            ? `${session.error || t("agent.cloud.panel.failed")} · `
+                                            : ""}
+                                    {new Date(session.updatedAt).toLocaleString(resolvedLanguage)}
                                 </div>
                             </div>
                             <Button
@@ -211,10 +220,10 @@ export function CloudAgentPanel() {
                                 shape="circle"
                                 className="!h-8 !w-8 !min-w-8 shrink-0"
                                 icon={<Trash2 className="size-3.5" />}
-                                aria-label={`删除会话 ${session.title || session.id}`}
+                                aria-label={t("agent.cloud.panel.deleteSessionLabel", { title: session.title || session.id })}
                                 onClick={(event) => {
                                     event.stopPropagation();
-                                    confirmDelete(session.id, session.title || "未命名会话");
+                                    confirmDelete(session.id, session.title || t("agent.cloud.panel.untitledSession"));
                                 }}
                             />
                         </div>
@@ -243,7 +252,7 @@ export function CloudAgentPanel() {
                             ) : null}
                             {(running || sending) && !toolRunning ? <AgentWorkingMessage text={activity} activityKey={`${sessionId}-${messages.length}-${activity}`} theme={theme} /> : null}
                         </div>
-                        {showScrollToBottom ? <AgentScrollToBottom theme={theme} title="查看最新消息" onClick={() => scrollToBottom()} /> : null}
+                        {showScrollToBottom ? <AgentScrollToBottom theme={theme} title={t("agent.cloud.panel.latestMessages")} onClick={() => scrollToBottom()} /> : null}
                     </div>
 
                     {showError ? (
@@ -256,21 +265,21 @@ export function CloudAgentPanel() {
                     {channel === "share" && anonymous ? (
                         <div className="mx-4 mb-1 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs leading-5" style={{ borderColor: theme.node.stroke, color: theme.node.muted }}>
                             <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
-                            <span>匿名访客的 Agent 历史保存在当前浏览器，清理浏览器数据或换设备后可能丢失，建议登录后使用。</span>
+                            <span>{t("agent.cloud.panel.anonymousHistoryWarning")}</span>
                         </div>
                     ) : null}
 
                     <div className="flex items-center justify-center gap-3 px-4 pt-1 text-[11px] tabular-nums" style={{ color: theme.node.muted }}>
                         <Tooltip title={billingHint}>
-                            <span className="cursor-help underline decoration-dotted underline-offset-2">每条消息 {messageCost} 点</span>
+                            <span className="cursor-help underline decoration-dotted underline-offset-2">{t("agent.cloud.panel.perMessageCost", { cost: messageCost })}</span>
                         </Tooltip>
-                        {channel === "share" && shareOwnerPays ? <span>由房主支付</span> : <span style={credits < messageCost ? { color: "#dc2626" } : undefined}>余额 {credits} 点</span>}
+                        {channel === "share" && shareOwnerPays ? <span>{t("agent.cloud.panel.ownerPays")}</span> : <span style={credits < messageCost ? { color: "#dc2626" } : undefined}>{t("agent.cloud.panel.balance", { credits })}</span>}
                     </div>
 
                     <CloudAgentComposer
                         disabled={!ready || !projectId}
                         sending={busy}
-                        placeholder={awaiting ? "上面有一条请求在等你确认，处理完才能继续对话" : projectId ? "让系统模型帮你读取或修改当前画布，可以把画布节点拖进来作为引用" : "请先打开一个画布"}
+                        placeholder={awaiting ? t("agent.cloud.panel.awaitingPlaceholder") : projectId ? t("agent.cloud.panel.canvasPlaceholder") : t("agent.cloud.panel.openCanvasPlaceholder")}
                         theme={theme}
                         visionWarning={visionWarning}
                         onSubmit={() => void send()}
@@ -282,7 +291,7 @@ export function CloudAgentPanel() {
                                 value={model}
                                 capability="text"
                                 disabled={busy}
-                                ariaLabel="选择系统模型"
+                                ariaLabel={t("agent.cloud.panel.selectModel")}
                                 className="h-9 max-w-44 rounded-full border-0 bg-transparent px-2.5 text-xs font-medium shadow-none hover:bg-black/5 dark:hover:bg-white/10"
                                 onChange={setModel}
                             />
@@ -299,6 +308,7 @@ export function CloudAgentPanel() {
  * 引用的节点可能早就被删了，这种就置灰划掉，别让用户对着一个指不到东西的标签乱点。
  */
 function CloudAgentMessageText({ parts }: { parts: ReturnType<typeof splitReferenceContent> }) {
+    const { t } = useTranslation();
     const projectId = useCloudAgentStore((state) => state.projectId);
     const highlightReference = useCloudAgentStore((state) => state.highlightReference);
     const revealReference = useCloudAgentStore((state) => state.revealReference);
@@ -317,7 +327,7 @@ function CloudAgentMessageText({ parts }: { parts: ReturnType<typeof splitRefere
                         key={index}
                         data-canvas-node-reference={nodeId}
                         className={missing ? MENTION_LABEL_MISSING_CLASS : `${MENTION_LABEL_CLASS} cursor-pointer`}
-                        title={missing ? "引用的节点已从画布中删除" : "点击在画布上定位这个节点"}
+                        title={missing ? t("agent.cloud.panel.referenceMissing") : t("agent.cloud.panel.referenceLocate")}
                         onMouseEnter={() => highlightReference(nodeId)}
                         onMouseLeave={() => highlightReference("")}
                         onClick={() => {
@@ -334,27 +344,27 @@ function CloudAgentMessageText({ parts }: { parts: ReturnType<typeof splitRefere
 
 /** 空会话时说明这个模式能做什么：能力按服务端实际开关展示，没配搜索密钥就不要宣称能联网。 */
 function CloudAgentIntro({ theme, model, ready }: { theme: (typeof canvasThemes)[keyof typeof canvasThemes]; model: string; ready: boolean }) {
+    const { t } = useTranslation();
     const settings = useServerStore((state) => state.settings);
     const config = useEffectiveConfig();
     const messageCost = modelCreditCost(model);
     const abilities = [
-        "读取画布结构、新建 / 修改 / 删除节点、连接与断开连线",
-        "把画布节点拖进输入框作为引用，也可以上传图片、把图片拖回画布",
-        ...(settings?.capabilities.image && settings.modelChannel.defaultImageModel ? ["按提示词生成图片并放进画布"] : []),
-        ...(settings?.agent.searchEnabled ? ["联网搜索最新资料"] : []),
+        t("agent.cloud.intro.canvasOperations"),
+        t("agent.cloud.intro.references"),
+        ...(settings?.capabilities.image && settings.modelChannel.defaultImageModel ? [t("agent.cloud.intro.imageGeneration")] : []),
+        ...(settings?.agent.searchEnabled ? [t("agent.cloud.intro.webSearch")] : []),
     ];
     return (
         <div className="space-y-3 px-1 py-6 text-sm leading-6" style={{ color: theme.node.muted }}>
-            <div style={{ color: theme.node.text }}>{ready ? "描述你想要的改动，系统模型会直接操作当前画布。" : "登录并打开一个画布后即可使用。"}</div>
+            <div style={{ color: theme.node.text }}>{t(ready ? "agent.cloud.intro.ready" : "agent.cloud.intro.unavailable")}</div>
             <ul className="ml-4 list-disc space-y-1">
                 {abilities.map((item) => (
                     <li key={item}>{item}</li>
                 ))}
             </ul>
             <div className="text-xs leading-5">
-                任务跑在服务端，关掉面板、刷新页面或换设备都不会中断，回来还能看到结果。
-                {model ? `当前模型 ${modelOptionLabel(config, model)}，` : ""}
-                {messageCost ? `每发一条消息扣 ${messageCost} 点，这条消息触发的多轮思考与工具调用不再额外扣点（单次最多 ${settings?.agent.maxRounds || 0} 轮）。` : "当前模型未配置算力点消耗。"}
+                {t("agent.cloud.intro.durable")} {model ? t("agent.cloud.intro.currentModel", { model: modelOptionLabel(config, model) }) : ""}{" "}
+                {messageCost ? t("agent.cloud.intro.messageCost", { cost: messageCost, maxRounds: settings?.agent.maxRounds || 0 }) : t("agent.cloud.intro.free")}
             </div>
         </div>
     );

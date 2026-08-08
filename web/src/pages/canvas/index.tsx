@@ -56,7 +56,7 @@ export default function CanvasPage() {
                 ),
             );
             data.projects.forEach((item) => importProject(remapStorageKeys(item.project, remap)));
-            message.success(`已导入 ${data.projects.length} 个画布`);
+            message.success(t("canvas.imported", { count: data.projects.length }));
         } catch {
             message.error(t("canvas.importFailed"));
         } finally {

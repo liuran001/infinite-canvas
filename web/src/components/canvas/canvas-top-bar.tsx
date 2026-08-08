@@ -141,11 +141,11 @@ export function CanvasTopBar({
                         )}
                     </div>
                     {viewers && viewers > 1 ? (
-                        <Tooltip title={`${viewers} 人正在协作`}>
+                        <Tooltip title={t("canvas.collaborating", { count: viewers })}>
                             <span
                                 className="inline-flex h-8 shrink-0 items-center gap-1 text-xs"
                                 style={{ color: theme.node.muted }}
-                                aria-label={`${viewers} 人正在协作`}
+                                aria-label={t("canvas.collaborating", { count: viewers })}
                             >
                                 <Users className="size-3.5" />
                                 <span>{viewers}</span>
@@ -158,9 +158,9 @@ export function CanvasTopBar({
 
                 <div className="pointer-events-auto flex items-center gap-1.5">
                     {onOpenShare ? (
-                        <Tooltip title="分享这张画布">
+                        <Tooltip title={t("canvas.share.openCanvas")}>
                             <CanvasSurfaceButton theme={theme} className="!h-10 !rounded-xl !px-3 !font-medium" style={{ boxShadow: "0 10px 30px rgba(28,25,23,.10)" }} icon={<Share2 className="size-4" />} onClick={onOpenShare}>
-                                分享
+                                {t("canvas.share.label")}
                             </CanvasSurfaceButton>
                         </Tooltip>
                     ) : null}
@@ -208,7 +208,7 @@ function CompactAgentStatus({ status, onClick }: { status: { connected: boolean;
     const theme = canvasThemes[colorTheme];
     // 未启用本地 Agent 是常态，不必常驻一条「未连接」占位。
     if (!status.connected && !status.enabled) return null;
-    const label = status.connected ? "Codex 已连接" : `Codex ${status.activity || "连接中"}`;
+    const label = status.connected ? t("canvas.agentConnected") : t("canvas.agentConnecting", { activity: status.activity || t("canvas.connecting") });
     const dotColor = status.connected ? "#22c55e" : status.enabled ? "#f59e0b" : theme.node.muted;
     return (
         <button type="button" className="flex h-8 items-center gap-1.5 text-xs transition hover:opacity-75" style={{ color: status.connected ? "#16a34a" : status.enabled ? "#d97706" : theme.node.muted }} onClick={onClick} title={t("canvas.openAgent")}>
@@ -244,6 +244,7 @@ function Shortcut({ keys, value }: { keys: string[]; value: string }) {
  * 否则他会以为已经存上了而直接关掉页面。
  */
 function CanvasSyncStatus() {
+    const { t } = useTranslation();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const syncState = useServerStore((state) => state.syncState);
     const syncError = useServerStore((state) => state.syncError);
@@ -253,10 +254,10 @@ function CanvasSyncStatus() {
         <span
             className="inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-xs"
             style={failed ? { background: "rgba(239,68,68,.12)", color: "#ef4444" } : { color: theme.node.muted }}
-            title={failed ? syncError || "同步失败" : "正在保存到服务器"}
+            title={failed ? syncError || t("canvas.sync.failed") : t("canvas.sync.savingTitle")}
         >
             {failed ? <CloudOff className="size-3.5" /> : <Loader2 className="size-3.5 animate-spin" />}
-            {failed ? "网络异常，可能未同步" : "保存中"}
+            {failed ? t("canvas.sync.failedStatus") : t("canvas.sync.saving")}
         </span>
     );
 }

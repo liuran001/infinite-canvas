@@ -5,6 +5,8 @@ import { Bot, CloudOff, Download, Group, Home, Loader2, LogIn, PanelLeftClose, P
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
+import i18n from "@/i18n";
+
 import { ensureGenerationBillingConsent, generateAudio, generateImages, generateText, generateVideo, isGenerationReady, resumeImages, resumeMedia, resumeText, storeGeneratedImage } from "@/services/api/generation";
 import { useJobStore, type JobContext, type TrackedJob } from "@/stores/use-job-store";
 import { defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
@@ -168,12 +170,6 @@ const NODE_STATUS_IDLE = "idle" as const;
 const NODE_STATUS_LOADING = "loading" as const;
 const NODE_STATUS_SUCCESS = "success" as const;
 const NODE_STATUS_ERROR = "error" as const;
-const IMAGE_PROMPT_REVERSE_PRESET = `请根据参考图片反推一段适合用于 AI 生图的提示词。
-
-要求：
-1. 只输出提示词正文，不要解释。
-2. 覆盖主体、构图、风格、光线、色彩、材质、镜头和氛围。
-3. 尽量写成可直接用于生图模型的完整提示词。`;
 
 function trackedShareCanvasJob(job: ServerJob, projectId: string): TrackedJob | null {
     const context = (job.context || {}) as Record<string, unknown>;
@@ -222,13 +218,14 @@ function isResumableCanvasJob(nodes: CanvasNodeData[], job: TrackedJob) {
 function resetInterruptedCanvasJobs(nodes: CanvasNodeData[], resumable: TrackedJob[]) {
     const resumingNodeIds = new Set(resumable.map((job) => job.context.nodeId || ""));
     const resumingImageIds = new Set(resumable.filter((job) => job.kind === "image").map((job) => job.clientJobId));
+    const interrupted = i18n.t("canvas.generation.interrupted");
     return resetInterruptedGeneration(nodes, resumingNodeIds).map((node) => {
         if (!node.metadata?.images?.some((image) => image.status === NODE_STATUS_LOADING && !resumingImageIds.has(image.id))) return node;
         const images = node.metadata.images.map((image) =>
-            image.status === NODE_STATUS_LOADING && !resumingImageIds.has(image.id) ? { ...image, status: NODE_STATUS_ERROR, errorDetails: "页面刷新后生成已中断，请重新生成。" } : image,
+            image.status === NODE_STATUS_LOADING && !resumingImageIds.has(image.id) ? { ...image, status: NODE_STATUS_ERROR, errorDetails: interrupted } : image,
         );
         const status = images.some((image) => image.status === NODE_STATUS_LOADING) ? NODE_STATUS_LOADING : images.some((image) => image.status === NODE_STATUS_SUCCESS) ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR;
-        return { ...node, metadata: { ...node.metadata, images, status, errorDetails: status === NODE_STATUS_ERROR ? node.metadata.errorDetails || "页面刷新后生成已中断，请重新生成。" : undefined } };
+        return { ...node, metadata: { ...node.metadata, images, status, errorDetails: status === NODE_STATUS_ERROR ? node.metadata.errorDetails || interrupted : undefined } };
     });
 }
 
@@ -250,7 +247,7 @@ function settleRecoveredGenerationAncestors(nodes: CanvasNodeData[], connections
             const children = connections.map((connection) => (connection.fromNodeId === node.id ? nodeById.get(connection.toNodeId) : undefined)).filter((item): item is CanvasNodeData => Boolean(item));
             if (!children.length) return node;
             if (children.some((child) => child.metadata?.status === NODE_STATUS_SUCCESS)) return { ...node, metadata: { ...node.metadata, status: NODE_STATUS_SUCCESS, errorDetails: undefined } };
-            if (children.every((child) => child.metadata?.status !== NODE_STATUS_LOADING)) return { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails: node.metadata?.errorDetails || "生成失败" } };
+            if (children.every((child) => child.metadata?.status !== NODE_STATUS_LOADING)) return { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails: node.metadata?.errorDetails || i18n.t("canvas.projectPage.generationFailed") } };
             return node;
         });
         frontier = parentIds;
@@ -554,7 +551,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
             setNodes((prev) => (current() ? settleRecoveredGenerationAncestors(prev.map((item) => (item.id === nodeId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...videoMetadata(media) } } : item)), connectionsRef.current, nodeId) : prev));
         } catch (error) {
             if (!current() || isGenerationCanceled(error)) return;
-            const errorDetails = error instanceof Error ? error.message : "生成失败";
+            const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
             setNodes((prev) => {
                 if (!current()) return prev;
                 const next = prev.map((item) => {
@@ -570,7 +567,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
             finishGenerationRequest(requestKey, controller);
             if (shareJobByRequestRef.current.get(requestKey) === job.jobId) shareJobByRequestRef.current.delete(requestKey);
         }
-    }, [finishGenerationRequest, isCurrentCanvasJob, shared, startGenerationRequest]);
+    }, [finishGenerationRequest, isCurrentCanvasJob, shared, startGenerationRequest, t]);
 
     const confirmStopGeneration = useCallback(
         (nodeId: string) => {
@@ -814,7 +811,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
         const reporter = shared ? createSharePresenceReporter(projectId) : createPresenceReporter(projectId);
         presenceReporterRef.current = reporter;
         if (shared) {
-            watchShareProject(projectId, { onProject: (project) => applyProject(project, true), onDeleted: () => useShareStore.getState().markGone("画布已被删除") }, controller.signal);
+            watchShareProject(projectId, { onProject: (project) => applyProject(project, true), onDeleted: () => useShareStore.getState().markGone(t("canvas.share.canvasDeleted")) }, controller.signal);
         } else {
             watchProject(
                 projectId,
@@ -838,7 +835,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
             presenceReporterRef.current = null;
             if (!shared) useProjectPresenceStore.getState().clear();
         };
-    }, [isServerModeReady, navigate, projectId, projectLoaded, shared]);
+    }, [isServerModeReady, navigate, projectId, projectLoaded, shared, t]);
 
     useEffect(() => {
         if (!projectLoaded || (!shared && !isServerModeReady)) return;
@@ -1539,8 +1536,8 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
 
     const exportCurrentProject = useCallback(async () => {
         const project = shared ? useShareStore.getState().project : useCanvasStore.getState().projects.find((item) => item.id === projectId);
-        if (!project) return message.error("未找到当前画布");
-        const hide = message.loading("正在导出当前画布…", 0);
+        if (!project) return message.error(t("canvas.projectPage.notFound"));
+        const hide = message.loading(t("canvas.projectPage.exporting"), 0);
         try {
             await exportCanvasProjects([project], project.title || t("canvas.title"));
             message.success(t("canvas.projectPage.exported"));
@@ -1550,7 +1547,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
         } finally {
             hide();
         }
-    }, [message, projectId, shared]);
+    }, [message, projectId, shared, t]);
 
     const cloneSharedProject = useCallback(async () => {
         if (!shared) return;
@@ -1559,21 +1556,21 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
         if (!useServerStore.getState().token) {
             rememberPendingClone(store.token);
             useServerStore.getState().setLoginOpen(true);
-            message.info("请先登录，登录后会继续保存到你的账号");
+            message.info(t("canvas.share.loginToClone"));
             return;
         }
         store.setCloning(true);
         try {
             const created = await shareApi.clone(store.token, store.guestToken);
-            message.success("已保存到你的画布");
+            message.success(t("canvas.share.cloned"));
             navigate(`/canvas/${created.id}`);
         } catch (error) {
-            if (isShareGone(error)) useShareStore.getState().markGone("链接已失效");
-            else message.error(error instanceof Error ? error.message : "保存到我的账号失败");
+            if (isShareGone(error)) useShareStore.getState().markGone(t("canvas.share.linkExpired"));
+            else message.error(error instanceof Error ? error.message : t("canvas.share.cloneFailed"));
         } finally {
             useShareStore.getState().setCloning(false);
         }
-    }, [message, navigate, shared]);
+    }, [message, navigate, shared, t]);
 
     useEffect(() => {
         if (!shared || !serverToken) return;
@@ -2180,7 +2177,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
         async (node: CanvasNodeData) => {
             if (shared && !useServerStore.getState().token) {
                 useServerStore.getState().setLoginOpen(true);
-                message.info("请先登录后再加入我的资产");
+                message.info(t("canvas.share.loginToSaveAsset"));
                 return;
             }
             if (node.type === CanvasNodeType.Text) {
@@ -2191,13 +2188,13 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                 return;
             }
             if (node.type === CanvasNodeType.Video) {
-                if (!node.metadata?.content) return message.error("没有可保存的视频");
+                if (!node.metadata?.content) return message.error(t("canvas.projectPage.noVideoToSave"));
                 let copied: Awaited<ReturnType<typeof uploadMediaFile>> | null = null;
                 if (shared) {
                     try {
                         copied = await uploadMediaFile(node.metadata.content, "canvas-video");
                     } catch (error) {
-                        message.error(error instanceof Error ? error.message : "保存视频失败");
+                        message.error(error instanceof Error ? error.message : t("canvas.share.saveVideoFailed"));
                         return;
                     }
                 }
@@ -2213,20 +2210,20 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                 message.success(t("common.addedToAssets"));
                 return;
             }
-            if (!node.metadata?.content) return message.error("没有可保存的图片");
+            if (!node.metadata?.content) return message.error(t("canvas.projectPage.noImageToSave"));
             let copied: Awaited<ReturnType<typeof uploadImage>> | null = null;
             if (shared) {
                 try {
                     copied = await uploadImage(node.metadata.content);
                 } catch (error) {
-                    message.error(error instanceof Error ? error.message : "保存图片失败");
+                    message.error(error instanceof Error ? error.message : t("canvas.share.saveImageFailed"));
                     return;
                 }
             }
             const dataUrl = copied || node.metadata.storageKey ? "" : node.metadata.content;
             addAsset({
                 kind: "image",
-                title: node.metadata?.prompt?.slice(0, 24) || "画布图片",
+                title: node.metadata?.prompt?.slice(0, 24) || t("canvas.projectPage.canvasImage"),
                 coverUrl: copied?.url || node.metadata.content,
                 tags: [],
                 source: "Canvas",
@@ -2242,7 +2239,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
             });
             message.success(t("common.addedToAssets"));
         },
-        [addAsset, message, shared],
+        [addAsset, message, shared, t],
     );
 
     const createImageReversePromptNodes = useCallback(
@@ -2391,7 +2388,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
             try {
                 acceptSelfPay = await ensureGenerationBillingConsent(jobContext(childId, prompt));
             } catch (error) {
-                if (!isGenerationCanceled(error)) message.error(error instanceof Error ? error.message : "生成失败");
+                if (!isGenerationCanceled(error)) message.error(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
                 return;
             }
             setAngleNodeId(null);
@@ -2431,7 +2428,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, jobContext, message, openConfigDialog, startGenerationRequest],
+        [effectiveConfig, finishGenerationRequest, jobContext, message, openConfigDialog, startGenerationRequest, t],
     );
 
     const handleFontSizeChange = useCallback((nodeId: string, fontSize: number) => {
@@ -2586,7 +2583,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
             {
                 id,
                 type: CanvasNodeType.Image,
-                title: payload.name || "图片",
+                title: payload.name || t("canvas.nodeTypes.image"),
                 position: { x: position.x - size.width / 2, y: position.y - size.height / 2 },
                 width: size.width,
                 height: size.height,
@@ -2595,7 +2592,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
         ]);
         setSelectedNodeIds(new Set([id]));
         setSelectedConnectionId(null);
-    }, []);
+    }, [t]);
 
     const handleDrop = useCallback(
         (event: ReactDragEvent<HTMLDivElement>) => {
@@ -2607,7 +2604,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                     const payload = JSON.parse(stored) as { name?: string; url: string; storageKey: string; width?: number; height?: number };
                     if (payload?.storageKey && payload.url) void createStoredImageNode(payload, screenToCanvas(event.clientX, event.clientY));
                 } catch {
-                    message.error("拖入的图片信息无法识别");
+                    message.error(t("canvas.projectPage.invalidDroppedImage"));
                 }
                 return;
             }
@@ -2630,7 +2627,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                 }
             }
         },
-        [createAudioFileNode, createImageFileNode, createStoredImageNode, createVideoFileNode, message, screenToCanvas],
+        [createAudioFileNode, createImageFileNode, createStoredImageNode, createVideoFileNode, message, screenToCanvas, t],
     );
 
     const startTitleEditing = useCallback(() => {
@@ -2676,7 +2673,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                 try {
                     acceptSelfPay = await ensureGenerationBillingConsent(jobContext(nodeId, scene));
                 } catch (error) {
-                    if (!isGenerationCanceled(error)) message.error(error instanceof Error ? error.message : "生成失败");
+                    if (!isGenerationCanceled(error)) message.error(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
                     return;
                 }
                 setRunningNodeId(nodeId);
@@ -2737,7 +2734,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
             } catch (error) {
                 finishGenerationRequest(nodeId, runController);
                 setRunningNodeId(null);
-                if (!isGenerationCanceled(error)) message.error(error instanceof Error ? error.message : "生成失败");
+                if (!isGenerationCanceled(error)) message.error(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
                 return;
             }
             let pendingChildIds: string[] = [];
@@ -3060,7 +3057,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, jobContext, message, openConfigDialog, startGenerationRequest],
+        [effectiveConfig, finishGenerationRequest, jobContext, message, openConfigDialog, startGenerationRequest, t],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;
@@ -3107,7 +3104,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
             try {
                 acceptSelfPay = await ensureGenerationBillingConsent(jobContext(node.id, prompt));
             } catch (error) {
-                if (!isGenerationCanceled(error)) message.error(error instanceof Error ? error.message : "生成失败");
+                if (!isGenerationCanceled(error)) message.error(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
                 return;
             }
 
@@ -3238,7 +3235,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, jobContext, message, openConfigDialog, startGenerationRequest],
+        [effectiveConfig, finishGenerationRequest, jobContext, message, openConfigDialog, startGenerationRequest, t],
     );
 
     const deleteBatchImage = useCallback((nodeId: string, imageId: string) => {
@@ -3379,16 +3376,16 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                     setSelectedNodeIds(new Set([id]));
                 } else {
                     const source = payload.dataUrl || resolveImageUrl(payload.storageKey);
-                    if (!source) throw new Error("图片资产无法读取，请重新上传");
+                    if (!source) throw new Error(t("canvas.projectPage.assetImageUnreadable"));
                     const copied = shared ? await uploadShareImage(payload.dataUrl || resolveImageUrl(payload.storageKey)) : null;
                     await insertAssistantImage({ id: `asset-${Date.now()}`, prompt: payload.title, dataUrl: copied?.url || source, storageKey: copied?.storageKey || payload.storageKey });
                 }
                 setAssetPickerOpen(false);
             } catch (error) {
-                message.error(error instanceof Error ? error.message : "插入资产失败");
+                message.error(error instanceof Error ? error.message : t("canvas.projectPage.insertAssetFailed"));
             }
         },
-        [insertAssistantImage, insertAssistantText, message, screenToCanvas, shared, size.height, size.width],
+        [insertAssistantImage, insertAssistantText, message, screenToCanvas, shared, size.height, size.width, t],
     );
 
     // Memoize every callback and render function passed to CanvasNode.
@@ -3469,9 +3466,9 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
         <main className="flex h-full min-h-0 overflow-hidden" style={{ background: theme.canvas.background, color: theme.node.text }}>
             <CanvasSidePanel nodes={nodes} selectedNodeIds={selectedNodeIds} onFocusNode={focusNode} onPreviewNode={setPreviewNodeId} onInsertAsset={handleAssetInsert} showAssets={!shared || Boolean(serverToken)} />
             <section className="relative min-w-0 flex-1 overflow-hidden">
-                {shared ? <SharedCanvasTopBar title={currentProject?.title || "未命名画布"} titleDraft={titleDraft} isTitleEditing={titleEditing} onTitleDraftChange={setTitleDraft} onStartTitleEditing={startTitleEditing} onFinishTitleEditing={finishTitleEditing} onCancelTitleEditing={() => setTitleEditing(false)} canUndo={historyState.canUndo} canRedo={historyState.canRedo} viewers={remotePresence.length + 1} viewerName={sharedDisplayName} anonymous={sharedAnonymous} readOnly={Boolean(sharedReadOnly)} allowClone={sharedAllowClone} cloning={sharedCloning} agentOpen={agentPanelOpen} onClone={() => void cloneSharedProject()} onLogin={() => useServerStore.getState().setLoginOpen(true)} onHome={() => navigate("/")} onExport={exportCurrentProject} onImport={() => handleUploadRequest()} onOpenConfig={() => openConfigDialog(false)} onOpenPlugins={() => setPluginManagerOpen(true)} onUndo={undoCanvas} onRedo={redoCanvas} onToggleAgent={toggleAgentPanel} /> : (
+                {shared ? <SharedCanvasTopBar title={currentProject?.title || t("canvas.projectPage.untitledCanvas")} titleDraft={titleDraft} isTitleEditing={titleEditing} onTitleDraftChange={setTitleDraft} onStartTitleEditing={startTitleEditing} onFinishTitleEditing={finishTitleEditing} onCancelTitleEditing={() => setTitleEditing(false)} canUndo={historyState.canUndo} canRedo={historyState.canRedo} viewers={remotePresence.length + 1} viewerName={sharedDisplayName} anonymous={sharedAnonymous} readOnly={Boolean(sharedReadOnly)} allowClone={sharedAllowClone} cloning={sharedCloning} agentOpen={agentPanelOpen} onClone={() => void cloneSharedProject()} onLogin={() => useServerStore.getState().setLoginOpen(true)} onHome={() => navigate("/")} onExport={exportCurrentProject} onImport={() => handleUploadRequest()} onOpenConfig={() => openConfigDialog(false)} onOpenPlugins={() => setPluginManagerOpen(true)} onUndo={undoCanvas} onRedo={redoCanvas} onToggleAgent={toggleAgentPanel} /> : (
                     <CanvasTopBar
-                        title={currentProject?.title || "未命名画布"}
+                        title={currentProject?.title || t("canvas.projectPage.untitledCanvas")}
                         viewers={remotePresence.length + 1}
                         titleDraft={titleDraft}
                         isTitleEditing={titleEditing}
@@ -3632,7 +3629,7 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
                     onUpload={(node) => handleUploadRequest(node.id)}
                     onDownload={downloadNodeImage}
                     onSaveAsset={(node) => void saveNodeAsset(node)}
-                    onMaskEdit={() => message.info("服务端生成暂不支持蒙版编辑")}
+                    onMaskEdit={() => message.info(t("canvas.projectPage.maskUnsupported"))}
                     onCrop={(node) => setCropNodeId(node.id)}
                     onSplit={(node) => setSplitNodeId(node.id)}
                     onUpscale={(node) => setUpscaleNodeId(node.id)}
@@ -3810,6 +3807,7 @@ function SharedCanvasTopBar({
     onRedo: () => void;
     onToggleAgent: () => void;
 }) {
+    const { t } = useTranslation();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const syncState = useShareStore((state) => state.syncState);
     const syncError = useShareStore((state) => state.syncError);
@@ -3837,8 +3835,8 @@ function SharedCanvasTopBar({
     return (
         <div className="pointer-events-none absolute left-0 right-0 top-0 z-50 flex h-16 items-center justify-between gap-3 pl-1 pr-4">
             <div className="pointer-events-auto flex min-w-0 items-center gap-2">
-                {action(sidePanelOpen ? "收起面板" : "展开面板", sidePanelOpen ? <PanelLeftClose className="size-4" /> : <PanelLeftOpen className="size-4" />, toggleSidePanel)}
-                {action("返回首页", <Home className="size-4" />, onHome)}
+                {action(sidePanelOpen ? t("canvas.collapsePanel") : t("canvas.expandPanel"), sidePanelOpen ? <PanelLeftClose className="size-4" /> : <PanelLeftOpen className="size-4" />, toggleSidePanel)}
+                {action(t("canvas.home"), <Home className="size-4" />, onHome)}
                 <div ref={titleRef} className="min-w-0">
                     {isTitleEditing ? (
                         <input
@@ -3853,38 +3851,38 @@ function SharedCanvasTopBar({
                             className="max-w-[280px] bg-transparent p-0 text-lg font-semibold outline-none"
                         />
                     ) : (
-                        <button type="button" className="max-w-[280px] truncate border-b border-dashed border-transparent text-left text-lg font-semibold transition hover:border-current" onDoubleClick={readOnly ? undefined : onStartTitleEditing} title={readOnly ? title : "双击修改画布名称"}>
+                        <button type="button" className="max-w-[280px] truncate border-b border-dashed border-transparent text-left text-lg font-semibold transition hover:border-current" onDoubleClick={readOnly ? undefined : onStartTitleEditing} title={readOnly ? title : t("canvas.renameHint")}>
                             {title}
                         </button>
                     )}
                 </div>
-                <span className="inline-flex items-center gap-1 text-xs" style={{ color: theme.node.muted }} title="当前协作人数">
+                <span className="inline-flex items-center gap-1 text-xs" style={{ color: theme.node.muted }} title={t("canvas.collaborating", { count: viewers })}>
                     <Users className="size-3.5" />
                     {viewers}
                 </span>
                 <span className="max-w-40 truncate text-xs" style={{ color: theme.node.muted }} title={viewerName}>
-                    {viewerName || (anonymous ? "匿名协作者" : "已登录协作者")}
+                    {viewerName || t(anonymous ? "canvas.share.anonymousCollaborator" : "canvas.share.signedInCollaborator")}
                 </span>
                 {syncState === "saving" ? (
                     <span className="inline-flex items-center gap-1 text-xs" style={{ color: theme.node.muted }}>
-                        <Loader2 className="size-3.5 animate-spin" /> 保存中
+                        <Loader2 className="size-3.5 animate-spin" /> {t("canvas.sync.saving")}
                     </span>
                 ) : syncState === "failed" ? (
-                    <span className="inline-flex items-center gap-1 text-xs text-red-500" title={syncError || "分享画布同步失败"}>
-                        <CloudOff className="size-3.5" /> 可能未同步
+                    <span className="inline-flex items-center gap-1 text-xs text-red-500" title={syncError || t("canvas.share.syncFailed")}>
+                        <CloudOff className="size-3.5" /> {t("canvas.share.possiblyUnsynced")}
                     </span>
                 ) : null}
             </div>
             <div className="pointer-events-auto flex items-center gap-1" style={{ color: theme.node.text }}>
-                {!readOnly ? action("撤销", <Undo2 className="size-4" />, onUndo, { disabled: !canUndo }) : null}
-                {!readOnly ? action("重做", <Redo2 className="size-4" />, onRedo, { disabled: !canRedo }) : null}
-                {!readOnly ? action("导入素材", <Upload className="size-4" />, onImport) : null}
-                {action("偏好设置", <Settings2 className="size-4" />, onOpenConfig)}
-                {!readOnly ? action("插件", <Puzzle className="size-4" />, onOpenPlugins) : null}
-                {action("导出画布", <Download className="size-4" />, onExport)}
-                {action("打开 Agent", <Bot className="size-4" />, onToggleAgent, { active: agentOpen })}
-                {anonymous ? action("登录", <LogIn className="size-4" />, onLogin) : null}
-                {allowClone ? action(cloning ? "正在保存到我的账号" : "保存到我的账号", cloning ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />, onClone, { disabled: cloning }) : null}
+                {!readOnly ? action(t("canvas.undo"), <Undo2 className="size-4" />, onUndo, { disabled: !canUndo }) : null}
+                {!readOnly ? action(t("canvas.redo"), <Redo2 className="size-4" />, onRedo, { disabled: !canRedo }) : null}
+                {!readOnly ? action(t("canvas.importAsset"), <Upload className="size-4" />, onImport) : null}
+                {action(t("canvas.share.preferences"), <Settings2 className="size-4" />, onOpenConfig)}
+                {!readOnly ? action(t("topNav.plugins"), <Puzzle className="size-4" />, onOpenPlugins) : null}
+                {action(t("canvas.exportCurrent"), <Download className="size-4" />, onExport)}
+                {action(t("topNav.openAgent"), <Bot className="size-4" />, onToggleAgent, { active: agentOpen })}
+                {anonymous ? action(t("canvas.share.login"), <LogIn className="size-4" />, onLogin) : null}
+                {allowClone ? action(t(cloning ? "canvas.share.cloning" : "canvas.share.clone"), cloning ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />, onClone, { disabled: cloning }) : null}
             </div>
         </div>
     );

@@ -45,7 +45,7 @@ export function usePluginHost(params: PluginHostParams) {
         const ensureReady = () => {
             if (!isGenerationReady()) {
                 openConfigDialog(true);
-                throw new Error("服务端还没有可用模型,请稍后重试或联系管理员");
+                throw new Error(t("canvas.plugins.aiConfigRequired"));
             }
         };
         const pluginGenerationContext = (prompt: string) => (shared ? { source: "canvas" as const, projectId, prompt } : undefined);
@@ -78,7 +78,7 @@ export function usePluginHost(params: PluginHostParams) {
             listModels: (capability) => selectableModelsByCapability(effectiveConfig, capability as ModelCapability | undefined).map((value) => ({ value, label: value })),
             defaultModel: (capability) => buildGenerationConfig(effectiveConfig, undefined, capability).model,
         };
-    }, [effectiveConfig, openConfigDialog, projectId, shared]);
+    }, [effectiveConfig, openConfigDialog, projectId, shared, t]);
 
     const pluginHost = useMemo<CanvasPluginHost>(
         () => ({

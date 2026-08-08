@@ -2,6 +2,7 @@ import { forwardRef, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent, PointerEvent, TextareaHTMLAttributes } from "react";
 import { createPortal } from "react-dom";
 import { FileText, Image as ImageIcon, Music2, Video } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { isImeComposing, isPlainEnterKey } from "@/lib/keyboard-event";
@@ -32,6 +33,7 @@ type Props = Omit<TextareaHTMLAttributes<HTMLTextAreaElement>, "onChange" | "val
 };
 
 export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Props>(function CanvasResourceMentionTextarea({ value, references, onChange, onSubmit, onKeyDown, className, containerClassName, style, highlightLabels = true, onLabelHover, onLabelClick, ...props }, forwardedRef) {
+    const { t } = useTranslation();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const overlayRef = useRef<HTMLDivElement | null>(null);
@@ -137,7 +139,7 @@ export const CanvasResourceMentionTextarea = forwardRef<HTMLTextAreaElement, Pro
                 className={className}
                 style={mergedStyle}
                 // 标签压在 textarea 底下，自己的 title 弹不出来；停在已删除的引用上时借 textarea 说清楚原因。
-                title={hoveredLabel && missingLabels.has(hoveredLabel) ? "引用的节点已从画布中删除" : props.title}
+                title={hoveredLabel && missingLabels.has(hoveredLabel) ? t("canvas.composer.referenceDeleted") : props.title}
                 onChange={(event) => {
                     const next = event.target.value;
                     onChange(next);

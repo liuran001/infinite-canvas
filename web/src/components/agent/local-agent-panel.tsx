@@ -825,9 +825,9 @@ export function LocalAgentPanel({ embedded, headless, autoConnect, forceLocal = 
 
     const runToolCall = async (endpoint: string, token: string, payload: AgentPendingToolCall) => {
         if (restricted && (isSiteTool(payload.name) || payload.name === "site_navigate")) {
-            const error = "分享画布仅允许 Agent 操作当前画布，不能使用账号级工具或跳转页面";
+            const error = rt("shareCanvasScopeOnly");
             await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, error });
-            addEventLog(`${toolName(payload.name)}已拒绝`, { error }, payload);
+            addEventLog(rt("toolRejected", { tool: toolName(payload.name) }), { error }, payload);
             return;
         }
         if (isSiteTool(payload.name)) {

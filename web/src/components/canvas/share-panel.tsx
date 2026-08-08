@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { App, Button, DatePicker, Drawer, Empty, Modal, Segmented, Switch, Tag, Tooltip } from "antd";
 import dayjs, { type Dayjs } from "dayjs";
 import { Copy, Link2, Link2Off, Loader2, Plus, RefreshCw } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { useCopyText } from "@/hooks/use-copy-text";
 import { canvasThemes, type CanvasTheme } from "@/lib/canvas-theme";
@@ -21,6 +22,7 @@ import { useThemeStore } from "@/stores/use-theme-store";
  */
 export function SharePanel({ projectId, open, onClose }: { projectId: string; open: boolean; onClose: () => void }) {
     const { message } = App.useApp();
+    const { t } = useTranslation();
     const copyText = useCopyText();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
 
@@ -46,11 +48,11 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
         try {
             setShares(await shareAdminApi.list(projectId));
         } catch (error) {
-            message.error(error instanceof Error ? error.message : "读取分享链接失败");
+            message.error(error instanceof Error ? error.message : t("canvas.share.errors.load"));
         } finally {
             setLoading(false);
         }
-    }, [message, projectId]);
+    }, [message, projectId, t]);
 
     useEffect(() => {
         if (open) void load();
@@ -63,7 +65,7 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
             setCreated(share);
             setShares((prev) => [share, ...prev]);
         } catch (error) {
-            message.error(error instanceof Error ? error.message : "创建分享链接失败");
+            message.error(error instanceof Error ? error.message : t("canvas.share.errors.create"));
         } finally {
             setCreating(false);
         }
@@ -74,21 +76,21 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
             const next = await shareAdminApi.update(projectId, share.id, input);
             setShares((prev) => prev.map((item) => (item.id === share.id ? next : item)));
         } catch (error) {
-            message.error(error instanceof Error ? error.message : "更新分享链接失败");
+            message.error(error instanceof Error ? error.message : t("canvas.share.errors.update"));
         }
     };
 
     const revoke = (share: ShareRecord) => {
         Modal.confirm({
-            title: "停用这条分享链接？",
-            content: "停用后正在浏览的访客会立即断开，链接不能再被打开。已保存到副本的内容不受影响。",
-            okText: "停用",
+            title: t("canvas.share.disableTitle"),
+            content: t("canvas.share.disableDescription"),
+            okText: t("canvas.share.disable"),
             okButtonProps: { danger: true },
-            cancelText: "取消",
+            cancelText: t("common.cancel"),
             onOk: async () => {
                 await shareAdminApi.revoke(projectId, share.id);
                 setShares((prev) => prev.map((item) => (item.id === share.id ? { ...item, enabled: false } : item)));
-                message.success("已停用分享链接");
+                message.success(t("canvas.share.disabledSuccess"));
             },
         });
     };
@@ -96,54 +98,54 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
     return (
         <>
             <Drawer
-                title="分享这张画布"
+                title={t("canvas.share.panelTitle")}
                 open={open}
                 onClose={onClose}
                 width={520}
                 extra={
-                    <Tooltip title="刷新">
-                        <Button type="text" icon={<RefreshCw className="size-4" />} onClick={() => void load()} aria-label="刷新分享列表" />
+                    <Tooltip title={t("canvas.share.refresh")}>
+                        <Button type="text" icon={<RefreshCw className="size-4" />} onClick={() => void load()} aria-label={t("canvas.share.refreshList")} />
                     </Tooltip>
                 }
             >
                 <section className="space-y-4 rounded-2xl border p-4" style={{ borderColor: theme.node.stroke }}>
-                    <h3 className="text-sm font-semibold">新建链接</h3>
-                    <Field label="权限" hint={role === "editor" ? "访客可以直接编辑这张画布，改动会写回你的画布本体。" : "访客只能查看与平移缩放，无法改动任何内容。"}>
+                    <h3 className="text-sm font-semibold">{t("canvas.share.newLink")}</h3>
+                    <Field label={t("canvas.share.permission")} hint={t(role === "editor" ? "canvas.share.editorHint" : "canvas.share.viewerHint")}>
                         <Segmented
                             value={role}
                             onChange={(value) => setRole(value as ShareRole)}
                             options={[
-                                { label: "只读", value: "viewer" },
-                                { label: "可编辑", value: "editor" },
+                                { label: t("canvas.share.readOnly"), value: "viewer" },
+                                { label: t("canvas.share.editable"), value: "editor" },
                             ]}
                         />
                     </Field>
-                    <Field label="允许匿名访问" hint={allowAnonymous ? "任何拿到链接的人都能打开。" : "访客必须先登录才能打开这条链接。"}>
+                    <Field label={t("canvas.share.allowAnonymous")} hint={t(allowAnonymous ? "canvas.share.anonymousOnHint" : "canvas.share.anonymousOffHint")}>
                         <Switch checked={allowAnonymous} onChange={setAllowAnonymous} />
                     </Field>
-                    <Field label="允许保存到自己账号" hint={allowClone ? "访客可以克隆一份独立副本，副本与这张画布互不影响。" : "访客不能把这张画布克隆走。"}>
+                    <Field label={t("canvas.share.allowClone")} hint={t(allowClone ? "canvas.share.cloneOnHint" : "canvas.share.cloneOffHint")}>
                         <Switch checked={allowClone} onChange={setAllowClone} />
                     </Field>
-                    <Field label="由我支付算力点" hint={ownerPays ? "分享访客触发的生成由你支付算力点。" : "关闭后，访客生成需要自己的账号承担算力点。"}>
+                    <Field label={t("canvas.share.ownerPays")} hint={t(ownerPays ? "canvas.share.ownerPaysOnHint" : "canvas.share.ownerPaysOffHint")}>
                         <Switch checked={ownerPays} onChange={setOwnerPays} />
                     </Field>
-                    <Field label="允许匿名用户编辑" hint="仅当权限为可编辑、允许匿名访问且由我支付算力点时可用。">
+                    <Field label={t("canvas.share.allowAnonymousEdit")} hint={t("canvas.share.anonymousEditHint")}>
                         <Switch checked={allowAnonymousEdit} disabled={!anonymousEditEnabled} onChange={setAllowAnonymousEdit} />
                     </Field>
-                    <Field label="过期时间" hint={expiresAt ? `到 ${expiresAt.format("YYYY-MM-DD HH:mm")} 后链接自动失效。` : "留空表示永不过期。"}>
-                        <DatePicker showTime value={expiresAt} onChange={setExpiresAt} placeholder="永不过期" disabledDate={(date) => date.isBefore(dayjs(), "day")} />
+                    <Field label={t("canvas.share.expiration")} hint={expiresAt ? t("canvas.share.expirationHint", { date: expiresAt.format("YYYY-MM-DD HH:mm") }) : t("canvas.share.neverExpiresHint")}>
+                        <DatePicker showTime value={expiresAt} onChange={setExpiresAt} placeholder={t("canvas.share.neverExpires")} disabledDate={(date) => date.isBefore(dayjs(), "day")} />
                     </Field>
                     <Button type="primary" block icon={<Plus className="size-4" />} loading={creating} onClick={() => void create()}>
-                        创建分享链接
+                        {t("canvas.share.createLink")}
                     </Button>
                 </section>
 
                 <section className="mt-6 space-y-3">
                     <h3 className="text-sm font-semibold">
-                        已有链接
+                        {t("canvas.share.existingLinks")}
                         {loading ? <Loader2 className="ml-2 inline size-3.5 animate-spin" /> : null}
                     </h3>
-                    {!loading && !shares.length ? <Empty description="还没有分享链接" image={Empty.PRESENTED_IMAGE_SIMPLE} /> : null}
+                    {!loading && !shares.length ? <Empty description={t("canvas.share.noLinks")} image={Empty.PRESENTED_IMAGE_SIMPLE} /> : null}
                     {shares.map((share) => (
                         <ShareRow key={share.id} share={share} theme={theme} onPatch={patch} onRevoke={revoke} onViewLogs={() => setLogShareId(share.id)} />
                     ))}
@@ -151,22 +153,22 @@ export function SharePanel({ projectId, open, onClose }: { projectId: string; op
             </Drawer>
 
             <Modal
-                title="链接已创建"
+                title={t("canvas.share.createdTitle")}
                 open={Boolean(created)}
                 centered
                 onCancel={() => setCreated(null)}
                 footer={
                     <Button type="primary" onClick={() => setCreated(null)}>
-                        知道了
+                        {t("canvas.share.gotIt")}
                     </Button>
                 }
             >
-                <p className="text-sm opacity-70">这条链接随时可以在下面的列表里再复制，不必现在就存下来。</p>
+                <p className="text-sm opacity-70">{t("canvas.share.createdHint")}</p>
                 <div className="mt-3 flex items-center gap-2 rounded-xl border px-3 py-2" style={{ borderColor: theme.node.stroke, background: theme.node.fill }}>
                     <Link2 className="size-4 shrink-0 opacity-60" />
                     <span className="min-w-0 flex-1 truncate font-mono text-xs">{created ? shareUrl(created) : ""}</span>
-                    <Button size="small" icon={<Copy className="size-3.5" />} onClick={() => created && copyText(shareUrl(created), "已复制分享链接")}>
-                        复制
+                    <Button size="small" icon={<Copy className="size-3.5" />} onClick={() => created && copyText(shareUrl(created), t("canvas.share.copySuccess"))}>
+                        {t("common.copy")}
                     </Button>
                 </div>
             </Modal>
@@ -194,6 +196,7 @@ function ShareRow({
     onRevoke: (share: ShareRecord) => void;
     onViewLogs: () => void;
 }) {
+    const { t } = useTranslation();
     const copyText = useCopyText();
     const expired = Boolean(share.expiresAt && Date.parse(share.expiresAt) < Date.now());
     const dead = !share.enabled || expired;
@@ -203,34 +206,34 @@ function ShareRow({
                 {/* 能复制时就把完整链接摆出来，不再只给一截前缀——前缀本身对用户没有任何用处。 */}
                 <span className="min-w-0 flex-1 truncate font-mono text-xs opacity-70">{share.copyable ? shareUrl(share) : `/s/${share.tokenPrefix}…`}</span>
                 {share.copyable ? (
-                    <Tooltip title="复制完整链接">
-                        <Button size="small" type="text" aria-label="复制完整链接" icon={<Copy className="size-3.5" />} onClick={() => copyText(shareUrl(share), "已复制分享链接")} />
+                    <Tooltip title={t("canvas.share.copyFullLink")}>
+                        <Button size="small" type="text" aria-label={t("canvas.share.copyFullLink")} icon={<Copy className="size-3.5" />} onClick={() => copyText(shareUrl(share), t("canvas.share.copySuccess"))} />
                     </Tooltip>
                 ) : null}
-                {dead ? <Tag color="default">{expired ? "已过期" : "已停用"}</Tag> : <Tag color={share.role === "editor" ? "green" : "blue"}>{share.role === "editor" ? "可编辑" : "只读"}</Tag>}
+                {dead ? <Tag color="default">{t(expired ? "canvas.share.expired" : "canvas.share.disabled")}</Tag> : <Tag color={share.role === "editor" ? "green" : "blue"}>{t(share.role === "editor" ? "canvas.share.editable" : "canvas.share.readOnly")}</Tag>}
             </div>
             {/*
              * 老链接建于「只存哈希」的年代，服务端手里也只有不可逆的哈希，没法再还原出完整链接。
              * 这时候必须把原因说清楚：不解释的话，用户只会觉得「别的链接都能复制，就这条按钮不见了」，
              * 然后反复刷新等它出现。给的出路也要具体——重建一条，而不是让他自己琢磨。
              */}
-            {share.copyable ? null : <p className="!mb-0 text-[11px] opacity-55">这是早期创建的链接，服务端只留了不可逆的摘要，没法再还原出完整地址。需要发给别人的话，新建一条链接即可。</p>}
+            {share.copyable ? null : <p className="!mb-0 text-[11px] opacity-55">{t("canvas.share.legacyUnavailable")}</p>}
 
             <div className="grid grid-cols-2 gap-2 text-xs">
                 <label className="flex items-center justify-between gap-2">
-                    <span className="opacity-70">匿名访问</span>
+                    <span className="opacity-70">{t("canvas.share.anonymousAccess")}</span>
                     <Switch size="small" disabled={dead} checked={share.allowAnonymous} onChange={(checked) => void onPatch(share, { allowAnonymous: checked, ...(checked ? {} : { allowAnonymousEdit: false }) })} />
                 </label>
                 <label className="flex items-center justify-between gap-2">
-                    <span className="opacity-70">允许克隆</span>
+                    <span className="opacity-70">{t("canvas.share.cloneAllowed")}</span>
                     <Switch size="small" disabled={dead} checked={share.allowClone} onChange={(checked) => void onPatch(share, { allowClone: checked })} />
                 </label>
                 <label className="flex items-center justify-between gap-2">
-                    <span className="opacity-70">由我支付算力点</span>
+                    <span className="opacity-70">{t("canvas.share.ownerPays")}</span>
                     <Switch size="small" disabled={dead} checked={share.ownerPays} onChange={(checked) => void onPatch(share, { ownerPays: checked, ...(checked ? {} : { allowAnonymousEdit: false }) })} />
                 </label>
                 <label className="flex items-center justify-between gap-2">
-                    <span className="opacity-70">匿名用户编辑</span>
+                    <span className="opacity-70">{t("canvas.share.anonymousEditing")}</span>
                     <Switch size="small" disabled={dead || share.role !== "editor" || !share.allowAnonymous || !share.ownerPays} checked={share.allowAnonymousEdit} onChange={(checked) => void onPatch(share, { allowAnonymousEdit: checked })} />
                 </label>
             </div>
@@ -242,31 +245,31 @@ function ShareRow({
                     value={share.role}
                     onChange={(value) => void onPatch(share, { role: value as ShareRole, ...(value === "editor" ? {} : { allowAnonymousEdit: false }) })}
                     options={[
-                        { label: "只读", value: "viewer" },
-                        { label: "可编辑", value: "editor" },
+                        { label: t("canvas.share.readOnly"), value: "viewer" },
+                        { label: t("canvas.share.editable"), value: "editor" },
                     ]}
                 />
                 <div className="flex items-center gap-1">
                     <Button size="small" type="text" onClick={onViewLogs}>
-                        访问记录
+                        {t("canvas.share.accessLogs")}
                     </Button>
                     {dead ? null : (
                         <Button size="small" type="text" danger icon={<Link2Off className="size-3.5" />} onClick={() => onRevoke(share)}>
-                            停用
+                            {t("canvas.share.disable")}
                         </Button>
                     )}
                 </div>
             </div>
 
             <div className="flex items-center justify-between gap-2 text-[11px] opacity-55">
-                <span>创建于 {dayjs(share.createdAt).format("YYYY-MM-DD HH:mm")}</span>
+                <span>{t("canvas.share.createdAt", { date: dayjs(share.createdAt).format("YYYY-MM-DD HH:mm") })}</span>
                 <DatePicker
                     size="small"
                     showTime
                     variant="borderless"
                     disabled={dead}
                     value={share.expiresAt ? dayjs(share.expiresAt) : null}
-                    placeholder="永不过期"
+                    placeholder={t("canvas.share.neverExpires")}
                     onChange={(value) => void onPatch(share, { expiresAt: value ? value.toISOString() : null })}
                 />
             </div>
@@ -274,12 +277,12 @@ function ShareRow({
     );
 }
 
-const LOG_EVENT_LABEL: Record<ShareAccessLog["event"], string> = { open: "打开", edit: "编辑", clone: "克隆" };
-
 function ShareLogsModal({ projectId, shareId, onClose }: { projectId: string; shareId: string; onClose: () => void }) {
     const { message } = App.useApp();
+    const { t } = useTranslation();
     const [logs, setLogs] = useState<ShareAccessLog[]>([]);
     const [loading, setLoading] = useState(false);
+    const eventLabels: Record<ShareAccessLog["event"], string> = { open: t("canvas.share.events.open"), edit: t("canvas.share.events.edit"), clone: t("canvas.share.events.clone") };
 
     useEffect(() => {
         if (!shareId) return;
@@ -287,22 +290,22 @@ function ShareLogsModal({ projectId, shareId, onClose }: { projectId: string; sh
         shareAdminApi
             .logs(projectId, shareId)
             .then((result) => setLogs(result.items))
-            .catch((error: Error) => message.error(error.message || "读取访问日志失败"))
+            .catch((error: Error) => message.error(error.message || t("canvas.share.errors.loadLogs")))
             .finally(() => setLoading(false));
-    }, [message, projectId, shareId]);
+    }, [message, projectId, shareId, t]);
 
     const rows = useMemo(() => logs.slice(0, 200), [logs]);
 
     return (
-        <Modal title="访问记录" open={Boolean(shareId)} onCancel={onClose} footer={null} centered width={560}>
-            <p className="mb-3 text-xs opacity-55">同一访客的连续访问会被服务端合并，因此这里看到的是访问次数的下界，而不是逐次请求。</p>
+        <Modal title={t("canvas.share.accessLogs")} open={Boolean(shareId)} onCancel={onClose} footer={null} centered width={560}>
+            <p className="mb-3 text-xs opacity-55">{t("canvas.share.logsHint")}</p>
             {loading ? <Loader2 className="mx-auto my-8 size-5 animate-spin" /> : null}
-            {!loading && !rows.length ? <Empty description="还没有访问记录" image={Empty.PRESENTED_IMAGE_SIMPLE} /> : null}
+            {!loading && !rows.length ? <Empty description={t("canvas.share.noLogs")} image={Empty.PRESENTED_IMAGE_SIMPLE} /> : null}
             <div className="max-h-[50vh] space-y-1.5 overflow-auto">
                 {rows.map((log) => (
                     <div key={log.id} className="flex items-center justify-between gap-3 rounded-lg px-2 py-1.5 text-xs odd:bg-black/[.03] dark:odd:bg-white/[.04]">
-                        <span className="w-14 shrink-0 font-medium">{LOG_EVENT_LABEL[log.event] || log.event}</span>
-                        <span className="min-w-0 flex-1 truncate opacity-70">{log.isAnonymous ? `匿名访客 ${log.actorId.slice(-6)}` : log.actorId}</span>
+                        <span className="w-14 shrink-0 font-medium">{eventLabels[log.event] || log.event}</span>
+                        <span className="min-w-0 flex-1 truncate opacity-70">{log.isAnonymous ? t("canvas.share.anonymousVisitor", { id: log.actorId.slice(-6) }) : log.actorId}</span>
                         <span className="shrink-0 opacity-50">{dayjs(log.createdAt).format("MM-DD HH:mm")}</span>
                     </div>
                 ))}

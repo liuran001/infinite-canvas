@@ -1,28 +1,34 @@
 import dayjs from "dayjs";
 
+import i18n from "@/i18n";
 import type { ServerAgentMessage, ServerAgentPendingAction } from "@/services/api/server";
 import type { AgentChatMessageItem } from "./agent-chat-message";
 import type { AgentSearchResult } from "./agent-search-card";
 
 /** 服务端工具名到中文标题：面板要让用户看清 agent 到底动了画布的什么地方。执行中的一行也直接用它拼成「正在读取画布」。 */
 const TOOL_LABELS: Record<string, string> = {
-    read_canvas: "读取画布",
-    create_node: "新建节点",
-    update_node: "修改节点",
-    delete_node: "删除节点",
-    move_nodes: "移动节点",
-    set_node_group: "调整分组",
-    connect_nodes: "连接节点",
-    disconnect_nodes: "断开连线",
-    rename_canvas: "重命名画布",
-    generate_image: "生成图片",
-    generate_video: "生成视频",
-    generate_audio: "生成音频",
-    view_image: "查看图片",
-    web_search: "联网搜索",
-    read_webpage: "读取网页",
-    import_image: "导入网络图片",
+    read_canvas: "readCanvas",
+    create_node: "createNode",
+    update_node: "updateNode",
+    delete_node: "deleteNode",
+    move_nodes: "moveNodes",
+    set_node_group: "setNodeGroup",
+    connect_nodes: "connectNodes",
+    disconnect_nodes: "disconnectNodes",
+    rename_canvas: "renameCanvas",
+    generate_image: "generateImage",
+    generate_video: "generateVideo",
+    generate_audio: "generateAudio",
+    view_image: "viewImage",
+    web_search: "webSearch",
+    read_webpage: "readWebpage",
+    import_image: "importImage",
 };
+
+function toolLabel(name: string) {
+    const key = TOOL_LABELS[name];
+    return key ? i18n.t(`agent.cloud.tools.${key}`) : name;
+}
 
 /** 一行摘要优先取最能说明「在干什么」的参数。 */
 const SUMMARY_KEYS = ["query", "prompt", "title", "content", "nodeId", "fromNodeId", "type"];
@@ -87,14 +93,14 @@ export function toCloudChatItem(message: ServerAgentMessage): AgentChatMessageIt
         const shown = clip(text(value).trim(), MAX_VALUE_CHARS);
         return shown ? [{ label, value: shown }] : [];
     });
-    const title = TOOL_LABELS[message.toolName] || message.toolName;
+    const title = toolLabel(message.toolName);
     const summary = clip(SUMMARY_KEYS.map((key) => text(args[key]).trim()).find(Boolean) || "", MAX_VALUE_CHARS);
     // 没有 toolResult 说明工具还在跑：服务端先落一条占位消息，拿到结果后用同一个 seq 再推一次。
-    if (!message.toolResult) return { id, role: "tool", title, text: summary || "正在执行", detail: { status: "running", rows } };
+    if (!message.toolResult) return { id, role: "tool", title, text: summary || i18n.t("agent.cloud.format.executing"), detail: { status: "running", rows } };
 
     const result = parseJson(message.toolResult) as { ok?: boolean; data?: unknown; error?: string } | null;
     const failed = result?.ok === false;
-    const failure = String(result?.error || "工具执行失败");
+    const failure = String(result?.error || i18n.t("agent.cloud.format.toolFailed"));
     // 只有联网搜索拆条目，其余工具照旧摊 output；原始 JSON 不截断，折叠起来备查。
     const results = !failed && message.toolName === "web_search" ? searchResults(result?.data) : [];
     const output = failed ? failure : results.length ? text(result?.data ?? "").trim() : clip(text(result?.data ?? "").trim(), MAX_OUTPUT_CHARS);
@@ -102,7 +108,7 @@ export function toCloudChatItem(message: ServerAgentMessage): AgentChatMessageIt
         id,
         role: "tool",
         title,
-        text: failed ? failure : summary || "已完成",
+        text: failed ? failure : summary || i18n.t("agent.cloud.format.completed"),
         detail: { status: failed ? "failed" : "completed", rows, output, ...(results.length ? { results } : {}) },
     };
 }
@@ -114,8 +120,8 @@ export function toCloudChatItem(message: ServerAgentMessage): AgentChatMessageIt
 export function cloudAgentActivity(messages: ServerAgentMessage[]) {
     const last = messages[messages.length - 1];
     // 工具消息先落一条没有结果的占位，拿到结果后用同一个 seq 再推一次；没有结果才代表这个工具还在跑。
-    if (last?.role === "tool" && !last.toolResult) return `正在${TOOL_LABELS[last.toolName] || "执行工具"}`;
-    return "正在思考";
+    if (last?.role === "tool" && !last.toolResult) return i18n.t("agent.cloud.format.runningTool", { tool: toolLabel(last.toolName) });
+    return i18n.t("agent.cloud.format.thinking");
 }
 
 export type CloudAgentTimelineEntry =
@@ -130,7 +136,9 @@ function elapsedText(startedAt: string, endedAt: string) {
     // 组还没等到后一条消息时用当前时间兜底，否则刚跑完的那一瞬间会先显示成 0 秒、过一会儿又冒出耗时。
     const seconds = Math.round(((endedAt ? dayjs(endedAt).valueOf() : Date.now()) - dayjs(startedAt).valueOf()) / 1000);
     if (!Number.isFinite(seconds) || seconds < 1) return "";
-    return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+    return seconds < 60
+        ? i18n.t("agent.cloud.format.durationSeconds", { seconds })
+        : i18n.t("agent.cloud.format.durationMinutes", { minutes: Math.floor(seconds / 60), seconds: seconds % 60 });
 }
 
 /**
@@ -141,10 +149,19 @@ function elapsedText(startedAt: string, endedAt: string) {
  */
 function toolGroupLabel(tools: ServerAgentMessage[], endedAt: string) {
     const last = tools[tools.length - 1];
-    if (!last.toolResult) return { running: true, label: `正在${TOOL_LABELS[last.toolName] || "执行工具"}` };
+    if (!last.toolResult) return { running: true, label: i18n.t("agent.cloud.format.runningTool", { tool: toolLabel(last.toolName) }) };
     const failed = tools.filter(toolFailed).length;
     const elapsed = elapsedText(tools[0].createdAt, endedAt);
-    return { running: false, label: `已执行 ${tools.length} 个操作${failed ? ` · ${failed} 个失败` : ""}${elapsed ? ` · 耗时 ${elapsed}` : ""}` };
+    return {
+        running: false,
+        label: [
+            i18n.t("agent.cloud.format.operationsCompleted", { count: tools.length }),
+            failed ? i18n.t("agent.cloud.format.operationsFailed", { count: failed }) : "",
+            elapsed ? i18n.t("agent.cloud.format.elapsed", { elapsed }) : "",
+        ]
+            .filter(Boolean)
+            .join(" · "),
+    };
 }
 
 /**
@@ -179,8 +196,18 @@ export function cloudAgentTimeline(messages: ServerAgentMessage[]): CloudAgentTi
  */
 export function cloudPendingCard(action: ServerAgentPendingAction) {
     if (action.type === "continue") {
-        const cost = action.credits ? `继续会再扣 ${action.credits} 点算力，和重新发一条消息一样` : "继续不再额外扣算力点";
-        return { title: "是否继续执行", summary: `这条消息已经跑了 ${action.roundsUsed} 轮还没做完。${cost}；选择不继续就停在这里。` };
+        const cost = action.credits
+            ? i18n.t("agent.cloud.pending.continueCost", { credits: action.credits })
+            : i18n.t("agent.cloud.pending.continueFree");
+        return {
+            title: i18n.t("agent.cloud.pending.continueTitle"),
+            summary: i18n.t("agent.cloud.pending.continueSummary", { rounds: action.roundsUsed, cost }),
+        };
     }
-    return { title: "是否修改画布标题", summary: `想把画布标题改成「${action.title}」${action.reason ? `，理由是${action.reason}` : ""}。` };
+    return {
+        title: i18n.t("agent.cloud.pending.renameTitle"),
+        summary: action.reason
+            ? i18n.t("agent.cloud.pending.renameSummaryWithReason", { title: action.title, reason: action.reason })
+            : i18n.t("agent.cloud.pending.renameSummary", { title: action.title }),
+    };
 }

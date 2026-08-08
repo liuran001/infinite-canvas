@@ -30,6 +30,8 @@ const block = (source, start, end) => {
     const to = from < 0 ? -1 : source.indexOf(end, from);
     return from < 0 ? "" : source.slice(from, to < 0 ? undefined : to);
 };
+const executableSource = (source) => source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+const hasHardcodedChinese = (source) => /(?:["'`][^"'`\n]*[\u3400-\u9fff]|>[^<>{}\n]*[\u3400-\u9fff][^<>{}\n]*<)/.test(executableSource(source));
 
 console.log("分享通道契约");
 
@@ -86,6 +88,15 @@ check("分享页上传前再兜一次权限", /if \(!editableRef\.current\) retu
 console.log("分享链接的可复制性");
 
 const sharePanel = read("components/canvas/share-panel.tsx");
+const mobileHintDialog = read("components/canvas/canvas-mobile-hint-dialog.tsx");
+const zhLocale = read("i18n/locales/zh-CN.ts");
+const enLocale = read("i18n/locales/en-US.ts");
+
+check("分享管理接入画布 i18n", /useTranslation/.test(sharePanel) && /t\("canvas\.share\./.test(sharePanel), "SharePanel 没有从 canvas.share 读取文案");
+check("分享管理不留硬编码中文", !hasHardcodedChinese(sharePanel), "SharePanel 仍有不会随语言切换的用户文案");
+check("移动端提示接入画布 i18n", /useTranslation/.test(mobileHintDialog) && /t\("canvas\.mobileHint\./.test(mobileHintDialog), "CanvasMobileHintDialog 没有从 canvas.mobileHint 读取文案");
+check("移动端提示不留硬编码中文", !hasHardcodedChinese(mobileHintDialog), "CanvasMobileHintDialog 仍有不会随语言切换的用户文案");
+check("中英 locale 提供分享与移动端文案", [zhLocale, enLocale].every((source) => /share:\s*\{/.test(source) && /mobileHint:\s*\{/.test(source)), "locale 缺少 canvas.share 或 canvas.mobileHint");
 
 // 服务端额外存了一份明文，链接因此随时可复制；但存量记录只有不可逆的哈希，永远还原不出完整地址。
 // 这两类必须靠服务端给的 copyable 区分，不能拿 token 是否为空串去猜：
@@ -95,7 +106,7 @@ check("类型里有 copyable 这个显式状态", /copyable: boolean/.test(share
 check("列表按 copyable 决定给不给复制入口", /share\.copyable \?/.test(sharePanel), "复制入口没有按 copyable 收口");
 check("不靠 token 是否为空串来猜", !/share\.token\s*\?\s*</.test(sharePanel) && !/Boolean\(share\.token\)/.test(sharePanel), "还在拿 token 是否有值判断能不能复制");
 // 不能复制时不能只是把按钮藏了：用户会以为是自己的问题，反复刷新等它出现。
-check("不能复制时说明原因", /copyable \? null :/.test(sharePanel) && /早期创建的链接/.test(sharePanel), "旧链接没有给出「为什么复制不了」的说明");
+check("不能复制时说明原因", /copyable \? null :/.test(sharePanel) && /t\("canvas\.share\.legacyUnavailable"\)/.test(sharePanel), "旧链接没有给出「为什么复制不了」的说明");
 // 拼链接优先用服务端给的 url：反代下前端自己拼主机名会拼错。
 check("优先用服务端给的完整链接", /share\.url \|\|/.test(sharePanel), "没有优先使用服务端下发的 url");
 // 顶部那段注释是这个文件的行为契约，改了行为却留着旧注释，下一个人会照着错的做。
@@ -118,7 +129,7 @@ check("生成器识别分享画布", /fullCanvas/.test(read("services/api/genera
 check("分享生成只接受当前画布的显式上下文", /context\?\.source\s*===\s*"canvas"[\s\S]{0,120}?context\.projectId\s*===\s*share\.project\.id/.test(read("services/api/generation.ts")), "缺少或错画布的 context 仍会误用当前分享的房主计费与存储");
 check("分享账单同意服务存在", /selfPayRequired/.test(read("services/share-billing-consent.ts")) && /AbortError/.test(read("services/share-billing-consent.ts")), "缺少取消语义");
 check("画布生成在创建占位前完成扣点确认", /ensureGenerationBillingConsent\(jobContext\(nodeId,[\s\S]{0,500}?let pendingChildIds/.test(projectPage), "取消自费确认后仍可能留下 loading 占位节点");
-check("未接入蒙版生成时入口直接提示且不进入扣点流程", /onMaskEdit=\{\(\) => message\.(?:info|warning)\("服务端生成暂不支持蒙版编辑"\)\}/.test(projectPage) && !/setMaskEditNodeId/.test(projectPage), "蒙版入口仍会先打开编辑器、确认扣点或创建 loading 节点，最后才报不支持");
+check("未接入蒙版生成时入口直接提示且不进入扣点流程", /onMaskEdit=\{\(\) => message\.(?:info|warning)\(t\("canvas\.projectPage\.maskUnsupported"\)\)\}/.test(projectPage) && !/setMaskEditNodeId/.test(projectPage), "蒙版入口仍会先打开编辑器、确认扣点或创建 loading 节点，最后才报不支持");
 check("角度生成在创建占位前完成扣点确认", angleGeneration.indexOf("ensureGenerationBillingConsent") >= 0 && angleGeneration.indexOf("ensureGenerationBillingConsent") < angleGeneration.indexOf("setRunningNodeId") && /acceptSelfPay/.test(angleGeneration), "取消角度生成的自费确认后仍会留下 loading 子节点");
 check("重试生成在写入 loading 前完成并复用扣点确认", retryGeneration.indexOf("ensureGenerationBillingConsent") >= 0 && retryGeneration.indexOf("ensureGenerationBillingConsent") < retryGeneration.indexOf("setRunningNodeId") && (retryGeneration.match(/acceptSelfPay/g) || []).length >= 5, "取消重试的自费确认会污染原节点，或部分重试类型没有复用确认结果");
 check("预确认结果复用到任务提交", /acceptedSelfPay \?\?/.test(read("services/api/generation.ts")) && /acceptSelfPay \}/.test(projectPage), "批量生成会重复弹窗或忽略预确认结果");
@@ -171,7 +182,7 @@ check("分享完整工作区挂载自费确认", /useShareBillingConsentPrompt\(
 check("登录协作者显示个人资产而匿名继续隐藏", /showAssets=\{!shared \|\| Boolean\(serverToken\)\}/.test(projectPage) && /\{!shared \|\| serverToken \? <AssetPickerModal/.test(projectPage), "登录协作者看不到个人资产，或匿名访客错误获得账号资产入口");
 check("协作者插入个人图片前复制到房主空间", /uploadShareImage\(payload\.dataUrl \|\| resolveImageUrl\(payload\.storageKey\)\)/.test(projectPage), "个人图片 fileId 被直接写进房主画布，其他协作者无法读取");
 check("协作者插入个人视频前复制到房主空间", /uploadShareMedia\(payload\.url,\s*"asset-video"\)/.test(projectPage), "个人视频 fileId 被直接写进房主画布，其他协作者无法读取");
-check("分享完整工作区保留克隆与登录入口", /保存到我的账号/.test(projectPage) && /onLogin/.test(projectPage), "fullCanvas 分支丢失保存副本或登录入口");
+check("分享完整工作区保留克隆与登录入口", /t\(cloning \? "canvas\.share\.cloning" : "canvas\.share\.clone"\)/.test(projectPage) && /onLogin/.test(projectPage), "fullCanvas 分支丢失保存副本或登录入口");
 check("匿名保存个人资产先要求登录", /shared && !useServerStore\.getState\(\)\.token[\s\S]{0,180}?setLoginOpen\(true\)/.test(projectPage), "匿名分享访客会把房主文件假装保存成自己的资产");
 check("协作者保存媒体会复制到自己的空间", /shared[\s\S]{0,180}?uploadMediaFile\(node\.metadata\.content/.test(projectPage) && /shared[\s\S]{0,180}?uploadImage\(node\.metadata\.content/.test(projectPage), "分享节点资产仍引用房主文件，协作者之后无法读取");
 check("分享完整工作区登录后继续克隆", /takePendingClone\(token\)/.test(projectPage), "fullCanvas 登录完成后没有续接保存副本");
@@ -205,7 +216,7 @@ check("分享 Agent 发送前复用自费确认", /ensureShareBillingConsent/.te
 check("分享 Agent 已有会话发送会透传自费确认", /api\.send\(sessionId,[\s\S]{0,180}?acceptSelfPay\)/.test(cloudStore) && /sendAgentMessage:[\s\S]{0,260}?acceptSelfPay/.test(shareApi), "只在新建会话时传了 acceptSelfPay，已有会话发送会被服务端拒绝");
 check("分享 Agent 续跑会透传自费确认", /api\(channel\)\.resolve|agentApi\(channel\)\.resolve/.test(cloudStore) && /resolve\(sessionId, approved, acceptSelfPay\)/.test(cloudStore) && /resolveAgentSession:[\s\S]{0,260}?acceptSelfPay/.test(shareApi), "续跑虽然弹了自费确认，但没有把同意结果交给服务端");
 check("分享 Agent 附件上传到房主画布空间", /uploadShareImage/.test(cloudStore), "分享 Agent 图片附件仍走当前账号空间");
-check("匿名 Agent 显示本地历史风险提示", /匿名访客[\s\S]{0,160}?浏览器[\s\S]{0,120}?建议登录/.test(cloudPanel), "匿名访客没有历史可能丢失的提示");
+check("匿名 Agent 显示本地历史风险提示", /t\("agent\.cloud\.panel\.anonymousHistoryWarning"\)/.test(cloudPanel), "匿名访客没有历史可能丢失的提示");
 check("匿名 Agent 历史使用 localforage", /localforage/.test(shareAgentHistory) && /shareId/.test(shareAgentHistory) && /actorId/.test(shareAgentHistory), "匿名会话没有按分享和访客身份隔离的浏览器本地持久化");
 check("远程更新不会覆盖本地待保存改动", /hasLocalChanges[\s\S]{0,500}?mergeProjectSnapshots\(scope\.state\.base, local, remote\)/.test(shareSync), "协作者更新到达时会直接丢掉本地防抖队列里的改动");
 check("异步远程水合会把期间本地编辑重放到远程快照", /pendingShareHydrationRef/.test(projectPage) && /mergeProjectSnapshots\(/.test(projectPage), "远程图片水合期间的本地编辑会覆盖远程新增内容");

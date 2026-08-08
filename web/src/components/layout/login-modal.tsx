@@ -3,6 +3,7 @@ import { Alert, App, Button, Divider, Form, Input, Modal } from "antd";
 import { Fingerprint, KeyRound, Loader2, Ticket, User } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 
 import { Turnstile } from "@/components/auth/turnstile";
 import { serverApi, ServerApiError, type AccountDeletionPending } from "@/services/api/server";
@@ -18,6 +19,8 @@ type LoginForm = { username: string; password: string; inviteCode?: string };
  */
 export function LoginModal() {
     const { message, modal } = App.useApp();
+    const { t, i18n } = useTranslation();
+    const resolvedLanguage = i18n.resolvedLanguage || i18n.language;
     const [form] = Form.useForm<LoginForm>();
     const [mode, setMode] = useState<Mode>("login");
     const [submitting, setSubmitting] = useState(false);
@@ -61,13 +64,13 @@ export function LoginModal() {
         if (!(error instanceof ServerApiError) || error.code !== "ACCOUNT_DELETION_PENDING" || !error.data) return false;
         const pending = error.data as AccountDeletionPending;
         modal.confirm({
-            title: "账号正在自助注销",
-            content: `预计于 ${new Date(pending.deletesAt).toLocaleString()} 完成。确认登录将立即取消注销。`,
-            okText: "确认登录并取消注销",
-            cancelText: "暂不登录",
+            title: t("auth.deletion.title"),
+            content: t("auth.deletion.content", { date: new Date(pending.deletesAt).toLocaleString(resolvedLanguage) }),
+            okText: t("auth.deletion.confirmLogin"),
+            cancelText: t("auth.deletion.cancelLogin"),
             onOk: async () => {
                 const session = await serverApi.cancelAccountDeletion(pending.resumeToken);
-                finish(session.token, session.user, "已取消注销并登录");
+                finish(session.token, session.user, t("auth.deletion.canceledAndSignedIn"));
             },
         });
         return true;
@@ -79,10 +82,10 @@ export function LoginModal() {
             const session = isRegister
                 ? await serverApi.register(values.username, values.password, values.inviteCode, captchaToken)
                 : await serverApi.login(values.username, values.password, captchaToken);
-            finish(session.token, session.user, isRegister ? "注册成功" : "登录成功");
+            finish(session.token, session.user, t(isRegister ? "auth.success.registered" : "auth.success.signedIn"));
         } catch (error) {
             // 邀请码不对、已用完、已停用这些原因都由服务端给中文文案，原样透出来才有指导意义。
-            if (!handleDeletionPending(error)) message.error(error instanceof Error ? error.message : "操作失败");
+            if (!handleDeletionPending(error)) message.error(error instanceof Error ? error.message : t("auth.errors.operationFailed"));
             resetCaptcha();
         } finally {
             setSubmitting(false);
@@ -95,10 +98,10 @@ export function LoginModal() {
         try {
             const { flowId, options } = await serverApi.passkeyLoginOptions("", captchaToken);
             const session = await serverApi.passkeyLoginVerify(flowId, await startAuthentication({ optionsJSON: options }));
-            finish(session.token, session.user, "登录成功");
+            finish(session.token, session.user, t("auth.success.signedIn"));
         } catch (error) {
             // 用户主动取消系统弹窗也会抛错，这种情况不提示。
-            const text = error instanceof Error ? error.message : "Passkey 登录失败";
+            const text = error instanceof Error ? error.message : t("auth.errors.passkeyLoginFailed");
             if (!handleDeletionPending(error) && !/NotAllowed|abort|cancel/i.test(text)) message.error(text);
             resetCaptcha();
         } finally {
@@ -122,33 +125,33 @@ export function LoginModal() {
         <Modal open={open} onCancel={() => setLoginOpen(false)} footer={null} width={400} centered destroyOnHidden styles={{ body: { padding: "8px 4px 4px" } }}>
             <div className="flex flex-col items-center pb-5 pt-2">
                 <span className="size-10 bg-stone-950 dark:bg-stone-100" style={{ mask: "url(/logo.svg) center / contain no-repeat", WebkitMask: "url(/logo.svg) center / contain no-repeat" }} />
-                <h2 className="mt-3 text-lg font-semibold text-stone-950 dark:text-stone-100">{isRegister ? "创建账号" : "登录无限画布"}</h2>
-                <p className="mt-1 text-xs text-stone-500">画布、素材与生成记录都保存在服务器，可在多设备之间同步</p>
+                <h2 className="mt-3 text-lg font-semibold text-stone-950 dark:text-stone-100">{t(isRegister ? "auth.form.createAccount" : "auth.form.signInTitle")}</h2>
+                <p className="mt-1 text-xs text-stone-500">{t("auth.form.description")}</p>
             </div>
 
             {loginError ? <Alert type="error" showIcon className="!mb-4" title={loginError} /> : null}
 
             <Form form={form} layout="vertical" requiredMark={false} onFinish={submit} disabled={submitting}>
-                <Form.Item name="username" rules={[{ required: true, message: "请输入用户名" }]} className="mb-3">
-                    <Input size="large" autoComplete="username" placeholder="用户名" prefix={<User className="size-4 text-stone-400" />} />
+                <Form.Item name="username" rules={[{ required: true, message: t("auth.form.usernameRequired") }]} className="mb-3">
+                    <Input size="large" autoComplete="username" placeholder={t("auth.form.username")} prefix={<User className="size-4 text-stone-400" />} />
                 </Form.Item>
-                <Form.Item name="password" rules={[{ required: true, message: "请输入密码" }]} className={needInvite ? "mb-3" : "mb-4"}>
-                    <Input.Password size="large" autoComplete={isRegister ? "new-password" : "current-password"} placeholder="密码" prefix={<KeyRound className="size-4 text-stone-400" />} />
+                <Form.Item name="password" rules={[{ required: true, message: t("auth.form.passwordRequired") }]} className={needInvite ? "mb-3" : "mb-4"}>
+                    <Input.Password size="large" autoComplete={isRegister ? "new-password" : "current-password"} placeholder={t("auth.form.password")} prefix={<KeyRound className="size-4 text-stone-400" />} />
                 </Form.Item>
                 {needInvite ? (
-                    <Form.Item name="inviteCode" rules={[{ required: true, message: "请输入邀请码" }]} className="mb-4">
-                        <Input size="large" placeholder="邀请码" prefix={<Ticket className="size-4 text-stone-400" />} />
+                    <Form.Item name="inviteCode" rules={[{ required: true, message: t("auth.form.inviteRequired") }]} className="mb-4">
+                        <Input size="large" placeholder={t("auth.form.inviteCode")} prefix={<Ticket className="size-4 text-stone-400" />} />
                     </Form.Item>
                 ) : null}
                 {captchaEnabled ? <Turnstile key={`${isRegister ? "register" : "login"}-${captchaNonce}`} siteKey={turnstile?.siteKey || ""} action={isRegister ? "register" : "login"} onToken={setCaptchaToken} onError={(text) => message.error(text)} /> : null}
                 <Button type="primary" size="large" htmlType="submit" block loading={submitting} disabled={captchaEnabled && !captchaToken}>
-                    {isRegister ? "注册并登录" : "登录"}
+                    {t(isRegister ? "auth.form.registerAndSignIn" : "auth.form.signIn")}
                 </Button>
             </Form>
 
             {!isRegister && thirdParty.length ? (
                 <>
-                    <Divider className="!my-5 !text-xs !text-stone-400">或</Divider>
+                    <Divider className="!my-5 !text-xs !text-stone-400">{t("auth.form.or")}</Divider>
                     <div className="flex gap-2">
                         {thirdParty.map((item) => (
                             <Button key={item.key} size="large" block loading={item.loading} disabled={item.disabled} onClick={item.onClick} className="!flex !items-center !justify-center !gap-2">
@@ -163,10 +166,10 @@ export function LoginModal() {
             <div className="mt-5 text-center text-xs text-stone-500">
                 {canRegister ? (
                     <button type="button" className="cursor-pointer text-stone-500 transition hover:text-stone-950 dark:hover:text-stone-100" onClick={() => setMode(isRegister ? "login" : "register")}>
-                        {isRegister ? "已有账号？去登录" : "还没有账号？立即注册"}
+                        {t(isRegister ? "auth.form.hasAccount" : "auth.form.noAccount")}
                     </button>
                 ) : (
-                    <span>当前服务器未开放注册</span>
+                    <span>{t("auth.form.registrationClosed")}</span>
                 )}
             </div>
         </Modal>
@@ -180,6 +183,8 @@ export function LoginModal() {
  */
 export function OauthCallbackHandler() {
     const { message, modal } = App.useApp();
+    const { t, i18n } = useTranslation();
+    const resolvedLanguage = i18n.resolvedLanguage || i18n.language;
     const navigate = useNavigate();
     const setSession = useServerStore((state) => state.setSession);
     // loading 正在处理回调，invite 等用户补邀请码，done 已经处理完交给页面跳转。
@@ -209,7 +214,7 @@ export function OauthCallbackHandler() {
         const deletesAt = params.get("deletesAt") || "";
 
         if (bound) {
-            message.success("已绑定 Linux.do");
+            message.success(t("auth.success.linuxDoBound"));
             window.history.replaceState(null, "", redirect);
             setPhase("done");
             return;
@@ -226,14 +231,14 @@ export function OauthCallbackHandler() {
         if (deletionPending && resumeToken) {
             setPhase("done");
             modal.confirm({
-                title: "账号正在自助注销",
-                content: `预计于 ${deletesAt ? new Date(deletesAt).toLocaleString() : "稍后"} 完成。确认登录将立即取消注销。`,
-                okText: "确认登录并取消注销",
-                cancelText: "暂不登录",
+                title: t("auth.deletion.title"),
+                content: t("auth.deletion.content", { date: deletesAt ? new Date(deletesAt).toLocaleString(resolvedLanguage) : t("auth.deletion.later") }),
+                okText: t("auth.deletion.confirmLogin"),
+                cancelText: t("auth.deletion.cancelLogin"),
                 onOk: async () => {
                     const session = await serverApi.cancelAccountDeletion(resumeToken);
                     setSession(session.token, session.user);
-                    message.success("已取消注销并登录");
+                    message.success(t("auth.deletion.canceledAndSignedIn"));
                     window.location.replace(redirect);
                 },
                 onCancel: () => window.location.replace(redirect),
@@ -255,7 +260,7 @@ export function OauthCallbackHandler() {
             .me()
             .then((profile) => {
                 setSession(token, profile);
-                message.success(`欢迎回来，${profile.displayName || profile.username}`);
+                message.success(t("auth.success.welcomeBack", { name: profile.displayName || profile.username }));
                 window.location.replace(redirect);
             })
             .catch((failure: Error) => {
@@ -263,16 +268,16 @@ export function OauthCallbackHandler() {
                 message.error(failure.message);
                 window.location.replace("/");
             });
-    }, [message, modal, navigate, params, pendingToken, redirect, setSession]);
+    }, [message, modal, navigate, params, pendingToken, redirect, resolvedLanguage, setSession, t]);
 
     const completeInvite = async () => {
         const code = inviteCode.trim();
         if (!code) {
-            setInviteError("请输入邀请码");
+            setInviteError(t("auth.form.inviteRequired"));
             return;
         }
         if (captchaEnabled && !captchaToken) {
-            setInviteError("请先完成人机验证");
+            setInviteError(t("auth.form.captchaRequired"));
             return;
         }
         setSubmitting(true);
@@ -280,12 +285,12 @@ export function OauthCallbackHandler() {
         try {
             const session = await serverApi.completeLinuxDo(pendingToken, code, captchaToken);
             setSession(session.token, session.user);
-            message.success("注册成功");
+            message.success(t("auth.success.registered"));
             window.location.replace(redirect);
         } catch (failure) {
             // pendingToken 过期、邀请码不对或已用完，服务端都会给中文原因，原样展示，
             // 过期这种重填也没用的情况下面还留着「重新登录」重走一遍授权。
-            setInviteError(failure instanceof Error ? failure.message : "完成注册失败");
+            setInviteError(failure instanceof Error ? failure.message : t("auth.errors.completeRegistrationFailed"));
             setCaptchaToken("");
             setCaptchaNonce((value) => value + 1);
             setSubmitting(false);
@@ -298,14 +303,14 @@ export function OauthCallbackHandler() {
         return (
             <div className="flex h-dvh items-center justify-center bg-background px-4">
                 <div className="w-full max-w-sm">
-                    <h2 className="text-center text-lg font-semibold text-stone-950 dark:text-stone-100">填写邀请码</h2>
-                    <p className="mt-1 text-center text-xs text-stone-500">身份已经验证通过，当前服务器还需要一个邀请码才能创建账号。</p>
+                    <h2 className="text-center text-lg font-semibold text-stone-950 dark:text-stone-100">{t("auth.oauth.inviteTitle")}</h2>
+                    <p className="mt-1 text-center text-xs text-stone-500">{t("auth.oauth.inviteDescription")}</p>
                     {inviteError ? <Alert type="error" showIcon className="!mt-4" title={inviteError} /> : null}
                     <Input
                         size="large"
                         className="!mt-4"
                         autoFocus
-                        placeholder="邀请码"
+                        placeholder={t("auth.form.inviteCode")}
                         value={inviteCode}
                         prefix={<Ticket className="size-4 text-stone-400" />}
                         onChange={(event) => setInviteCode(event.target.value)}
@@ -313,7 +318,7 @@ export function OauthCallbackHandler() {
                     />
                     {captchaEnabled ? <div className="mt-3"><Turnstile key={`oauth-${captchaNonce}`} siteKey={turnstile?.siteKey || ""} action="oauth_complete" onToken={setCaptchaToken} onError={setInviteError} /></div> : null}
                     <Button type="primary" size="large" block className="!mt-3" loading={submitting} disabled={captchaEnabled && !captchaToken} onClick={() => void completeInvite()}>
-                        完成注册
+                        {t("auth.oauth.completeRegistration")}
                     </Button>
                     <div className="mt-4 flex justify-center gap-5 text-xs text-stone-500">
                         <button
@@ -324,10 +329,10 @@ export function OauthCallbackHandler() {
                                 navigate(redirect, { replace: true });
                             }}
                         >
-                            重新登录
+                            {t("auth.oauth.signInAgain")}
                         </button>
                         <button type="button" className="cursor-pointer transition hover:text-stone-950 dark:hover:text-stone-100" onClick={() => window.location.replace(redirect)}>
-                            放弃并返回
+                            {t("auth.oauth.cancelAndReturn")}
                         </button>
                     </div>
                 </div>
@@ -337,7 +342,7 @@ export function OauthCallbackHandler() {
     return (
         <div className="flex h-dvh items-center justify-center gap-2 bg-background text-sm text-stone-500">
             <Loader2 className="size-4 animate-spin" />
-            正在完成登录…
+            {t("auth.oauth.completing")}
         </div>
     );
 }

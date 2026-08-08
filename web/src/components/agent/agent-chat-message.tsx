@@ -252,7 +252,7 @@ export function AgentToolCard({ title, text, detail, theme }: { title: string; t
     if (searchResults.length) return <AgentSearchCard title={title} text={text} results={searchResults} output={String(objectField(detail, "output") || "")} theme={theme} />;
     const state = toolCardState(title, text, detail);
     const view = userDetail(detail);
-    const showText = title !== "读取画布" || text !== "已读取当前画布内容";
+    const showText = title !== i18n.t("agent.eventExtra.tools.readCanvas") || text !== i18n.t("agent.eventMore.canvasRead");
     const className = "group min-w-0 rounded-xl border px-3 py-2.5 text-left";
     const style = { borderColor: theme.node.stroke, background: "transparent", color: theme.node.text };
     const content = (

@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button, Checkbox, Modal } from "antd";
+import { useTranslation } from "react-i18next";
 
 const DISMISS_KEY = "canvas-mobile-hint-dismissed";
 
 /** 画布没有针对移动端优化，窄屏进入画布时提示一次，勾选后本地记住不再提醒。 */
 export function CanvasMobileHintDialog() {
     const navigate = useNavigate();
+    const { t } = useTranslation();
     const [open, setOpen] = useState(false);
     const [dismiss, setDismiss] = useState(false);
 
@@ -22,13 +24,13 @@ export function CanvasMobileHintDialog() {
 
     return (
         <Modal
-            title="画布未针对移动端优化"
+            title={t("canvas.mobileHint.title")}
             open={open}
             centered
             onCancel={close}
             footer={
                 <>
-                    <Button onClick={close}>继续</Button>
+                    <Button onClick={close}>{t("canvas.mobileHint.continue")}</Button>
                     <Button
                         type="primary"
                         onClick={() => {
@@ -36,14 +38,14 @@ export function CanvasMobileHintDialog() {
                             navigate("/image");
                         }}
                     >
-                        去生图工作台
+                        {t("canvas.mobileHint.openImageWorkbench")}
                     </Button>
                 </>
             }
         >
-            <p className="text-sm opacity-60">画布的拖拽、缩放和节点编辑在小屏幕上不太好用，建议改用生图工作台生成图片。</p>
+            <p className="text-sm opacity-60">{t("canvas.mobileHint.description")}</p>
             <Checkbox className="mt-4" checked={dismiss} onChange={(event) => setDismiss(event.target.checked)}>
-                下次不再提醒
+                {t("canvas.mobileHint.dismiss")}
             </Checkbox>
         </Modal>
     );

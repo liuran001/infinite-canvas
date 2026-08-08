@@ -1,3 +1,4 @@
+import i18n from "@/i18n";
 import type { CanvasResourceKind } from "@/lib/canvas/canvas-resource-references";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
 
@@ -12,11 +13,12 @@ export const CLOUD_AGENT_IMAGE_MIME = "application/x-cloud-agent-image";
 /** 画布节点拖进面板时，用这个选择器认出「松手的地方是不是面板」。 */
 export const CLOUD_AGENT_DROP_SELECTOR = "[data-cloud-agent-drop]";
 
-const TYPE_LABELS: Record<string, string> = { image: "图片", text: "文本", video: "视频", audio: "音频", config: "配置", group: "分组" };
+const TYPE_LABELS: Record<string, string> = { image: "image", text: "text", video: "video", audio: "audio", config: "config", group: "group" };
 
 /** 引用标签显示节点标题，没有标题就退回类型名，插件节点直接用它自己的类型串。 */
 export function nodeTypeLabel(type: string) {
-    return TYPE_LABELS[type] || type;
+    const key = TYPE_LABELS[type];
+    return key ? i18n.t(`agent.cloud.references.${key}`) : type;
 }
 
 /** 服务端的引用标记：@[标题](canvas-node:节点ID#类型)。标记插在正文里，位置本身有语义。 */
@@ -43,7 +45,7 @@ export function buildDraftReference(node: CanvasNodeData, existing: CloudAgentDr
     const saved = existing.find((item) => item.nodeId === node.id);
     if (saved) return saved;
     // 标签里不能有空白：整块删除和高亮都按「一段连续文字」处理，夹了空格就会被拆开。
-    const base = `@${(node.title || nodeTypeLabel(node.type)).replace(/\s+/g, "")}`.slice(0, 24) || "@节点";
+    const base = `@${(node.title || nodeTypeLabel(node.type)).replace(/\s+/g, "")}`.slice(0, 24) || `@${i18n.t("agent.cloud.references.node")}`;
     let label = base;
     for (let index = 2; existing.some((item) => item.label === label); index += 1) label = `${base}${index}`;
     return { label, nodeId: node.id, type: node.type, title: node.title || "", kind: draftKind(node), previewUrl: node.metadata?.content };

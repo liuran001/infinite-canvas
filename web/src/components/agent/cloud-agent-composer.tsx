@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import { Button, Tooltip } from "antd";
 import { ArrowUp, ImagePlus, LoaderCircle, Square, X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { CanvasResourceMentionTextarea } from "@/components/canvas/canvas-resource-mention-textarea";
 import type { canvasThemes } from "@/lib/canvas-theme";
@@ -16,6 +17,7 @@ type Theme = (typeof canvasThemes)[keyof typeof canvasThemes];
  * 二是上传的图片能直接拖回画布，复用同一份服务端文件。
  */
 export function CloudAgentComposer({ theme, disabled, sending, placeholder, visionWarning, left, onSubmit, onStop }: { theme: Theme; disabled?: boolean; sending?: boolean; placeholder: string; visionWarning?: string; left?: ReactNode; onSubmit: () => void; onStop?: () => void }) {
+    const { t } = useTranslation();
     const prompt = useCloudAgentStore((state) => state.prompt);
     const attachments = useCloudAgentStore((state) => state.attachments);
     const draftReferences = useCloudAgentStore((state) => state.draftReferences);
@@ -77,13 +79,13 @@ export function CloudAgentComposer({ theme, disabled, sending, placeholder, visi
                 className="rounded-[24px] border px-3 pb-3 pt-3 shadow-lg transition"
                 style={{ background: theme.toolbar.panel, borderColor: referenceDropActive ? "#2f80ff" : theme.node.stroke }}
             >
-                {referenceDropActive ? <div className="mb-2 rounded-lg px-2 py-1 text-[11px]" style={{ background: "rgba(47,128,255,.1)", color: "#2f80ff" }}>松手把这个节点作为引用插进光标位置</div> : null}
+                {referenceDropActive ? <div className="mb-2 rounded-lg px-2 py-1 text-[11px]" style={{ background: "rgba(47,128,255,.1)", color: "#2f80ff" }}>{t("agent.cloud.references.drop")}</div> : null}
                 {attachments.length ? (
                     <div className="thin-scrollbar mb-2 flex gap-2 overflow-x-auto pb-1">
                         {attachments.map((item) => (
-                            <div key={item.id} className="group relative size-14 shrink-0 overflow-hidden rounded-xl border" style={{ borderColor: theme.node.stroke }} title={`${item.name}（可拖到画布上）`}>
+                            <div key={item.id} className="group relative size-14 shrink-0 overflow-hidden rounded-xl border" style={{ borderColor: theme.node.stroke }} title={t("agent.cloud.references.draggable", { name: item.name })}>
                                 <CloudAgentImage image={item} className="size-full cursor-grab object-cover" />
-                                <button type="button" className="absolute right-1 top-1 grid size-5 place-items-center rounded-full border opacity-0 shadow-sm transition group-hover:opacity-100" style={{ background: theme.toolbar.panel, borderColor: theme.node.stroke, color: theme.node.text }} onClick={() => removeAttachment(item.id)} aria-label="移除图片">
+                                <button type="button" className="absolute right-1 top-1 grid size-5 place-items-center rounded-full border opacity-0 shadow-sm transition group-hover:opacity-100" style={{ background: theme.toolbar.panel, borderColor: theme.node.stroke, color: theme.node.text }} onClick={() => removeAttachment(item.id)} aria-label={t("agent.composer.removeImage")}>
                                     <X className="size-3" />
                                 </button>
                             </div>
@@ -136,16 +138,16 @@ export function CloudAgentComposer({ theme, disabled, sending, placeholder, visi
                                 event.target.value = "";
                             }}
                         />
-                        <Tooltip title="上传图片，可拖到画布上">
-                            <Button type="text" shape="circle" className="!h-9 !w-9 !min-w-9" disabled={disabled || sending || uploading} style={{ color: theme.node.muted }} icon={uploading ? <LoaderCircle className="size-4 animate-spin" /> : <ImagePlus className="size-4" />} onClick={() => fileInputRef.current?.click()} aria-label="上传图片" />
+                        <Tooltip title={t("agent.cloud.references.uploadHint")}>
+                            <Button type="text" shape="circle" className="!h-9 !w-9 !min-w-9" disabled={disabled || sending || uploading} style={{ color: theme.node.muted }} icon={uploading ? <LoaderCircle className="size-4 animate-spin" /> : <ImagePlus className="size-4" />} onClick={() => fileInputRef.current?.click()} aria-label={t("agent.composer.uploadImage")} />
                         </Tooltip>
                         {left}
                     </div>
                     <div className="flex shrink-0 items-center gap-1.5">
                         {sending && onStop ? (
-                            <Button danger shape="circle" className="!h-10 !w-10 !min-w-10" icon={<Square className="size-4" />} onClick={() => onStop()} aria-label="停止" />
+                            <Button danger shape="circle" className="!h-10 !w-10 !min-w-10" icon={<Square className="size-4" />} onClick={() => onStop()} aria-label={t("agent.composer.stop")} />
                         ) : (
-                            <Button type="primary" shape="circle" className="!h-10 !w-10 !min-w-10" disabled={!canSubmit} icon={sending ? <LoaderCircle className="size-4 animate-spin" /> : <ArrowUp className="size-4" />} onClick={onSubmit} aria-label="发送" />
+                            <Button type="primary" shape="circle" className="!h-10 !w-10 !min-w-10" disabled={!canSubmit} icon={sending ? <LoaderCircle className="size-4 animate-spin" /> : <ArrowUp className="size-4" />} onClick={onSubmit} aria-label={t("agent.composer.send")} />
                         )}
                     </div>
                 </div>

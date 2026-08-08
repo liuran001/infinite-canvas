@@ -337,7 +337,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                     <div data-remote-presence className="pointer-events-none absolute inset-[-3px] z-[60] rounded-[26px] border-2" style={{ borderColor: remoteEditors[0].color }} />
                     <div className="pointer-events-none absolute -top-6 left-0 z-[70] flex gap-1 text-[11px] text-white">
                         {remoteEditors.slice(0, 2).map((editor) => (
-                            <span key={editor.clientId} className="rounded px-1.5 py-0.5" style={{ backgroundColor: editor.color }}>{editor.displayName || "协作者"}</span>
+                            <span key={editor.clientId} className="rounded px-1.5 py-0.5" style={{ backgroundColor: editor.color }}>{editor.displayName || t("canvas.collaborator")}</span>
                         ))}
                         {remoteEditors.length > 2 ? <span className="rounded bg-slate-600 px-1.5 py-0.5">+{remoteEditors.length - 2}</span> : null}
                     </div>
@@ -368,7 +368,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                         />
                     ) : readOnly ? (
                         <span className="block max-w-full truncate py-0.5 text-xs font-medium opacity-75" style={{ color: theme.node.text }}>
-                            {data.title || "未命名节点"}
+                            {data.title || t("canvas.node.untitled")}
                         </span>
                     ) : (
                         <button
