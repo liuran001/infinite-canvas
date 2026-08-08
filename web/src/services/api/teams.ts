@@ -1,3 +1,5 @@
+import i18n from "@/i18n";
+
 import { serverRequest } from "./server";
 
 /** 团队角色。与服务端 team-access 的权限矩阵一一对应，界面只按它裁剪入口，判定仍由服务端做。 */
@@ -99,31 +101,32 @@ function logQuery(query: TeamLogQuery = {}) {
 }
 
 export const teamApi = {
-    teams: () => serverRequest<Team[]>("/v1/teams", {}, "读取团队列表失败"),
-    createTeam: (body: { name: string; description?: string }) => serverRequest<TeamEntity>("/v1/teams", { method: "POST", ...jsonBody(body) }, "创建团队失败"),
-    team: (id: string) => serverRequest<Team>(`/v1/teams/${id}`, {}, "读取团队失败"),
-    updateTeam: (id: string, body: { name?: string; description?: string }) => serverRequest<Team>(`/v1/teams/${id}`, { method: "PATCH", ...jsonBody(body) }, "保存团队失败"),
-    disbandTeam: (id: string) => serverRequest<boolean>(`/v1/teams/${id}`, { method: "DELETE" }, "解散团队失败"),
-    transferOwner: (id: string, userId: string) => serverRequest<boolean>(`/v1/teams/${id}/transfer`, { method: "POST", ...jsonBody({ userId }) }, "转让团队失败"),
-    leaveTeam: (id: string) => serverRequest<boolean>(`/v1/teams/${id}/leave`, { method: "POST" }, "退出团队失败"),
+    teams: () => serverRequest<Team[]>("/v1/teams", {}, i18n.t("teams.errors.list")),
+    createTeam: (body: { name: string; description?: string }) => serverRequest<TeamEntity>("/v1/teams", { method: "POST", ...jsonBody(body) }, i18n.t("teams.errors.create")),
+    team: (id: string) => serverRequest<Team>(`/v1/teams/${id}`, {}, i18n.t("teams.errors.load")),
+    updateTeam: (id: string, body: { name?: string; description?: string }) => serverRequest<Team>(`/v1/teams/${id}`, { method: "PATCH", ...jsonBody(body) }, i18n.t("teams.errors.save")),
+    disbandTeam: (id: string) => serverRequest<boolean>(`/v1/teams/${id}`, { method: "DELETE" }, i18n.t("teams.errors.disband")),
+    transferOwner: (id: string, userId: string) => serverRequest<boolean>(`/v1/teams/${id}/transfer`, { method: "POST", ...jsonBody({ userId }) }, i18n.t("teams.errors.transfer")),
+    leaveTeam: (id: string) => serverRequest<boolean>(`/v1/teams/${id}/leave`, { method: "POST" }, i18n.t("teams.errors.leave")),
 
-    members: (id: string) => serverRequest<TeamMemberView[]>(`/v1/teams/${id}/members`, {}, "读取成员失败"),
+    members: (id: string) => serverRequest<TeamMemberView[]>(`/v1/teams/${id}/members`, {}, i18n.t("teams.errors.members")),
     updateMember: (id: string, userId: string, patch: { role?: TeamRole; creditLimit?: number; limitWindow?: TeamLimitWindow; status?: TeamMemberStatus }) =>
-        serverRequest<TeamMemberView>(`/v1/teams/${id}/members/${userId}`, { method: "PATCH", ...jsonBody(patch) }, "保存成员设置失败"),
-    removeMember: (id: string, userId: string) => serverRequest<boolean>(`/v1/teams/${id}/members/${userId}`, { method: "DELETE" }, "移除成员失败"),
+        serverRequest<TeamMemberView>(`/v1/teams/${id}/members/${userId}`, { method: "PATCH", ...jsonBody(patch) }, i18n.t("teams.errors.saveMember")),
+    removeMember: (id: string, userId: string) => serverRequest<boolean>(`/v1/teams/${id}/members/${userId}`, { method: "DELETE" }, i18n.t("teams.errors.removeMember")),
 
-    invites: (id: string) => serverRequest<TeamInvite[]>(`/v1/teams/${id}/invites`, {}, "读取邀请失败"),
+    invites: (id: string) => serverRequest<TeamInvite[]>(`/v1/teams/${id}/invites`, {}, i18n.t("teams.errors.invites")),
     /** 只有这一次响应里带 token 明文，服务端之后只剩哈希，界面必须当场让用户复制走。 */
-    createInvite: (id: string, body: { kind: TeamInviteKind; role: TeamRole; maxUses?: number; expiresAt?: string; note?: string }) => serverRequest<TeamInviteCreated>(`/v1/teams/${id}/invites`, { method: "POST", ...jsonBody(body) }, "创建邀请失败"),
+    createInvite: (id: string, body: { kind: TeamInviteKind; role: TeamRole; maxUses?: number; expiresAt?: string; note?: string }) =>
+        serverRequest<TeamInviteCreated>(`/v1/teams/${id}/invites`, { method: "POST", ...jsonBody(body) }, i18n.t("teams.errors.createInvite")),
     updateInvite: (id: string, inviteId: string, patch: { enabled?: boolean; maxUses?: number; expiresAt?: string; note?: string }) =>
-        serverRequest<TeamInvite>(`/v1/teams/${id}/invites/${inviteId}`, { method: "PATCH", ...jsonBody(patch) }, "保存邀请失败"),
-    deleteInvite: (id: string, inviteId: string) => serverRequest<boolean>(`/v1/teams/${id}/invites/${inviteId}`, { method: "DELETE" }, "删除邀请失败"),
+        serverRequest<TeamInvite>(`/v1/teams/${id}/invites/${inviteId}`, { method: "PATCH", ...jsonBody(patch) }, i18n.t("teams.errors.saveInvite")),
+    deleteInvite: (id: string, inviteId: string) => serverRequest<boolean>(`/v1/teams/${id}/invites/${inviteId}`, { method: "DELETE" }, i18n.t("teams.errors.deleteInvite")),
 
-    creditLogs: (id: string, query?: TeamLogQuery) => serverRequest<{ items: TeamCreditLog[]; total: number }>(`/v1/teams/${id}/credit-logs${logQuery(query)}`, {}, "读取团队流水失败"),
-    myCreditLogs: (id: string, query?: TeamLogQuery) => serverRequest<{ items: TeamCreditLog[]; total: number }>(`/v1/teams/${id}/credit-logs/mine${logQuery(query)}`, {}, "读取我的流水失败"),
+    creditLogs: (id: string, query?: TeamLogQuery) => serverRequest<{ items: TeamCreditLog[]; total: number }>(`/v1/teams/${id}/credit-logs${logQuery(query)}`, {}, i18n.t("teams.errors.logs")),
+    myCreditLogs: (id: string, query?: TeamLogQuery) => serverRequest<{ items: TeamCreditLog[]; total: number }>(`/v1/teams/${id}/credit-logs/mine${logQuery(query)}`, {}, i18n.t("teams.errors.myLogs")),
 
-    previewInvite: (token: string) => serverRequest<TeamInvitePreview>(`/v1/team-invites/${encodeURIComponent(token)}`, {}, "邀请链接无效或已失效"),
-    acceptInvite: (token: string) => serverRequest<TeamMemberRecord>(`/v1/team-invites/${encodeURIComponent(token)}/accept`, { method: "POST" }, "加入团队失败"),
+    previewInvite: (token: string) => serverRequest<TeamInvitePreview>(`/v1/team-invites/${encodeURIComponent(token)}`, {}, i18n.t("teams.errors.invalidInvite")),
+    acceptInvite: (token: string) => serverRequest<TeamMemberRecord>(`/v1/team-invites/${encodeURIComponent(token)}/accept`, { method: "POST" }, i18n.t("teams.errors.join")),
     /** 手输码走独立接口：它在 /v1/teams/:id 之前注册，"join" 不会被当成团队 id。 */
-    joinByCode: (code: string) => serverRequest<TeamMemberRecord>("/v1/teams/join", { method: "POST", ...jsonBody({ code }) }, "加入团队失败"),
+    joinByCode: (code: string) => serverRequest<TeamMemberRecord>("/v1/teams/join", { method: "POST", ...jsonBody({ code }) }, i18n.t("teams.errors.join")),
 };

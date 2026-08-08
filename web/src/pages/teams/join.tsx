@@ -1,12 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { App, Button } from "antd";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "react-router-dom";
 
 import { teamApi } from "@/services/api/teams";
 import { useServerStore } from "@/stores/use-server-store";
-
-const roleLabels: Record<string, string> = { owner: "所有者", admin: "管理员", member: "成员", viewer: "只读" };
 
 /**
  * 邀请落地页。预览接口本身要求登录（团队数据一律不对匿名开放），
@@ -15,6 +14,7 @@ const roleLabels: Record<string, string> = { owner: "所有者", admin: "管理�
 export default function TeamJoinPage() {
     const { token = "" } = useParams();
     const { message } = App.useApp();
+    const { t } = useTranslation();
     const navigate = useNavigate();
     const [joining, setJoining] = useState(false);
     const loggedIn = useServerStore((state) => Boolean(state.token));
@@ -25,10 +25,10 @@ export default function TeamJoinPage() {
         setJoining(true);
         try {
             const member = await teamApi.acceptInvite(token);
-            message.success("已加入团队");
+            message.success(t("teams.join.joined"));
             navigate(`/teams/${member.teamId}`);
         } catch (acceptError) {
-            message.error(acceptError instanceof Error ? acceptError.message : "加入团队失败");
+            message.error(acceptError instanceof Error ? acceptError.message : t("teams.join.joinFailed"));
         } finally {
             setJoining(false);
         }
@@ -39,31 +39,29 @@ export default function TeamJoinPage() {
             <div className="w-full max-w-md rounded-2xl border border-stone-200 p-8 text-center dark:border-stone-800">
                 {!loggedIn ? (
                     <>
-                        <h1 className="text-lg font-semibold">先登录再加入团队</h1>
-                        <p className="mt-2 text-sm text-stone-500">团队数据不对未登录访客开放，登录后这条邀请仍然有效。</p>
+                        <h1 className="text-lg font-semibold">{t("teams.join.loginTitle")}</h1>
+                        <p className="mt-2 text-sm text-stone-500">{t("teams.join.loginDescription")}</p>
                         <Button className="mt-5" type="primary" onClick={() => setLoginOpen(true)}>
-                            去登录
+                            {t("teams.join.login")}
                         </Button>
                     </>
                 ) : isPending ? (
-                    <div className="text-sm text-stone-500">正在校验邀请…</div>
+                    <div className="text-sm text-stone-500">{t("teams.join.validating")}</div>
                 ) : error || !data ? (
                     <>
-                        <h1 className="text-lg font-semibold">邀请链接无效或已失效</h1>
-                        <p className="mt-2 text-sm text-stone-500">这条链接可能已被停用、用完或过期，请向团队管理员要一条新的。</p>
+                        <h1 className="text-lg font-semibold">{t("teams.join.invalidTitle")}</h1>
+                        <p className="mt-2 text-sm text-stone-500">{t("teams.join.invalidDescription")}</p>
                         <Button className="mt-5" onClick={() => navigate("/teams")}>
-                            去我的团队
+                            {t("teams.join.myTeams")}
                         </Button>
                     </>
                 ) : (
                     <>
-                        <p className="text-xs text-stone-500">你被邀请加入</p>
+                        <p className="text-xs text-stone-500">{t("teams.join.invitedTo")}</p>
                         <h1 className="mt-2 text-xl font-semibold">{data.teamName}</h1>
-                        <p className="mt-2 text-sm text-stone-500">
-                            当前 {data.memberCount} 名成员 · 加入后的角色：{roleLabels[data.role] || data.role}
-                        </p>
+                        <p className="mt-2 text-sm text-stone-500">{t("teams.join.summary", { count: data.memberCount, role: t(`teams.roles.${data.role}`, { defaultValue: data.role }) })}</p>
                         <Button className="mt-5" type="primary" loading={joining} onClick={() => void accept()}>
-                            加入团队
+                            {t("teams.join.join")}
                         </Button>
                     </>
                 )}

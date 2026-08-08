@@ -82,8 +82,8 @@ const MAX_CANVAS_TITLE_CHARS = 60;
  */
 const DEFAULT_CANVAS_TITLE = /^(?:无限画布 \d+|未命名画布)$/;
 
-const string = (description: string) => ({ type: "string", description });
-const number = (description: string) => ({ type: "number", description });
+const string = (description: string, enumValues?: string[]) => ({ type: "string", description, ...(enumValues?.length ? { enum: enumValues } : {}) });
+const number = (description: string, limits?: { minimum?: number; maximum?: number }) => ({ type: "number", description, ...limits });
 const boolean = (description: string) => ({ type: "boolean", description });
 const stringList = (description: string) => ({ type: "array", description, items: { type: "string" } });
 
@@ -92,9 +92,15 @@ const stringList = (description: string) => ({ type: "array", description, items
  * 校验放在服务端而不是靠这句话：模型完全可能拿文本模型来生图。
  * 「默认」是用户偏好里配的那个，没配过才是全站默认，所以这里不写死成「系统默认」。
  */
-const modelParam = (kind: string) => string(`指定${kind}模型，留空用默认设置；填了不存在或能力不匹配的模型会自动回落到默认，不会报错`);
+const modelParam = (kind: string, capability: ModelCapability, settings: PublicSetting) => {
+    const models = settings.modelChannel.models.filter((model) => model.capability === capability);
+    const names = models.map((model) => model.name);
+    const labels = models.map((model) => model.label === model.name ? model.name : `${model.label} (${model.name})`);
+    const fallback = capability === "image" ? settings.modelChannel.defaultImageModel : capability === "video" ? settings.modelChannel.defaultVideoModel : capability === "audio" ? settings.modelChannel.defaultAudioModel : settings.modelChannel.defaultTextModel;
+    return string(`指定${kind}模型，只能照抄真实模型 ID：${labels.join("、")}；留空优先使用用户偏好，否则使用系统默认模型 ${fallback}`, names);
+};
 
-export function listAgentTools(access: AgentToolAccess): AgentTool[] {
+export function listAgentTools(access: AgentToolAccess, settings: PublicSetting): AgentTool[] {
     const tools: AgentTool[] = [
         {
             name: "read_canvas",
@@ -177,11 +183,12 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
                 properties: {
                     prompt: string("生图提示词，尽量具体"),
                     referenceStorageKeys: stringList("参考图的 storageKey 列表（形如 server:xxx），可以是用户上传的附件或画布上已有的图片"),
-                    model: modelParam("生图"),
-                    count: number("生成张数，默认 1"),
-                    size: string("尺寸或比例，例如 1024x1024、16:9"),
-                    quality: string("画质档位，例如 low、medium、high；档位越高越贵"),
-                    background: string("背景，例如 transparent 透明、opaque 不透明"),
+                    model: modelParam("生图", "image", settings),
+                    count: number("生成张数，默认 1", { minimum: 1, maximum: 4 }),
+                    size: string("尺寸或比例，常用值有 auto、1024x1024、1536x1024、1024x1536、2048x2048、2048x1152、1152x2048、3840x2160、2160x3840；也可填 1:1、16:9 等比例或自定义宽x高"),
+                    quality: string("画质档位，档位越高越贵", ["auto", "high", "medium", "low"]),
+                    background: string("背景", ["transparent", "opaque"]),
+                    title: string("生成后图片节点标题，留空使用默认名"),
                     x: number("图片节点左上角横坐标"),
                     y: number("图片节点左上角纵坐标"),
                 },
@@ -198,7 +205,8 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
                 properties: {
                     prompt: string("视频提示词，尽量具体"),
                     referenceStorageKeys: stringList("参考图的 storageKey 列表（形如 server:xxx）"),
-                    model: modelParam("视频"),
+                    model: modelParam("视频", "video", settings),
+                    title: string("生成后视频节点标题，留空使用默认名"),
                     seconds: string("时长秒数，例如 5"),
                     ratio: string("画面比例，例如 16:9"),
                     resolution: string("分辨率档位，例如 720p"),
@@ -219,7 +227,8 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
                 type: "object",
                 properties: {
                     prompt: string("要朗读的文字内容"),
-                    model: modelParam("音频"),
+                    model: modelParam("音频", "audio", settings),
+                    title: string("生成后音频节点标题，留空使用默认名"),
                     voice: string("音色名，例如 alloy"),
                     format: string("音频格式，例如 mp3"),
                     speed: number("语速倍率，1 为正常"),
@@ -242,7 +251,7 @@ export function listAgentTools(access: AgentToolAccess): AgentTool[] {
                 type: "object",
                 properties: {
                     prompt: string("要写什么，把体裁、篇幅、风格、受众都写清楚，模型看不到当前对话"),
-                    model: modelParam("文本"),
+                    model: modelParam("文本", "text", settings),
                     reasoningEffort: string("推理强度，例如 low、medium、high；需要深度思考时才填"),
                     title: string("文本节点标题，留空用默认名"),
                     x: number("文本节点左上角横坐标"),
@@ -443,12 +452,11 @@ async function runGenerationJob(ctx: ToolContext, kind: JobKind, model: string, 
  * 放行一个文本模型去生图，上游只会回一串看不懂的错，还会绕开按模型单价计费的口径。
  * 不匹配时静默往下一层落而不是报错——不管是模型挑错了名字，还是用户偏好里的模型被管理员下线、改了能力，
  * 换个能用的把活干完，都比中断整轮执行、让用户看见一条工具报错有用得多。
- * 最后一个候选是全站默认，直接兜底不再校验：它由管理员保证，这里多挡一道只会把「管理员配错」变成更难查的静默失败。
+ * 全部候选都按能力复核，避免错误的管理员默认值或旧偏好把文本模型送进生图请求。
  */
 function resolveGenerationModel(settings: PublicSetting, capability: ModelCapability, ...candidates: string[]) {
-    const fallback = candidates.pop() || "";
     const usable = candidates.map((item) => item.trim()).find((name) => name && settings.modelChannel.models.some((model) => model.name === name && model.capability === capability));
-    return usable || fallback;
+    return usable || "";
 }
 
 /** 生成结果落到节点上的公共元数据，和前端生成完写回节点的字段保持一致。 */

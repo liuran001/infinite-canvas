@@ -172,8 +172,8 @@ function normalizeChannel(channel: Partial<ModelChannel>): ModelChannel {
 /** 当前选择仍然有效就保留，否则按能力回落到第一个匹配模型。 */
 function repairDefaultModel(current: string, models: PublicModel[], capability: ModelCapability) {
     const value = (current || "").trim();
-    if (models.some((model) => model.name === value)) return value;
-    return models.find((model) => model.capability === capability)?.name || models[0]?.name || "";
+    if (models.some((model) => model.name === value && model.capability === capability)) return value;
+    return models.find((model) => model.capability === capability)?.name || "";
 }
 
 function normalizeSearchService(service: Partial<SearchService>): SearchService {

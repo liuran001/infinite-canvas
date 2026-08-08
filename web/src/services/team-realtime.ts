@@ -1,5 +1,6 @@
 import { Modal } from "antd";
 
+import i18n from "@/i18n";
 import { expireAccountSession, serverApiUrl } from "@/services/api/server";
 import { teamApi, type TeamRole } from "@/services/api/teams";
 import { decodeSseFrames, parseSseJson } from "@/services/sse-frames";
@@ -42,9 +43,9 @@ class TeamStreamError extends Error {
 const TERMINAL_STATUS = [401, 403, 404];
 
 function terminalMessage(status: number) {
-    if (status === 401) return "登录状态已失效，请重新登录";
-    if (status === 403) return "你在这个团队中的权限已变更，请刷新页面";
-    return "你已不在这个团队里，或团队已解散";
+    if (status === 401) return i18n.t("teams.realtime.sessionExpired");
+    if (status === 403) return i18n.t("teams.realtime.permissionChanged");
+    return i18n.t("teams.realtime.notMember");
 }
 
 /** ServerApiError 与 TeamStreamError 都带 status，这里统一取。不是永久失败就返回 0。 */
@@ -72,7 +73,7 @@ const sleep = (ms: number, signal: AbortSignal) =>
 /** 读流并按帧回调。分帧与解析都交给 sse-frames，坏帧只跳过它自己，不会掀翻整条连接。 */
 async function readSse(response: Response, onEvent: (event: TeamRealtimeEvent) => void) {
     const reader = response.body?.getReader();
-    if (!reader) throw new Error("团队实时连接没有返回内容");
+    if (!reader) throw new Error(i18n.t("teams.realtime.noStream"));
     const decoder = new TextDecoder();
     let buffer = "";
     for (;;) {
@@ -93,14 +94,14 @@ async function openStream(teamId: string, onEvent: (event: TeamRealtimeEvent) =>
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), Accept: "text/event-stream" },
         signal,
     }).catch(() => {
-        throw new Error("团队实时连接失败：无法连接服务端，请检查网络");
+        throw new Error(i18n.t("teams.realtime.connectFailed"));
     });
     if (response.status === 401) {
         expireAccountSession();
         useServerStore.getState().setLoginOpen(true);
-        throw new TeamStreamError("登录状态已失效，请重新登录", 401);
+        throw new TeamStreamError(i18n.t("teams.realtime.sessionExpired"), 401);
     }
-    if (!response.ok) throw new TeamStreamError(`团队实时连接失败（HTTP ${response.status}）`, response.status);
+    if (!response.ok) throw new TeamStreamError(i18n.t("teams.realtime.httpFailed", { status: response.status }), response.status);
     await readSse(response, onEvent);
 }
 
@@ -343,10 +344,10 @@ export function notifyTeamQuotaExceeded(error: unknown) {
     if (!isTeamQuotaExceeded(error) || quotaModalOpen) return false;
     quotaModalOpen = true;
     Modal.confirm({
-        title: "团队云空间已满",
-        content: "这次上传没有成功。占满的是团队的云空间，不是你个人的——删你自己的个人画布不会腾出空间。可以去团队里清理不再需要的画布与素材，或请平台管理员调大这个团队的配额。",
-        okText: "去团队页看看",
-        cancelText: "知道了",
+        title: i18n.t("teams.realtime.quotaTitle"),
+        content: i18n.t("teams.realtime.quotaDescription"),
+        okText: i18n.t("teams.realtime.viewTeam"),
+        cancelText: i18n.t("teams.realtime.acknowledge"),
         afterClose: () => {
             quotaModalOpen = false;
         },
@@ -366,10 +367,10 @@ export function notifyTeamCreditsExhausted(error: unknown) {
     if (!isTeamCreditsExhausted(error) || exhaustedModalOpen) return false;
     exhaustedModalOpen = true;
     Modal.confirm({
-        title: "团队积分已用尽",
-        content: "这次生成没有扣款也没有生成内容。团队积分只能由平台管理员充值；你也可以改成用自己的个人积分继续，两本账互相独立。",
-        okText: "去设置开启回落",
-        cancelText: "去团队页联系管理员充值",
+        title: i18n.t("teams.realtime.creditsTitle"),
+        content: i18n.t("teams.realtime.creditsDescription"),
+        okText: i18n.t("teams.realtime.enableFallback"),
+        cancelText: i18n.t("teams.realtime.contactAdmin"),
         afterClose: () => {
             exhaustedModalOpen = false;
         },

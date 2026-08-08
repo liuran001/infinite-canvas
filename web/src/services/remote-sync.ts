@@ -105,6 +105,9 @@ async function hydrateAsset(asset: Asset): Promise<Asset> {
 
 export function pushProject(project: CanvasProject) {
     if (!isServerMode()) return;
+    const state = projectSaves.get(project.id) || { inflight: false, dirty: false, retries: 0, base: confirmedProjects.get(project.id) || null };
+    state.dirty = true;
+    projectSaves.set(project.id, state);
     schedule(`project:${project.id}`, () => flushProject(project.id));
 }
 
@@ -152,11 +155,14 @@ async function flushProject(id: string) {
     }
     const project = useCanvasStore.getState().projects.find((item) => item.id === id);
     if (!project || !isServerMode()) return;
+    state.base ||= confirmedProjects.get(id) || project;
     const cloudAgent = useCloudAgentStore.getState();
-    if (cloudAgent.status === "running" && cloudAgent.projectId === id) return;
+    if (cloudAgent.status === "running" && cloudAgent.projectId === id) {
+        state.dirty = true;
+        return;
+    }
     state.inflight = true;
     state.dirty = false;
-    state.base ||= confirmedProjects.get(id) || project;
     useServerStore.getState().setSyncState("saving");
     try {
         const saved = await serverApi.saveProject(id, { title: project.title, data: project, revision: project.revision || 0, clientId: projectClientId });
@@ -247,11 +253,20 @@ async function pullProjects(since: string) {
     const pending = new Set<string>();
     items.forEach((item) => {
         const local = merged.get(item.id);
-        if (item.deleted) merged.delete(item.id);
-        else if (local && time(local.updatedAt) > time(item.updatedAt)) {
-            merged.set(item.id, { ...local, revision: item.revision });
-            pending.add(item.id);
-        } else merged.set(item.id, toProject(item));
+        if (item.deleted) {
+            merged.delete(item.id);
+            confirmedProjects.delete(item.id);
+            projectSaves.delete(item.id);
+        } else {
+            const remote = toProject(item);
+            confirmedProjects.set(item.id, remote);
+            const save = projectSaves.get(item.id);
+            if (save && !save.base) save.base = remote;
+            if (local && time(local.updatedAt) > time(item.updatedAt)) {
+                merged.set(item.id, { ...local, revision: item.revision });
+                pending.add(item.id);
+            } else merged.set(item.id, remote);
+        }
     });
     store.projects.forEach((project) => {
         if (!project.revision && merged.has(project.id)) pending.add(project.id);
@@ -302,20 +317,31 @@ async function pullUserPlugins(since: string) {
 }
 
 /**
- * 按 ID 强制以远程为准覆盖本地画布，云端 Agent 改完画布后由画布页调用。
- * 不能复用 pullProjects 的「按 updatedAt 后写胜出」：本地这份刚被用户操作过，
- * updatedAt 往往比服务端新，后写胜出会把 agent 的改动当成过期数据丢掉。
+ * 按 ID 拉取服务端最新画布。没有待保存变更时直接采用远端；
+ * 用户仍在本地编辑时，以最近一次确认快照为 base 做三方合并，再补推合并结果。
  */
 export async function pullProject(id: string) {
     if (!isServerMode()) return null;
+    const key = `project:${id}`;
+    const state = projectSaves.get(id) || { inflight: false, dirty: false, retries: 0, base: confirmedProjects.get(id) || null };
+    projectSaves.set(id, state);
+    const pendingLocalBeforePull = state.dirty || state.inflight || timers.has(key);
     const item = await serverApi.project(id);
     if (item.deleted) return null;
-    // 先取消本地待推送的防抖任务，否则刚覆盖完又会被旧状态推回服务端。
-    cancel(`project:${id}`);
-    const project = toProject(item);
-    confirmedProjects.set(id, project);
+    const local = useCanvasStore.getState().projects.find((project) => project.id === id);
+    const hasPendingLocal = pendingLocalBeforePull || state.dirty || state.inflight || timers.has(key);
+    // 防抖任务里的本地改动会在下方与远端三方合并，不能让旧任务再单独推一份快照。
+    cancel(key);
+    const remote = toProject(item);
+    const base = state.base || confirmedProjects.get(id);
+    const project = hasPendingLocal && base && local ? mergeProjectSnapshots(base, local, remote) : remote;
+    confirmedProjects.set(id, remote);
+    state.base = remote;
+    state.dirty = hasPendingLocal;
     // 本地可能压根没有这张画布（换设备、或直接打开画布链接），这时要补进列表而不是只替换。
     applyRemoteProject(project);
+    const cloudAgent = useCloudAgentStore.getState();
+    if (state.dirty && !state.inflight && !(cloudAgent.status === "running" && cloudAgent.projectId === id)) pump(() => flushProject(id));
     return project;
 }
 

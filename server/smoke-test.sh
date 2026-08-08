@@ -70,23 +70,23 @@ check "管理员可读用户列表" "$(curl -s "$BASE/admin/users" -H "Authoriza
 
 echo "系统设置"
 curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{
-  "private": { "channels": [{ "apiFormat": "openai", "name": "测试渠道", "baseUrl": "https://api.example.com", "apiKey": "sk-secret", "models": [{ "name": "gpt-image-2", "capability": "image" }], "weight": 1, "enabled": true }] },
-  "public": { "modelChannel": { "modelCosts": [{ "model": "gpt-image-2", "credits": 2 }] } }
+  "private": { "channels": [{ "apiFormat": "openai", "name": "测试渠道", "baseUrl": "https://api.example.com", "apiKey": "sk-secret", "models": [{ "name": "gpt-image-2", "capability": "image" }, { "name": "gpt", "capability": "text" }], "weight": 1, "enabled": true }] },
+  "public": { "modelChannel": { "defaultImageModel": "gpt", "modelCosts": [{ "model": "gpt-image-2", "credits": 2 }] } }
 }' >/dev/null
 check "渠道模型汇总到公开配置" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.models[0].name')" "gpt-image-2"
 check "公开配置带出模型能力" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.models[0].capability')" "image"
-check "默认生图模型自动修复" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.defaultImageModel')" "gpt-image-2"
+check "文本模型不能冒充默认生图模型" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.defaultImageModel')" "gpt-image-2"
 check "后台读取时密钥被脱敏" "$(curl -s "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.private.channels[0].apiKey')" ""
 curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{
-  "private": { "channels": [{ "apiFormat": "openai", "name": "测试渠道", "baseUrl": "https://api.example.com", "apiKey": "", "models": [{ "name": "gpt-image-2", "capability": "image" }], "weight": 1, "enabled": true }] },
+  "private": { "channels": [{ "apiFormat": "openai", "name": "测试渠道", "baseUrl": "https://api.example.com", "apiKey": "", "models": [{ "name": "gpt-image-2", "capability": "image" }, { "name": "gpt", "capability": "text" }], "weight": 1, "enabled": true }] },
   "public": { "modelChannel": { "modelCosts": [{ "model": "gpt-image-2", "credits": 2 }] } }
 }' >/dev/null
-check "留空保存不会清掉已有密钥" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.models | length')" "1"
+check "留空保存不会清掉已有渠道模型" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.models | length')" "2"
 
 # 只改一个开关不该把其余配置一起清空：直接归一化入参会把没传的字段填成默认值，
 # 于是「改个注册开关」会顺手把渠道和密钥洗掉。这条守着 saveSettings 的深合并。
 curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"allowRegister":false}}}' >/dev/null
-check "部分更新不会清掉渠道" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.models | length')" "1"
+check "部分更新不会清掉渠道模型" "$(curl -s "$BASE/settings" | jq -r '.data.modelChannel.models | length')" "2"
 check "部分更新确实改到了目标字段" "$(curl -s "$BASE/settings" | jq -r .data.auth.allowRegister)" "false"
 check "部分更新不会清掉渠道密钥" "$(curl -s "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.data.private.channels | length')" "1"
 curl -s -X POST "$BASE/admin/settings" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"public":{"auth":{"allowRegister":true}}}' >/dev/null
@@ -1213,6 +1213,12 @@ check "Agent 用流式调模型" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_la
 check "工具列表里没有 read_webpage" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_webpage")] | length')" "0"
 check "工具列表里没有 import_image" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="import_image")] | length')" "0"
 check "工具列表里有画布读写工具" "$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_tools" | jq -r '[.tools[] | select(.=="read_canvas" or .=="create_node" or .=="connect_nodes")] | length')" "3"
+AGENT_REQUEST=$(curl -s "http://127.0.0.1:$UPSTREAM_PORT/_last")
+check "生图工具下发真实 image 模型 ID 列表" "$(echo "$AGENT_REQUEST" | jq -r '[.tools[] | select(.function.name=="generate_image")][0].function.parameters.properties.model.enum | join(",")')" "mock-image,mock-image-pro"
+check "生图工具下发完整画质选项" "$(echo "$AGENT_REQUEST" | jq -r '[.tools[] | select(.function.name=="generate_image")][0].function.parameters.properties.quality.enum | join(",")')" "auto,high,medium,low"
+check "生图工具明确张数范围" "$(echo "$AGENT_REQUEST" | jq -r '[.tools[] | select(.function.name=="generate_image")][0].function.parameters.properties.count | "\(.minimum)-\(.maximum)"')" "1-4"
+check "生图工具可直接设置节点标题" "$(echo "$AGENT_REQUEST" | jq -r '[.tools[] | select(.function.name=="generate_image")][0].function.parameters.properties | has("title")')" "true"
+check "系统提示要求照抄真实模型 ID" "$(echo "$AGENT_REQUEST" | jq -r '.messages[0].content | contains("schema 的 enum")')" "true"
 
 # 工具直接改的是服务端画布，revision 递增后前端现有的增量同步就能拉到。
 AGENT_PROJECT=$(curl -s "$BASE/v1/projects/agent-p1" -H "Authorization: Bearer $USER_TOKEN")

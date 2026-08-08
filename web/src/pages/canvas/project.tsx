@@ -862,8 +862,8 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
     // 离开画布就解绑并断开事件流，免得在别的页面对着上一张画布继续发指令；回来会重新绑定并补齐进度。
     useEffect(() => () => useCloudAgentStore.getState().bindProject(""), []);
 
-    // 画布是被服务端直接改的，本地这份是 React state，必须显式拉回来覆盖，
-    // 否则不仅看不到新节点，本地旧状态回写还会把 agent 的改动顶掉。
+    // 画布是被服务端直接改的，拉取后统一交给 onRemoteProjectApplied 那条带序号保护的渲染链路；
+    // 这里再手动 setNodes 会绕过本地编辑检测，图片水合稍慢时可能把用户刚移动的节点再次覆盖。
     useEffect(() => {
         if (shared || !projectLoaded || cloudAgentCanvasReload === appliedCanvasReloadRef.current) return;
         appliedCanvasReloadRef.current = cloudAgentCanvasReload;
@@ -871,8 +871,6 @@ export function InfiniteCanvasPage({ shared = false }: { shared?: boolean } = {}
             .then(async (project) => {
                 if (!project || useCloudAgentStore.getState().projectId !== projectId) return;
                 canvasReloadRetryRef.current = 0;
-                setNodes(await hydrateCanvasImages(project.nodes));
-                setConnections(project.connections);
             })
             .catch((error) => {
                 console.warn("拉取云端画布失败", error);

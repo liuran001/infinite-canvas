@@ -14,6 +14,23 @@ function mergeValue<T>(base: T, local: T, remote: T): T {
     return local;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** 同一节点两侧改了不同字段时逐字段合并，不能让本地位置覆盖掉 Agent 新写入的图片引用。 */
+function mergeRecord<T extends Record<string, unknown>>(base: T, local: T, remote: T): T {
+    const result: Record<string, unknown> = {};
+    for (const key of new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)])) {
+        const before = base[key];
+        const ours = local[key];
+        const theirs = remote[key];
+        const value = isRecord(before) && isRecord(ours) && isRecord(theirs) ? mergeRecord(before, ours, theirs) : mergeValue(before, ours, theirs);
+        if (value !== undefined) result[key] = value;
+    }
+    return result as T;
+}
+
 /** 按 ID 三方合并。删除优先：base 里存在而任一侧删除的条目不会被另一侧修改复活。 */
 function mergeItems<T extends { id: string }>(base: T[], local: T[], remote: T[]) {
     const baseMap = new Map(base.map((item) => [item.id, item]));
@@ -30,7 +47,7 @@ function mergeItems<T extends { id: string }>(base: T[], local: T[], remote: T[]
             else if (theirs) result.push(theirs);
             continue;
         }
-        result.push(mergeValue(before, ours!, theirs!));
+        result.push(mergeRecord(before, ours!, theirs!));
     }
     return result;
 }

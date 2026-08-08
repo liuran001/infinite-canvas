@@ -312,7 +312,7 @@ function systemPrompt(projectId: string, extra: string, access: AgentToolAccess,
         // 轮数是硬预算，模型看得见才能规划：只剩两三轮时该先把最要紧的做完，而不是开一个做不完的新任务。
         `本次执行最多 ${maxRounds} 轮，含这一轮还剩 ${remainingRounds} 轮。轮数用完会暂停下来向用户申请继续（要再花一次算力点），所以请按剩余轮数安排：先做最要紧的事，快用完时先收尾并说明进度，不要开一个明显做不完的新任务。`,
         "一次只做用户要求的事，做完用中文简要说明改了什么。",
-        "工具调用失败时把失败原因如实转述给用户，不要假装成功。",
+        "工具调用失败时把失败原因如实转述给用户，不要假装成功。生成工具的 model 只能照抄工具 schema 的 enum 中的真实模型 ID，不要把品牌简称直接当模型 ID。",
     ].join("\n");
     return extra.trim() ? `${base}\n\n${extra.trim()}` : base;
 }
@@ -560,7 +560,7 @@ async function runLoop(session: AgentSession, signal: AbortSignal) {
     const settings = await publicSettings();
     const channel = await selectModelChannel(session.model);
     const access = await toolAccess(settings, session.model);
-    const tools = listAgentTools(access);
+    const tools = listAgentTools(access, settings);
     // 用户的「Agent 生成默认设置」整段执行只读一次库：一次执行里生成类工具可能被调很多次，
     // 每次都查一遍纯属白花开销，而偏好在跑的过程中改了也不该半路换规格——改动下一条消息就会生效。
     const prefs = await getAgentGenerationPreference(session.userId);

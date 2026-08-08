@@ -53,12 +53,12 @@ export async function hydrateCanvasImages(nodes: CanvasNodeData[], { allowUpload
     return Promise.all(
         nodes.map(async (node) => {
             const metadata = node.metadata;
-            const content = metadata?.content;
+            const content = metadata?.content || "";
             if ((node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio) && metadata?.storageKey) return { ...node, metadata: { ...metadata, content: await resolveMediaUrl(metadata.storageKey, content) } };
-            if (node.type !== CanvasNodeType.Image || !content) return node;
-            const images = await Promise.all((metadata.images || []).map(async (image) => (image.content ? { ...image, content: await resolveImageUrl(image.storageKey, image.content) } : image)));
+            if (node.type !== CanvasNodeType.Image || !metadata || (!content && !metadata.storageKey && !(metadata.images || []).some((image) => image.content || image.storageKey))) return node;
+            const images = await Promise.all((metadata.images || []).map(async (image) => (image.content || image.storageKey ? { ...image, content: await resolveImageUrl(image.storageKey, image.content) } : image)));
             if (metadata.storageKey) return { ...node, metadata: { ...metadata, content: await resolveImageUrl(metadata.storageKey, content), images } };
-            if (!content.startsWith("data:image/") || !allowUpload) return node;
+            if (!content.startsWith("data:image/") || !allowUpload) return images.length ? { ...node, metadata: { ...metadata, images } } : node;
             return { ...node, metadata: { ...metadata, ...imageMetadata(await uploadImage(content)) } };
         }),
     );

@@ -17,6 +17,8 @@ import { fileURLToPath } from "node:url";
 import { decodeSseFrames, parseSseJson } from "./src/services/sse-frames.ts";
 import { validateInviteCode, normalizeInviteCode, INVITE_CODE_MAX_LENGTH, INVITE_CODE_MIN_LENGTH } from "./src/lib/invite-code.ts";
 import { ownedTeamCount, teamCreateBlockedReason } from "./src/lib/team-limits.ts";
+import enUS from "./src/i18n/locales/en-US.ts";
+import zhCN from "./src/i18n/locales/zh-CN.ts";
 import { useTeamStore } from "./src/stores/use-team-store.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "src");
@@ -34,6 +36,14 @@ function check(name, ok, detail = "") {
 }
 
 const read = (relative) => readFileSync(join(root, relative), "utf8");
+function leafPaths(value, prefix = "") {
+    if (Array.isArray(value)) return value.flatMap((item, index) => leafPaths(item, `${prefix}[${index}]`));
+    if (value && typeof value === "object") return Object.entries(value).flatMap(([key, item]) => leafPaths(item, prefix ? `${prefix}.${key}` : key));
+    return [prefix];
+}
+function sourceWithoutComments(value) {
+    return value.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+}
 /** 递归列出 src 下所有 ts/tsx，给「全仓扫描某个反模式」这类断言用。 */
 function sourceFiles(dir) {
     const out = [];
@@ -60,6 +70,22 @@ const team = (id, credits, myRole = "owner", storageUsed = 0, storageQuota = 0) 
     createdAt: "",
     updatedAt: "",
 });
+
+console.log("团队英文完整性契约");
+
+const teamPageFiles = ["pages/teams/index.tsx", "pages/teams/layout.tsx", "pages/teams/detail.tsx", "pages/teams/members.tsx", "pages/teams/invites.tsx", "pages/teams/logs.tsx", "pages/teams/join.tsx"];
+const teamPageSources = teamPageFiles.map((file) => [file, read(file)]);
+check("团队导航中英文词条完整", Boolean(zhCN.navigation.teams) && Boolean(enUS.navigation.teams));
+check("中英文团队词条结构一致", Boolean(zhCN.teams) && JSON.stringify(leafPaths(zhCN.teams).sort()) === JSON.stringify(leafPaths(enUS.teams).sort()));
+check("英文团队词条不残留中文", Boolean(enUS.teams) && !/[\p{Script=Han}]/u.test(JSON.stringify(enUS.teams)));
+for (const [file, source] of teamPageSources) {
+    check(`${file} 接入 i18n`, /useTranslation\(\)/.test(source));
+    check(`${file} 可见文案不再硬编码中文`, !/[\p{Script=Han}]/u.test(sourceWithoutComments(source)));
+    check(`${file} 日期不锁死中文地区`, !/toLocaleString\("zh-CN"/.test(source));
+}
+const teamListSource = read("pages/teams/index.tsx");
+check("创建团队上限提示走 i18n", /t\("teams\.list\.createBlocked"/.test(teamListSource));
+check("团队实时终态与弹窗走 i18n", /i18n\.t\("teams\.realtime\./.test(read("services/team-realtime.ts")));
 
 console.log("团队 store 的时序契约");
 
